@@ -1,0 +1,15 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [
+    {
+      "package": "./",
+      "options": {
+        "tickSeconds": 30,
+        "defaultTimeoutMinutes": 30,
+        // No sample jobs or external notifications run automatically.
+        // See examples/opencode.jsonc for opt-in configuration.
+        "jobs": [],
+      },
+    },
+  ],
+}

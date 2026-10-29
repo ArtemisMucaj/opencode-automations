@@ -1,0 +1,11 @@
+{
+  "$schema": "https://opencode.ai/v2/cli.json",
+  "plugins": [
+    {
+      "package": "/absolute/path/to/opencode-automations/tui.tsx",
+      "options": {
+        "notify": "off"
+      }
+    }
+  ]
+}

@@ -1,0 +1,43 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  // Example only. Set package to your checkout's absolute path when using elsewhere.
+  "plugins": [
+    {
+      "package": "../",
+      "options": {
+        "tickSeconds": 30,
+        "defaultTimeoutMinutes": 30,
+        "defaultModel": "anthropic/claude-sonnet-4-5",
+        // Sent by the server, so they work with no TUI open. Use any subset.
+        "notify": {
+          "on": ["succeeded", "failed", "timeout"],
+          "macos": true,
+          // Optional phone notifications via Pushover.
+          // "pushover": { "token": "<app token>", "user": "<user key>" },
+        },
+        "jobs": [
+          {
+            "id": "morning-mr-triage",
+            "prompt": "List open merge requests where I'm a reviewer and summarize what each needs from me, oldest first.",
+            "cron": "45 8 * * 1-5",
+            "tz": "Europe/Paris",
+            "session": "new",
+            // Required: the server's cwd is not your project.
+            "directory": "/Users/artemis/src/home-plus",
+          },
+          {
+            "id": "dep-audit",
+            "prompt": "Run the dependency audit, compare against the previous findings in this session, and report only what changed.",
+            "cron": "@weekly",
+            "session": "reuse",
+            "agent": "build",
+            "model": "lmstudio/qwen3-coder",
+            "timeoutMinutes": 20,
+            "notify": ["failed", "timeout"], // only bother me when it breaks
+            "directory": "/Users/artemis/src/home-plus",
+          },
+        ],
+      },
+    },
+  ],
+}

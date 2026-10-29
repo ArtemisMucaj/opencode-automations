@@ -1,0 +1,31 @@
+{
+  "name": "opencode-automations",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": "./index.ts",
+    "./tui": "./tui.tsx"
+  },
+  "files": ["*.ts", "tui.tsx", "README.md"],
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@opencode/plugin": "2.2.1",
+    "cron-parser": "5.10.2",
+    "proper-lockfile": "4.1.2"
+  },
+  "peerDependencies": {
+    "@opentui/core": "0.7.0",
+    "@opentui/solid": "0.7.0",
+    "solid-js": "^1.9.0"
+  },
+  "devDependencies": {
+    "@opentui/core": "0.7.0",
+    "@opentui/solid": "0.7.0",
+    "@types/bun": "1.4.4",
+    "@types/proper-lockfile": "4.1.4",
+    "typescript": "7.0.2"
+  }
+}
