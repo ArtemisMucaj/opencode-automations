@@ -394,7 +394,8 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
                           backgroundColor={isSel() ? t.background.action.primary.focused : undefined}
                         >
                           <text fg={fg() ?? L().text}>
-                            <span style={{ fg: fg() ?? (running().has(j.id) ? L().warn : isActive(j) ? L().ok : L().faint) }}>{dot()}</span>{" "}
+                            {/* Green marks the selected row; status is shown by the dot's shape. */}
+                            <span style={{ fg: isSel() ? L().ok : running().has(j.id) ? L().warn : L().muted }}>{dot()}</span>{" "}
                             {j.name.slice(0, 22)}
                           </text>
                           <text fg={fg() ?? L().muted}>{when()}</text>

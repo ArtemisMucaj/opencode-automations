@@ -571,7 +571,7 @@ function AutomationsView(props) {
                     var _v$14 = isSel() ? t.background.action.primary.focused : undefined,
                       _v$15 = fg() ?? L().text,
                       _v$16 = {
-                        fg: fg() ?? (running().has(j.id) ? L().warn : isActive(j) ? L().ok : L().faint)
+                        fg: isSel() ? L().ok : running().has(j.id) ? L().warn : L().muted
                       },
                       _v$17 = fg() ?? L().muted;
                     _v$14 !== _p$.e && (_p$.e = _$setProp(_el$30, "backgroundColor", _v$14, _p$.e));
