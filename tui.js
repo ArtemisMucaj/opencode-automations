@@ -1,4 +1,4 @@
-// Generated from tui.tsx by `bun run build`. Do not edit. Committed on purpose: see AGENTS.md.
+// Generated from tui.tsx by `bun run compile`. Do not edit. Committed on purpose: see AGENTS.md.
 import { memo as _$memo } from "@opentui/solid";
 import { createTextNode as _$createTextNode } from "@opentui/solid";
 import { createComponent as _$createComponent } from "@opentui/solid";

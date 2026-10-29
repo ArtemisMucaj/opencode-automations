@@ -21,5 +21,5 @@ const result = await transformAsync(await Bun.file(src).text(), {
 })
 if (!result?.code) throw new Error("tui.tsx compiled to nothing")
 
-await Bun.write(out, "// Generated from tui.tsx by `bun run build`. Do not edit. Committed on purpose: see AGENTS.md.\n" + result.code + "\n")
+await Bun.write(out, "// Generated from tui.tsx by `bun run compile`. Do not edit. Committed on purpose: see AGENTS.md.\n" + result.code + "\n")
 console.log("wrote tui.js")

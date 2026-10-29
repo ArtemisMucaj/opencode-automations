@@ -1,2 +1,2 @@
-# Generated from tui.tsx by `bun run build`; committed on purpose (see AGENTS.md).
+# Generated from tui.tsx by `bun run compile`; committed on purpose (see AGENTS.md).
 tui.js linguist-generated=true -diff
