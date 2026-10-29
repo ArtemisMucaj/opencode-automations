@@ -1,4 +1,3 @@
-/** @jsxImportSource @opentui/solid */
 // opencode v2 TUI plugin for automations.
 //
 // Reads the same jobs.json / history.jsonl the server plugin writes, and writes *intents*

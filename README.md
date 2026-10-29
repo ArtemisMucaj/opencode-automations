@@ -34,7 +34,7 @@ opencode plugin add github:ArtemisMucaj/opencode-automations
 
 OpenCode installs the Git package and adds it to your global configuration. No manual clone, permanent checkout, or absolute local path is needed. This single entry loads both server and TUI parts; no separate `cli.json` entry is needed for normal use.
 
-**Maintainers:** Git installation requires `package.json`, the plugin sources, and `bun.lock` to be committed and pushed to the repository first. Uncommitted local changes are not installed from Git.
+**Maintainers:** Git installation requires `package.json`, the plugin sources, and `bun.lock` to be committed and pushed to the repository first. Uncommitted local changes are not installed from Git. After editing `tui.tsx`, run `bun run build` and commit the regenerated `tui.js`: installs load that precompiled file, because OpenTUI does not compile JSX inside `node_modules`.
 
 For SSH access, use this **instead** of the command above:
 
