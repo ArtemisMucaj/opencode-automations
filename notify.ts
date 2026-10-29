@@ -55,7 +55,7 @@ export function compose(job: Job, run: Run): Message {
   const dur = secs >= 60 ? `${Math.round(secs / 60)}m` : `${secs}s`
   const text = (run.error ?? run.output ?? "").trim()
   return {
-    title: `${job.name} ${run.status}`,
+    title: job.name,
     body: text ? text.slice(0, 500) : `Finished in ${dur}`,
     status: run.status,
     job,
