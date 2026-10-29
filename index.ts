@@ -177,7 +177,8 @@ export default Plugin.define({
       const run: Run = { ...f.run, status, endedAt: Date.now(), output: f.lastText?.slice(0, 4000), error }
       store.appendRun(run)
       mutate((jobs) => { const j = find(jobs, run.jobID); if (j) j.lastStatus = status })
-      notify(f.job, run)
+      // History keeps a capped copy; the notification gets the full text.
+      notify(f.job, { ...run, output: f.lastText })
     }
 
     function notify(job: Job, run: Run) {

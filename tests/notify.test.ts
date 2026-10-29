@@ -1,5 +1,5 @@
 import { expect, spyOn, test } from "bun:test"
-import { send, type Deps, type Message } from "../notify.ts"
+import { compose, send, type Deps, type Message } from "../notify.ts"
 
 const message: Message = {
   title: "Morning succeeded", body: "All clear", status: "succeeded",
@@ -123,4 +123,26 @@ test("Pushover sends credentials, message and elevated failure priority", async 
   expect(JSON.parse(calls[0].input?.body as string)).toEqual({
     token: "test-token", user: "test-user", title: "Morning succeeded", message: "All clear", priority: 1,
   })
+})
+
+test("Pushover sends one message capped at 1024 chars, with a note when cut", async () => {
+  const bodies: Array<{ title: string; message: string }> = []
+  const body = "z".repeat(3000)
+  const failed = await send({ pushover: { token: "t", user: "u" } }, { ...message, body }, {
+    platform: "linux",
+    fetch: async (_url, input) => { bodies.push(JSON.parse(input?.body as string)); return new Response("ok") },
+    exec: async () => {},
+  })
+  expect(failed).toEqual([])
+  expect(bodies).toHaveLength(1)
+  expect(bodies[0].title).toBe("Morning succeeded")
+  expect(bodies[0].message.length).toBeLessThanOrEqual(1024)
+  expect(bodies[0].message.startsWith("zzz")).toBe(true)
+  expect(bodies[0].message.endsWith("Read full output directly from OpenCode session")).toBe(true)
+})
+
+test("compose does not crop the run output", () => {
+  const output = "y".repeat(3000)
+  const m = compose(message.job, { ...message.run, output })
+  expect(m.body).toBe(output)
 })

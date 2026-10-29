@@ -56,11 +56,25 @@ export function compose(job: Job, run: Run): Message {
   const text = (run.error ?? run.output ?? "").trim()
   return {
     title: job.name,
-    body: text ? text.slice(0, 500) : `Finished in ${dur}`,
+    body: text || `Finished in ${dur}`,
     status: run.status,
     job,
     run,
   }
+}
+
+const PUSHOVER_MAX = 1024
+
+const MORE = "\n\n… Read full output directly from OpenCode session"
+
+/** Fit text in `max` characters; if it's cut, end with a note pointing to the session. */
+export function fit(text: string, max: number): string {
+  if (text.length <= max) return text
+  let cut = max - MORE.length
+  // Don't split an emoji or other surrogate pair in half.
+  const code = text.charCodeAt(cut - 1)
+  if (code >= 0xd800 && code <= 0xdbff) cut--
+  return text.slice(0, cut).trimEnd() + MORE
 }
 
 const ok = (r: Response) => {
@@ -98,6 +112,7 @@ export async function send(cfg: NotifyConfig, m: Message, deps: Deps = defaultDe
   }
 
   if (cfg.pushover) {
+    const pushover = cfg.pushover
     tasks.push([
       "pushover",
       () =>
@@ -106,7 +121,8 @@ export async function send(cfg: NotifyConfig, m: Message, deps: Deps = defaultDe
             method: "POST",
             signal: timeout(),
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ ...cfg.pushover, title: m.title, message: m.body, priority: bad ? 1 : 0 }),
+            // Pushover rejects messages over 1024 chars.
+            body: JSON.stringify({ ...pushover, title: m.title, message: fit(m.body, PUSHOVER_MAX), priority: bad ? 1 : 0 }),
           })
           .then(ok),
     ])
