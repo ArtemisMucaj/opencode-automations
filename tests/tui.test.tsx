@@ -30,11 +30,11 @@ test("TUI renders automations page and persists pause/run-now actions", async ()
     theme: {
       hue: { accent: scale },
       categorical: [scale, scale, scale],
-      text: { base: color, muted: color, faint: color, action: { primary: { base: color } }, feedback },
+      text: { base: color, muted: color, faint: color, action: { primary: { base: color, focused: color } }, feedback },
       background: {
         base: "#111111",
         raised: { base: "#1a1a1a", high: "#222222", max: "#2a2a2a" },
-        action: { primary: { base: "#333333" } },
+        action: { primary: { base: "#333333", focused: "#333333" } },
         feedback,
       },
       border: { base: color },

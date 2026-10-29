@@ -549,7 +549,7 @@ function AutomationsView(props) {
                 const isSel = () => i() === index();
                 const dot = () => running().has(j.id) ? "◐" : isActive(j) ? "●" : "○";
                 const when = () => running().has(j.id) ? "running" : isActive(j) ? relative(j.nextRunAt, state.now()) : stateOf(j);
-                const fg = () => isSel() ? t.text.action.primary.base : undefined;
+                const fg = () => isSel() ? t.text.action.primary.focused : undefined;
                 return (() => {
                   var _el$30 = _$createElement("box"),
                     _el$31 = _$createElement("text"),
@@ -568,7 +568,7 @@ function AutomationsView(props) {
                   _$insert(_el$31, () => j.name.slice(0, 22), null);
                   _$insert(_el$34, when);
                   _$effect(_p$ => {
-                    var _v$14 = isSel() ? t.background.action.primary.base : undefined,
+                    var _v$14 = isSel() ? t.background.action.primary.focused : undefined,
                       _v$15 = fg() ?? L().text,
                       _v$16 = {
                         fg: fg() ?? (running().has(j.id) ? L().warn : isActive(j) ? L().ok : L().faint)

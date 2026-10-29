@@ -384,14 +384,14 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
                       const isSel = () => i() === index()
                       const dot = () => (running().has(j.id) ? "◐" : isActive(j) ? "●" : "○")
                       const when = () => (running().has(j.id) ? "running" : isActive(j) ? relative(j.nextRunAt, state.now()) : stateOf(j))
-                      const fg = () => (isSel() ? t.text.action.primary.base : undefined)
+                      const fg = () => (isSel() ? t.text.action.primary.focused : undefined)
                       return (
                         <box
                           flexDirection="row"
                           justifyContent="space-between"
                           paddingLeft={2}
                           paddingRight={2}
-                          backgroundColor={isSel() ? t.background.action.primary.base : undefined}
+                          backgroundColor={isSel() ? t.background.action.primary.focused : undefined}
                         >
                           <text fg={fg() ?? L().text}>
                             <span style={{ fg: fg() ?? (running().has(j.id) ? L().warn : isActive(j) ? L().ok : L().faint) }}>{dot()}</span>{" "}
