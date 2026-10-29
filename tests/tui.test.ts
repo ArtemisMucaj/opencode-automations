@@ -18,18 +18,26 @@ test("TUI renders automations page and persists pause/run-now actions", async ()
   const testRenderer = await createTestRenderer({ width: 120, height: 35 })
   const layers: any[] = []
   let route: any
+  // Minimal stand-in for @opencode/theme's ResolvedTheme (only the tokens tui.tsx reads).
   const color = "#aaaaaa"
+  const feedback = Object.fromEntries(["success", "error", "warning", "info"].map((name) => [name, { base: color, muted: color }]))
+  const scale = Object.fromEntries([100, 200, 300, 400, 500, 600, 700, 800, 900].map((step) => [step, color]))
   const ctx = {
     renderer: testRenderer.renderer,
     options: { dataDir, notify: "off" },
     location: { directory: dataDir },
+    themeMode: "dark",
     theme: {
-      text: {
-        subdued: color,
-        action: { primary: { default: color } },
-        feedback: Object.fromEntries(["success", "error", "warning", "info"].map((name) => [name, { default: color }])),
+      hue: { accent: scale },
+      categorical: [scale, scale, scale],
+      text: { base: color, muted: color, faint: color, action: { primary: { base: color } }, feedback },
+      background: {
+        base: "#111111",
+        raised: { base: "#1a1a1a", high: "#222222", max: "#2a2a2a" },
+        action: { primary: { base: "#333333" } },
+        feedback,
       },
-      border: { default: color }, background: { action: { primary: { default: "#222222" } } },
+      border: { base: color },
     },
     keymap: { layer: (fn: any) => { layers.push(fn()) } },
     ui: {

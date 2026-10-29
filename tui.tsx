@@ -8,9 +8,10 @@
 //  - The session sidebar shows upcoming jobs, and flags sessions created by an automation run.
 //  - Finished runs raise a toast, plus an OS notification when the terminal isn't focused.
 
+import type { RGBA } from "@opentui/core"
 import { Plugin } from "@opencode/plugin/tui"
 import { watch, type FSWatcher } from "node:fs"
-import { createMemo, createSignal, For, Show } from "solid-js"
+import { createMemo, createSignal, For, Show, type JSX } from "solid-js"
 import { describe, nextRun } from "./cron.ts"
 import { defaultDataDir, isActive, mutateRaw, parseScheduleText, relative, uniqueID } from "./jobs.ts"
 import { Store, type Job, type Run, type RunStatus, type SessionMode } from "./store.ts"
@@ -20,6 +21,45 @@ type Context = Plugin.Context
 const PAGE = "automations"
 
 const glyph: Record<RunStatus, string> = { running: "◐", succeeded: "✓", failed: "✗", timeout: "⧗", skipped: "↷" }
+
+// Everything is drawn as filled blocks in the host theme's colors (no borders), so the page
+// follows whichever theme is selected. Tinted blocks use the theme's categorical hues.
+function look(ctx: Context) {
+  const t = ctx.theme
+  const dark = ctx.themeMode !== "light"
+  const hue = (i: number) => t.categorical[i % Math.max(1, t.categorical.length)] ?? t.hue.accent
+  return {
+    t,
+    text: t.text.base,
+    muted: t.text.muted,
+    faint: t.text.faint,
+    ok: t.text.feedback.success.base,
+    warn: t.text.feedback.warning.base,
+    bad: t.text.feedback.error.base,
+    info: t.text.feedback.info.base,
+    /** Neutral raised block (list, sidebar). */
+    panel: t.background.raised.base,
+    /** Slightly higher block, for key caps. */
+    cap: t.background.raised.high,
+    /** Softly tinted block background for section i. */
+    tint: (i: number) => hue(i)[dark ? 900 : 100],
+    /** Readable heading color on that tint. */
+    ink: (i: number) => hue(i)[dark ? 300 : 700],
+  }
+}
+
+const keyHints: [string, string][] = [
+  ["↑↓", "select"],
+  ["space", "pause"],
+  ["r", "run now"],
+  ["n", "new"],
+  ["e", "prompt"],
+  ["s", "schedule"],
+  ["m", "model"],
+  ["d", "delete"],
+  ["⏎", "open session"],
+  ["esc", "back"],
+]
 const stateOf = (j: Job) => (j.done ? "done" : j.paused ? "paused" : !j.enabled ? "disabled" : "active")
 const firstLine = (s?: string) => (s ?? "").split("\n").find((l) => l.trim()) ?? ""
 const duration = (r: Run) => (r.endedAt ? `${Math.max(1, Math.round((r.endedAt - r.startedAt) / 1000))}s` : "")
@@ -236,57 +276,86 @@ function AutomationsPage(props: { ctx: Context; state: State }) {
     ],
   }))
 
-  const muted = t.text.subdued
-  const ok = t.text.feedback.success.default
-  const bad = t.text.feedback.error.default
-  const warn = t.text.feedback.warning.default
-  const statusColor = (s?: RunStatus) => (s === "succeeded" ? ok : s === "running" ? warn : s ? bad : muted)
+  const L = createMemo(() => look(ctx))
+  const statusColor = (s?: RunStatus) =>
+    s === "succeeded" ? L().ok : s === "running" ? L().warn : s === "skipped" || !s ? L().muted : L().bad
+  const badge = (j: Job) => {
+    const s = stateOf(j)
+    const kind = s === "active" ? "success" : s === "paused" ? "warning" : s === "done" ? "info" : undefined
+    return {
+      label: ` ${s} `,
+      fg: kind ? t.text.feedback[kind].base : L().muted,
+      bg: kind ? t.background.feedback[kind].base : L().cap,
+    }
+  }
+  const activeCount = createMemo(() => state.jobs().filter(isActive).length)
 
-  const Field = (p: { label: string; value: string }) => (
+  const Heading = (p: { title: string; hue: number }) => (
+    <text fg={L().ink(p.hue)}>
+      <b>{p.title.toUpperCase()}</b>
+    </text>
+  )
+  const Block = (p: { title: string; hue: number; children: JSX.Element }) => (
+    <box flexDirection="column" backgroundColor={L().tint(p.hue)} paddingLeft={2} paddingRight={2} paddingTop={1} paddingBottom={1} gap={1}>
+      <Heading title={p.title} hue={p.hue} />
+      {p.children}
+    </box>
+  )
+  const Field = (p: { label: string; value: string; fg?: RGBA }) => (
     <text>
-      <span style={{ fg: muted }}>{p.label.padEnd(11)}</span>
-      {p.value}
+      <span style={{ fg: L().muted }}>{p.label.padEnd(11)}</span>
+      <span style={{ fg: p.fg ?? L().text }}>{p.value}</span>
     </text>
   )
 
   return (
     <box flexDirection="column" flexGrow={1} paddingLeft={2} paddingRight={2} paddingTop={1}>
-      <box flexDirection="row" justifyContent="space-between">
-        <text>
+      <box flexDirection="row" justifyContent="space-between" paddingBottom={1}>
+        <text fg={L().text}>
           <b>⏰ Automations</b>
         </text>
-        <text fg={muted}>
-          {state.jobs().length} jobs · {running().size} running
+        <text fg={L().muted}>
+          {state.jobs().length} jobs · {activeCount()} active ·{" "}
+          <span style={{ fg: running().size ? L().warn : L().muted }}>{running().size} running</span>
         </text>
       </box>
 
       <Show
         when={sorted().length}
         fallback={
-          <box paddingTop={2} flexDirection="column" gap={1}>
-            <text fg={muted}>No automations yet.</text>
-            <text fg={muted}>Press n to create one, or ask in chat: “every weekday at 8:45, triage my open MRs”.</text>
+          <box backgroundColor={L().panel} padding={2} flexDirection="column" gap={1}>
+            <text fg={L().text}>No automations yet.</text>
+            <text fg={L().muted}>Press n to create one, or ask in chat: “every weekday at 8:45, triage my open MRs”.</text>
           </box>
         }
       >
-        <box flexDirection="row" flexGrow={1} paddingTop={1} gap={2}>
+        <box flexDirection="row" flexGrow={1} gap={2}>
           {/* list */}
-          <box flexDirection="column" width={36} border borderColor={t.border.default} paddingLeft={1} paddingRight={1}>
+          <box flexDirection="column" width={38} backgroundColor={L().panel} paddingTop={1} paddingBottom={1}>
+            <box paddingLeft={2} paddingBottom={1}>
+              <text fg={L().muted}>
+                <b>JOBS</b>
+              </text>
+            </box>
             <For each={sorted()}>
               {(j, i) => {
                 const isSel = () => i() === index()
                 const dot = () => (running().has(j.id) ? "◐" : isActive(j) ? "●" : "○")
                 const when = () => (running().has(j.id) ? "running" : isActive(j) ? relative(j.nextRunAt, state.now()) : stateOf(j))
+                const fg = () => (isSel() ? t.text.action.primary.base : undefined)
                 return (
                   <box
                     flexDirection="row"
                     justifyContent="space-between"
-                    backgroundColor={isSel() ? t.background.action.primary.default : undefined}
+                    paddingLeft={2}
+                    paddingRight={2}
+                    backgroundColor={isSel() ? t.background.action.primary.base : undefined}
                   >
-                    <text fg={isSel() ? t.text.action.primary.default : undefined}>
-                      <span style={{ fg: running().has(j.id) ? warn : isActive(j) ? ok : muted }}>{dot()}</span> {j.name.slice(0, 22)}
+                    <text fg={fg() ?? L().text}>
+                      <span style={{ fg: fg() ?? (running().has(j.id) ? L().warn : isActive(j) ? L().ok : L().faint) }}>{dot()}</span>{" "}
+                      {j.name.slice(0, 22)}
                     </text>
-                    <text fg={isSel() ? t.text.action.primary.default : muted}>{when()}</text>
+                    <text fg={fg() ?? L().muted}>{when()}</text>
                   </box>
                 )
               }}
@@ -298,53 +367,65 @@ function AutomationsPage(props: { ctx: Context; state: State }) {
             {(j) => (
               <scrollbox flexGrow={1}>
                 <box flexDirection="column" gap={1}>
-                  <box flexDirection="column">
+                  <Block title="Details" hue={0}>
                     <text>
-                      <b>{j().name}</b>
-                      <span style={{ fg: muted }}>
+                      <span style={{ fg: L().text }}>
+                        <b>{j().name}</b>
+                      </span>
+                      {"  "}
+                      <span style={{ fg: badge(j()).fg, bg: badge(j()).bg }}>{badge(j()).label}</span>
+                      <span style={{ fg: L().muted }}>
                         {"  "}
-                        {j().id} · {stateOf(j())}
+                        {j().id}
                         {j().source === "config" ? " · from config" : ""}
                       </span>
                     </text>
-                    <Field label="schedule" value={describe(j().schedule)} />
-                    <Field label="next" value={isActive(j()) ? `${clock(j().nextRunAt)}  (${relative(j().nextRunAt, state.now())})` : "—"} />
-                    <Field label="last" value={j().lastRunAt ? `${clock(j().lastRunAt)}  ${j().lastStatus ?? ""}` : "never"} />
-                    <Field label="session" value={j().session + (j().sessionID ? `  ${j().sessionID}` : "")} />
-                    <Field label="agent" value={j().agent ?? "default"} />
-                    <Field label="model" value={j().session === "current" ? "chat's model" : (j().model ?? "agent default")} />
-                    <Field label="directory" value={ctx.ui.format.path(j().directory)} />
-                    <Field label="timeout" value={`${j().timeoutMinutes}m · catch-up ${j().catchUp ? "on" : "off"}`} />
-                  </box>
-
-                  <box flexDirection="column">
-                    <text fg={muted}>prompt</text>
-                    <box border borderColor={t.border.default} paddingLeft={1} paddingRight={1}>
-                      <text>{j().prompt}</text>
+                    <box flexDirection="column">
+                      <Field label="schedule" value={describe(j().schedule)} />
+                      <Field label="next" value={isActive(j()) ? `${clock(j().nextRunAt)}  (${relative(j().nextRunAt, state.now())})` : "—"} />
+                      <Field
+                        label="last"
+                        value={j().lastRunAt ? `${clock(j().lastRunAt)}  ${j().lastStatus ?? ""}` : "never"}
+                        fg={j().lastStatus ? statusColor(j().lastStatus as RunStatus) : undefined}
+                      />
                     </box>
-                  </box>
+                    <box flexDirection="column">
+                      <Field label="session" value={j().session + (j().sessionID ? `  ${j().sessionID}` : "")} />
+                      <Field label="agent" value={j().agent ?? "default"} />
+                      <Field label="model" value={j().session === "current" ? "chat's model" : (j().model ?? "agent default")} />
+                    </box>
+                    <box flexDirection="column">
+                      <Field label="directory" value={ctx.ui.format.path(j().directory)} />
+                      <Field label="timeout" value={`${j().timeoutMinutes}m · catch-up ${j().catchUp ? "on" : "off"}`} />
+                    </box>
+                  </Block>
 
-                  <box flexDirection="column">
-                    <text fg={muted}>recent runs</text>
-                    <Show when={jobRuns().length} fallback={<text fg={muted}>none yet</text>}>
-                      <For each={jobRuns()}>
-                        {(r) => (
-                          <box flexDirection="column">
-                            <text>
-                              <span style={{ fg: statusColor(r.status) }}>{glyph[r.status]}</span> {clock(r.startedAt)}
-                              <span style={{ fg: muted }}>
-                                {"  "}
-                                {r.status} {duration(r)}
-                              </span>
-                            </text>
-                            <Show when={r.error ?? firstLine(r.output)}>
-                              {(line) => <text fg={r.error ? bad : muted}>{"  " + line().slice(0, 100)}</text>}
-                            </Show>
-                          </box>
-                        )}
-                      </For>
+                  <Block title="Prompt" hue={1}>
+                    <text fg={L().text}>{j().prompt}</text>
+                  </Block>
+
+                  <Block title="Recent runs" hue={2}>
+                    <Show when={jobRuns().length} fallback={<text fg={L().muted}>none yet</text>}>
+                      <box flexDirection="column">
+                        <For each={jobRuns()}>
+                          {(r) => (
+                            <box flexDirection="column">
+                              <text fg={L().text}>
+                                <span style={{ fg: statusColor(r.status) }}>{glyph[r.status]}</span> {clock(r.startedAt)}
+                                <span style={{ fg: L().muted }}>
+                                  {"  "}
+                                  {r.status} {duration(r)}
+                                </span>
+                              </text>
+                              <Show when={r.error ?? firstLine(r.output)}>
+                                {(line) => <text fg={r.error ? L().bad : L().muted}>{"  " + line().slice(0, 100)}</text>}
+                              </Show>
+                            </box>
+                          )}
+                        </For>
+                      </box>
                     </Show>
-                  </box>
+                  </Block>
                 </box>
               </scrollbox>
             )}
@@ -352,16 +433,23 @@ function AutomationsPage(props: { ctx: Context; state: State }) {
         </box>
       </Show>
 
-      <text fg={muted} paddingTop={1}>
-        ↑↓ select · space pause · r run now · n new · e prompt · s schedule · m model · d delete · ⏎ open session · esc back
-      </text>
+      <box flexDirection="row" flexWrap="wrap" paddingTop={1} paddingBottom={1} columnGap={2}>
+        <For each={keyHints}>
+          {([key, label]) => (
+            <text>
+              <span style={{ fg: L().text, bg: L().cap }}> {key} </span>
+              <span style={{ fg: L().muted }}> {label}</span>
+            </text>
+          )}
+        </For>
+      </box>
     </box>
   )
 }
 
 function SidebarSection(props: { ctx: Context; state: State; sessionID: string }) {
   const { ctx, state } = props
-  const muted = ctx.theme.text.subdued
+  const L = createMemo(() => look(ctx))
   const upcoming = createMemo(() =>
     state
       .jobs()
@@ -372,14 +460,13 @@ function SidebarSection(props: { ctx: Context; state: State; sessionID: string }
   const thisRun = createMemo(() => state.runs().find((r) => r.sessionID === props.sessionID))
   return (
     <Show when={state.jobs().length || thisRun()}>
-      <box flexDirection="column" paddingTop={1}>
-        <text>
-          <b>Automations</b>
-          <span style={{ fg: muted }}> /automations</span>
+      <box flexDirection="column" marginTop={1} backgroundColor={L().panel} paddingLeft={1} paddingRight={1} paddingTop={1} paddingBottom={1}>
+        <text fg={L().ink(0)}>
+          <b>⏰ Automations</b>
         </text>
         <Show when={thisRun()}>
           {(r) => (
-            <text fg={ctx.theme.text.feedback.info.default}>
+            <text fg={L().info}>
               this session: {r().jobID} {glyph[r().status]}
             </text>
           )}
@@ -387,11 +474,12 @@ function SidebarSection(props: { ctx: Context; state: State; sessionID: string }
         <For each={upcoming()}>
           {(j) => (
             <box flexDirection="row" justifyContent="space-between">
-              <text>{j.name.slice(0, 18)}</text>
-              <text fg={muted}>{relative(j.nextRunAt, state.now())}</text>
+              <text fg={L().text}>{j.name.slice(0, 18)}</text>
+              <text fg={L().muted}>{relative(j.nextRunAt, state.now())}</text>
             </box>
           )}
         </For>
+        <text fg={L().faint}>/automations</text>
       </box>
     </Show>
   )

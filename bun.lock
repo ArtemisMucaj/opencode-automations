@@ -10,6 +10,7 @@
         "proper-lockfile": "4.1.2",
       },
       "devDependencies": {
+        "@opencode/theme": "2.2.1",
         "@opentui/core": "0.7.0",
         "@opentui/solid": "0.7.0",
         "@types/bun": "1.4.4",
@@ -193,6 +194,8 @@
     "@opencode/protocol": ["@opencode/protocol@2.2.1", "", { "dependencies": { "@opencode/schema": "2.2.1", "effect": "4.0.1" } }, "sha512-lqkkRhrckEKmiSJi249rvfX/fXX8JeiMS7adtXonO1Ol3IqnEqY4uSZgvQiQ11SBR5RyDQaRW9KGoOjaTY4PAQ=="],
 
     "@opencode/schema": ["@opencode/schema@2.2.1", "", { "dependencies": { "@standard-schema/spec": "1.1.0", "effect": "4.0.1" } }, "sha512-TicxPQC1UKqq954X1yUKmBlXfJYl5CRr52FKwLZbYOfTxJd406Hoqt2arM4YI3c+abs17b9sumoq5uqFLhiGFA=="],
+
+    "@opencode/theme": ["@opencode/theme@2.2.1", "", { "dependencies": { "@opentui/core": "0.7.0", "effect": "4.0.1" } }, "sha512-YAKT/TacMHM04rLi9o1zyVpgEhy3hpuHZKGs/VC6+wigRrieLvyTvS7/FmcOVEeophNmwL0FYI1sD/NCTLlxlA=="],
 
     "@opencode/util": ["@opencode/util@2.2.1", "", { "dependencies": { "@effect/opentelemetry": "4.0.1", "@effect/platform-node": "4.0.1", "@effect/platform-node-shared": "4.0.1", "@npmcli/arborist": "9.4.0", "@npmcli/config": "10.8.1", "@opentelemetry/api": "1.9.0", "@opentelemetry/api-logs": "0.219.0", "@opentelemetry/context-async-hooks": "2.8.0", "@opentelemetry/exporter-trace-otlp-http": "0.219.0", "@opentelemetry/resources": "2.8.0", "@opentelemetry/sdk-logs": "0.219.0", "@opentelemetry/sdk-metrics": "2.8.0", "@opentelemetry/sdk-trace-base": "2.8.0", "@opentelemetry/sdk-trace-node": "2.8.0", "cross-spawn": "7.0.6", "effect": "4.0.1", "glob": "13.0.5", "mime-types": "3.0.2", "minimatch": "10.2.5", "npm-package-arg": "13.0.2", "open": "11.0.4", "pacote": "21.5.1" } }, "sha512-MgJ8oJ/S+L5gRBmYk8bEHRVR99eEvUUDGg8fZLG/UD1+RPisJ6Ce1ZO++pBjTvkdS+Okk6lPxhbjYemIQtSciQ=="],
 
