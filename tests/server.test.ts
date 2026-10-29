@@ -54,7 +54,7 @@ async function start(options: Record<string, unknown> = {}, jobs: Job[] = []) {
 function job(overrides: Partial<Job> = {}): Job {
   return {
     id: "morning", name: "Morning", prompt: "Check things", schedule: { kind: "every", ms: 60_000 },
-    directory: process.cwd(), session: "new", timeoutMinutes: 30, catchUp: true, enabled: true,
+    directory: process.cwd(), session: "new", timeoutMinutes: 30, runMissed: true, enabled: true,
     source: "tool", createdAt: Date.now() - 120_000, nextRunAt: Date.now() + 60_000, ...overrides,
   }
 }

@@ -164,7 +164,7 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
     togglePause: withJob((j) =>
       update(j.id, (x) => {
         x.paused = !x.paused
-        // Resuming re-anchors to now, so a long pause doesn't trigger a catch-up run.
+        // Resuming re-anchors to now, so a long pause doesn't fire a missed run right away.
         if (!x.paused) x.nextRunAt = nextRun(x.schedule, Date.now(), x.createdAt)
       }),
     ),
@@ -257,7 +257,7 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
             directory,
             session,
             timeoutMinutes: 30,
-            catchUp: true,
+            runMissed: true,
             enabled: true,
             source: "tool",
             createdAt: now,
@@ -434,7 +434,7 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
                             <Field label="agent" value={j().agent ?? "default"} />
                             <Field label="model" value={j().session === "current" ? "chat's model" : (j().model ?? "agent default")} />
                             <Field label="directory" value={ctx.ui.format.path(j().directory)} />
-                            <Field label="timeout" value={`${j().timeoutMinutes}m · catch-up ${j().catchUp ? "on" : "off"}`} />
+                            <Field label="timeout" value={`${j().timeoutMinutes}m · run missed ${j().runMissed ? "on" : "off"}`} />
                           </box>
                         </Block>
 

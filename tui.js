@@ -180,7 +180,7 @@ function AutomationsView(props) {
   const actions = {
     togglePause: withJob(j => update(j.id, x => {
       x.paused = !x.paused;
-      // Resuming re-anchors to now, so a long pause doesn't trigger a catch-up run.
+      // Resuming re-anchors to now, so a long pause doesn't fire a missed run right away.
       if (!x.paused) x.nextRunAt = nextRun(x.schedule, Date.now(), x.createdAt);
     })),
     runNow: withJob(j => {
@@ -295,7 +295,7 @@ function AutomationsView(props) {
           directory,
           session,
           timeoutMinutes: 30,
-          catchUp: true,
+          runMissed: true,
           enabled: true,
           source: "tool",
           createdAt: now,
@@ -694,7 +694,7 @@ function AutomationsView(props) {
                       _$insert(_el$44, _$createComponent(Field, {
                         label: "timeout",
                         get value() {
-                          return `${j().timeoutMinutes}m · catch-up ${j().catchUp ? "on" : "off"}`;
+                          return `${j().timeoutMinutes}m · run missed ${j().runMissed ? "on" : "off"}`;
                         }
                       }), null);
                       return _el$44;

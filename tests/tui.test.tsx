@@ -12,7 +12,7 @@ test("TUI renders automations page and persists pause/run-now actions", async ()
   const store = new Store(dataDir)
   store.saveJobs([{
     id: "morning", name: "Morning triage", prompt: "Check merge requests", schedule: { kind: "every", ms: 60_000 },
-    directory: dataDir, session: "new", timeoutMinutes: 30, catchUp: true, enabled: true,
+    directory: dataDir, session: "new", timeoutMinutes: 30, runMissed: true, enabled: true,
     source: "tool", createdAt: Date.now(), nextRunAt: Date.now() + 60_000,
   } satisfies Job])
   const testRenderer = await createTestRenderer({ width: 120, height: 45 })

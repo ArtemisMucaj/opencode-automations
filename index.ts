@@ -38,7 +38,7 @@ interface ConfigJob extends ScheduleInput {
   agent?: string
   model?: string
   timeoutMinutes?: number
-  catchUp?: boolean
+  runMissed?: boolean
   enabled?: boolean
   notify?: JobNotify
 }
@@ -107,7 +107,7 @@ export default Plugin.define({
         agent: c.agent ?? opts.defaultAgent,
         model: c.model ?? opts.defaultModel,
         timeoutMinutes: c.timeoutMinutes ?? defaultTimeout,
-        catchUp: c.catchUp ?? true,
+        runMissed: c.runMissed ?? true,
         enabled: c.enabled ?? true,
         notify: c.notify,
         source: "config",
@@ -187,7 +187,7 @@ export default Plugin.define({
       }
     }
 
-    async function fire(job: Job, reason: "schedule" | "manual" | "catch-up"): Promise<Run> {
+    async function fire(job: Job, reason: "schedule" | "manual" | "missed"): Promise<Run> {
       const runID = `${job.id}-${randomUUID()}`
       const base: Run = { jobID: job.id, runID, startedAt: Date.now(), status: "running" }
 
@@ -232,7 +232,7 @@ export default Plugin.define({
       leader = store.lease(tickMs * 3)
       if (!leader) return
       const now = Date.now()
-      const due: Array<[Job, "schedule" | "manual" | "catch-up"]> = []
+      const due: Array<[Job, "schedule" | "manual" | "missed"]> = []
 
       mutate((jobs) => {
         for (const job of jobs) {
@@ -249,7 +249,7 @@ export default Plugin.define({
           }
           if (now < job.nextRunAt) continue
           const missed = now - job.nextRunAt > Math.max(MISSED_GRACE_MS, tickMs * 2)
-          const reason = !missed ? "schedule" : job.catchUp ? "catch-up" : undefined
+          const reason = !missed ? "schedule" : job.runMissed ? "missed" : undefined
           if (reason) {
             due.push([job, reason])
             job.lastRunAt = now
@@ -349,7 +349,7 @@ export default Plugin.define({
                 agent: input.agent ?? opts.defaultAgent,
                 model: input.model ?? opts.defaultModel,
                 timeoutMinutes: input.timeoutMinutes ?? defaultTimeout,
-                catchUp: true,
+                runMissed: true,
                 enabled: true,
                 source: "tool",
                 createdAt: now,

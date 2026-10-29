@@ -5,7 +5,7 @@ const message: Message = {
   title: "Morning succeeded", body: "All clear", status: "succeeded",
   job: {
     id: "morning", name: "Morning", prompt: "Check things", schedule: { kind: "every", ms: 60_000 },
-    directory: "/project", session: "new", timeoutMinutes: 30, catchUp: true, enabled: true,
+    directory: "/project", session: "new", timeoutMinutes: 30, runMissed: true, enabled: true,
     source: "tool", createdAt: 1,
   },
   run: { runID: "r1", jobID: "morning", startedAt: 1, endedAt: 2, status: "succeeded" },

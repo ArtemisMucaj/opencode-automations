@@ -18,7 +18,7 @@ export interface Job {
   agent?: string
   model?: string
   timeoutMinutes: number
-  catchUp: boolean
+  runMissed: boolean
   enabled: boolean
   paused?: boolean
   done?: boolean
