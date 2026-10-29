@@ -6,9 +6,9 @@
       "options": {
         "tickSeconds": 30,
         "defaultTimeoutMinutes": 30,
-        // macOS notifications enabled for automation run completion.
+        // Native desktop notifications enabled for automation run completion.
         "notify": {
-          "macos": true,
+          "native": true,
         },
         // No sample jobs run automatically.
         // See examples/opencode.jsonc for opt-in configuration.

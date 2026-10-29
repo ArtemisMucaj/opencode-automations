@@ -11,7 +11,7 @@
         // Sent by the server, so they work with no TUI open. Use any subset.
         "notify": {
           "on": ["succeeded", "failed", "timeout"],
-          "macos": true,
+          "native": true,
           // Optional phone notifications via Pushover.
           // "pushover": { "token": "<app token>", "user": "<user key>" },
         },

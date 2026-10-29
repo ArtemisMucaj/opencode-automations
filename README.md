@@ -110,8 +110,15 @@ Configured on the **server** plugin (`notify` in `opencode.jsonc`), so they fire
 
 | channel | reaches | setup |
 |---|---|---|
-| `macos` | Mac notification center | `"macos": true` |
+| `native` | macOS or Linux desktop | `"native": true` |
 | `pushover` | iPhone, Android, desktop | `"pushover": { "token", "user" }` |
+
+`native` picks the server's OS backend automatically:
+
+- **macOS:** `osascript` (AppleScript). Allow notifications for Script Editor in System Settings if prompted. Optional macOS-only sound: `"native": { "sound": "Ping" }` (empty string disables sound).
+- **Linux:** `notify-send` (install `libnotify-bin` on Debian/Ubuntu, `libnotify` on Fedora/Arch). Requires a running desktop notification service and access to its user D-Bus session. The OpenCode server must inherit that desktop session environment; a headless server or isolated system service will not display local notifications.
+
+No TUI needs to be open, but native notifications appear on the **server machine**, not a remote client's desktop. Missing utilities, unavailable desktop sessions, or unsupported OSes are logged as `native` delivery failures without failing the automation; Pushover can still deliver. The old `macos` option is no longer supported—replace it with `native`.
 
 Failures get elevated priority in Pushover. `on` picks outcomes (default: succeeded, failed, timeout). Per job, `notify: false` silences it and `notify: ["failed"]` limits it. A failing channel is logged and never affects the run. The TUI's own OS notification is now off by default (`notify` in `cli.json` to turn it back on) to avoid duplicates.
 
@@ -139,7 +146,7 @@ Failures get elevated priority in Pushover. `on` picks outcomes (default: succee
 
 ```sh
 bun install
-bun test            # cron/DST, persistence/leases, server tools, TUI intents, macOS/Pushover delivery, headless TUI render
+bun test            # cron/DST, persistence/leases, server tools, TUI intents, native/Pushover delivery, headless TUI render
 bun run typecheck
 ```
 

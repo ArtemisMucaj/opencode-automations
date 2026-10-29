@@ -1,5 +1,5 @@
 // Run-completion notifications, sent from the server plugin so they work with no TUI open.
-// Channels: macOS Notification Center and Pushover.
+// Channels: native desktop notifications (macOS/Linux) and Pushover.
 // Failures are logged and never affect the run.
 
 import { spawn } from "node:child_process"
@@ -8,7 +8,8 @@ import type { Job, Run, RunStatus } from "./store.ts"
 export interface NotifyConfig {
   /** Which outcomes notify. Default: every finished run except skipped. */
   on?: RunStatus[]
-  macos?: boolean | { sound?: string }
+  /** Desktop notifications. Sound customization applies to macOS only. */
+  native?: boolean | { sound?: string }
   pushover?: { token: string; user: string }
 }
 
@@ -25,7 +26,7 @@ export interface Message {
 
 export interface Deps {
   fetch: (input: string, init?: RequestInit) => Promise<Response>
-  osascript: (args: string[]) => Promise<void>
+  exec: (command: string, args: string[]) => Promise<void>
   platform: NodeJS.Platform
 }
 
@@ -34,12 +35,12 @@ const DEFAULT_ON: RunStatus[] = ["succeeded", "failed", "timeout"]
 const defaultDeps: Deps = {
   fetch: (input, init) => fetch(input, init),
   platform: process.platform,
-  osascript: (args) =>
+  exec: (command, args) =>
     new Promise((resolve, reject) => {
       // argv, not string interpolation: job output can contain anything.
-      const p = spawn("osascript", args, { stdio: "ignore" })
+      const p = spawn(command, args, { stdio: "ignore" })
       p.on("error", reject)
-      p.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`osascript exited ${code}`))))
+      p.on("exit", (code, signal) => (code === 0 ? resolve() : reject(new Error(`${command} exited ${signal ?? code}`))))
     }),
 }
 
@@ -72,17 +73,28 @@ export async function send(cfg: NotifyConfig, m: Message, deps: Deps = defaultDe
   const bad = m.status !== "succeeded"
   const tasks: Array<[string, () => Promise<unknown>]> = []
 
-  if (cfg.macos && deps.platform === "darwin") {
-    const sound = typeof cfg.macos === "object" ? cfg.macos.sound : bad ? "Basso" : "Glass"
+  if (cfg.native) {
+    const native = cfg.native
     tasks.push([
-      "macos",
-      () =>
-        deps.osascript([
-          "-e", "on run argv",
-          "-e", `display notification (item 2 of argv) with title (item 1 of argv) subtitle (item 3 of argv)${sound ? ` sound name "${sound.replace(/"/g, "")}"` : ""}`,
-          "-e", "end run",
-          m.title, m.body.slice(0, 240), "opencode automations",
-        ]),
+      "native",
+      async () => {
+        if (deps.platform === "darwin") {
+          const sound = typeof native === "object" ? native.sound : bad ? "Basso" : "Glass"
+          await deps.exec("osascript", [
+            "-e", "on run argv",
+            "-e", `display notification (item 2 of argv) with title (item 1 of argv) subtitle (item 3 of argv)${sound ? ` sound name "${sound.replace(/"/g, "")}"` : ""}`,
+            "-e", "end run",
+            m.title, m.body.slice(0, 240), "opencode automations",
+          ])
+        } else if (deps.platform === "linux") {
+          await deps.exec("notify-send", [
+            "--app-name", "opencode automations", "--urgency", bad ? "critical" : "normal",
+            "--", m.title, m.body,
+          ])
+        } else {
+          throw new Error(`native notifications are not supported on ${deps.platform}`)
+        }
+      },
     ])
   }
 
