@@ -51,12 +51,11 @@ export function shouldNotify(cfg: NotifyConfig | undefined, job: Job, status: Ru
 }
 
 export function compose(job: Job, run: Run): Message {
-  const icon = { succeeded: "✅", failed: "❌", timeout: "⏱", skipped: "↷", running: "◐" }[run.status]
   const secs = run.endedAt ? Math.max(1, Math.round((run.endedAt - run.startedAt) / 1000)) : 0
   const dur = secs >= 60 ? `${Math.round(secs / 60)}m` : `${secs}s`
   const text = (run.error ?? run.output ?? "").trim()
   return {
-    title: `${icon} ${job.name} ${run.status}`,
+    title: `${job.name} ${run.status}`,
     body: text ? text.slice(0, 500) : `Finished in ${dur}`,
     status: run.status,
     job,
