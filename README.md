@@ -1,13 +1,13 @@
 # opencode automations (v2 plugin)
 
-Run prompts on a schedule inside opencode 2 — cron, fixed intervals, or one-shot — declared in config, created from chat, or managed from a TUI page.
+Run prompts on a schedule inside opencode 2 — cron, fixed intervals, or one-shot — declared in config, created from chat, or managed from a TUI dialog.
 
 Two halves, one package:
 
 | part | runs in | does |
 |---|---|---|
 | `index.ts` (server plugin) | the opencode background server | owns the ticker, fires runs, tracks them to completion, exposes `automation_*` tools |
-| `tui.tsx` (TUI plugin) | each TUI | `/automations` page, sidebar section, toasts + OS notifications when runs finish |
+| `tui.tsx` (TUI plugin) | each TUI | `/automations` dialog, sidebar section, toasts + OS notifications when runs finish |
 
 Both share `jobs.json` / `history.jsonl` on disk. The TUI only writes *intents* (pause, edit, delete, run-now); the server's leader executes them, so there's still exactly one firer and one history.
 
@@ -90,7 +90,7 @@ Uses `@opencode/plugin@2.2.1`, OpenTUI `0.7.0`, `cron-parser` for timezone/DST-a
 
 ## TUI
 
-`/automations` (or the command palette → "Automations"):
+`/automations` (or the command palette → "Automations") opens a dialog over the current screen; **esc** closes it.
 
 - **⏎** opens the job's latest run session (in a tab if tabs are on).
 - **r** queues a run; the server fires it on its next tick (≤ `tickSeconds`), even if the job is paused, without moving its schedule.
