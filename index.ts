@@ -277,7 +277,8 @@ export default Plugin.define({
               case "session.execution.failed":
                 finish(sid, "failed", JSON.stringify((ev as any).data.error))
                 break
-              case "session.idle": // queue drained → our prompt is done
+              case "session.execution.succeeded": // V2 execution completed
+              case "session.idle": // compatibility with hosts emitting legacy idle
                 finish(sid, "succeeded")
                 break
             }

@@ -109,6 +109,29 @@ test("one-shot completion survives reload and run output reaches history", async
   expect(app.store.loadJobs()[0].done).toBe(true)
 })
 
+test("V2 execution success completes the run without waiting for legacy idle", async () => {
+  const fetch = spyOn(globalThis, "fetch").mockResolvedValue(new Response("ok"))
+  try {
+    const app = await start({ notify: { pushover: { token: "test-token", user: "test-user" } } }, [job({ timeoutMinutes: 0.001 })])
+    await app.call("automation_run", { id: "morning" })
+    app.events.emit("event", { type: "session.text.ended", data: { sessionID: "session-1", text: "Ok" } })
+    app.events.emit("event", {
+      id: "evt-success", type: "session.execution.succeeded", created: Date.now(),
+      durable: { aggregateID: "session-1", seq: 3, version: 1 },
+      location: { directory: app.dataDir }, data: { sessionID: "session-1" },
+    })
+    await flush()
+    expect(app.store.history()[0]).toMatchObject({ status: "succeeded", output: "Ok" })
+    expect(app.store.loadJobs()[0].lastStatus).toBe("succeeded")
+    // A compatibility idle event must not produce another notification.
+    app.events.emit("event", { type: "session.idle", data: { sessionID: "session-1" } })
+    await new Promise((resolve) => setTimeout(resolve, 80))
+    expect(app.store.history()[0].status).toBe("succeeded")
+    expect(fetch.mock.calls).toHaveLength(1)
+    expect(JSON.parse(fetch.mock.calls[0][1]?.body as string)).toMatchObject({ message: "Ok", priority: 0 })
+  } finally { fetch.mockRestore() }
+})
+
 test("defaultModel reaches newly created sessions", async () => {
   const app = await start({ defaultModel: "anthropic/test-model" })
   await app.call("automation_create", { name: "Audit", prompt: "Check", every: "1h" })
