@@ -352,7 +352,7 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
             paddingRight={2}
             paddingTop={1}
           >
-      <box flexDirection="row" justifyContent="space-between" paddingBottom={1}>
+            <box flexDirection="row" justifyContent="space-between" paddingBottom={1} flexShrink={0}>
               <text fg={L().text}>
                 <b>⏰ Automations</b>
               </text>
@@ -371,7 +371,8 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
                 </box>
               }
             >
-              <box flexDirection="row" flexGrow={1} gap={2}>
+              {/* flexBasis/minHeight 0: a tall detail pane scrolls instead of squeezing the header and hints. */}
+              <box flexDirection="row" flexGrow={1} flexShrink={1} flexBasis={0} minHeight={0} gap={2}>
                 {/* list */}
                 <box flexDirection="column" width={38} backgroundColor={L().panel} paddingTop={1} paddingBottom={1}>
                   <box paddingLeft={2} paddingBottom={1}>
@@ -393,11 +394,12 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
                           paddingRight={2}
                           backgroundColor={isSel() ? t.background.action.primary.focused : undefined}
                         >
-                          <text fg={fg() ?? L().text}>
-                            {/* Green marks the selected row; status is shown by the dot's shape. */}
-                            <span style={{ fg: isSel() ? L().ok : running().has(j.id) ? L().warn : L().muted }}>{dot()}</span>{" "}
-                            {j.name.slice(0, 22)}
-                          </text>
+                          {/* The dot is its own <text>: opencode doesn't repaint a <span> whose color changes but whose
+                              text doesn't, which left the green dot on the previously selected row. */}
+                          <box flexDirection="row" gap={1}>
+                            <text fg={isSel() ? L().ok : running().has(j.id) ? L().warn : L().muted}>{dot()}</text>
+                            <text fg={fg() ?? L().text}>{j.name.slice(0, 22)}</text>
+                          </box>
                           <text fg={fg() ?? L().muted}>{when()}</text>
                         </box>
                       )
@@ -408,7 +410,7 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
                 {/* detail */}
                 <Show when={selected()}>
                   {(j) => (
-                    <scrollbox flexGrow={1}>
+                    <scrollbox flexGrow={1} minHeight={0}>
                       <box flexDirection="column" gap={1}>
                         <Block title="Details" hue={0}>
                           <text>
@@ -472,7 +474,7 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
               </box>
             </Show>
 
-            <box flexDirection="row" flexWrap="wrap" paddingTop={1} paddingBottom={1} columnGap={2}>
+            <box flexDirection="row" flexWrap="wrap" paddingTop={1} paddingBottom={1} columnGap={2} flexShrink={0}>
               <For each={keyHints}>
                 {([key, label]) => (
                   <text>

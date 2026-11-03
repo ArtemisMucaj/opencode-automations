@@ -478,6 +478,7 @@ function AutomationsView(props) {
         _$setProp(_el$9, "flexDirection", "row");
         _$setProp(_el$9, "justifyContent", "space-between");
         _$setProp(_el$9, "paddingBottom", 1);
+        _$setProp(_el$9, "flexShrink", 0);
         _$insertNode(_el$0, _el$1);
         _$insertNode(_el$1, _$createTextNode(`⏰ Automations`));
         _$insertNode(_el$11, _el$12);
@@ -530,6 +531,9 @@ function AutomationsView(props) {
             _$insertNode(_el$18, _el$19);
             _$setProp(_el$18, "flexDirection", "row");
             _$setProp(_el$18, "flexGrow", 1);
+            _$setProp(_el$18, "flexShrink", 1);
+            _$setProp(_el$18, "flexBasis", 0);
+            _$setProp(_el$18, "minHeight", 0);
             _$setProp(_el$18, "gap", 2);
             _$insertNode(_el$19, _el$20);
             _$setProp(_el$19, "flexDirection", "column");
@@ -552,9 +556,9 @@ function AutomationsView(props) {
                 const fg = () => isSel() ? t.text.action.primary.focused : undefined;
                 return (() => {
                   var _el$30 = _$createElement("box"),
-                    _el$31 = _$createElement("text"),
-                    _el$32 = _$createElement("span"),
-                    _el$33 = _$createTextNode(` `),
+                    _el$31 = _$createElement("box"),
+                    _el$32 = _$createElement("text"),
+                    _el$33 = _$createElement("text"),
                     _el$34 = _$createElement("text");
                   _$insertNode(_el$30, _el$31);
                   _$insertNode(_el$30, _el$34);
@@ -564,19 +568,19 @@ function AutomationsView(props) {
                   _$setProp(_el$30, "paddingRight", 2);
                   _$insertNode(_el$31, _el$32);
                   _$insertNode(_el$31, _el$33);
+                  _$setProp(_el$31, "flexDirection", "row");
+                  _$setProp(_el$31, "gap", 1);
                   _$insert(_el$32, dot);
-                  _$insert(_el$31, () => j.name.slice(0, 22), null);
+                  _$insert(_el$33, () => j.name.slice(0, 22));
                   _$insert(_el$34, when);
                   _$effect(_p$ => {
                     var _v$14 = isSel() ? t.background.action.primary.focused : undefined,
-                      _v$15 = fg() ?? L().text,
-                      _v$16 = {
-                        fg: isSel() ? L().ok : running().has(j.id) ? L().warn : L().muted
-                      },
+                      _v$15 = isSel() ? L().ok : running().has(j.id) ? L().warn : L().muted,
+                      _v$16 = fg() ?? L().text,
                       _v$17 = fg() ?? L().muted;
                     _v$14 !== _p$.e && (_p$.e = _$setProp(_el$30, "backgroundColor", _v$14, _p$.e));
-                    _v$15 !== _p$.t && (_p$.t = _$setProp(_el$31, "fg", _v$15, _p$.t));
-                    _v$16 !== _p$.a && (_p$.a = _$setProp(_el$32, "style", _v$16, _p$.a));
+                    _v$15 !== _p$.t && (_p$.t = _$setProp(_el$32, "fg", _v$15, _p$.t));
+                    _v$16 !== _p$.a && (_p$.a = _$setProp(_el$33, "fg", _v$16, _p$.a));
                     _v$17 !== _p$.o && (_p$.o = _$setProp(_el$34, "fg", _v$17, _p$.o));
                     return _p$;
                   }, {
@@ -598,6 +602,7 @@ function AutomationsView(props) {
                   _el$36 = _$createElement("box");
                 _$insertNode(_el$35, _el$36);
                 _$setProp(_el$35, "flexGrow", 1);
+                _$setProp(_el$35, "minHeight", 0);
                 _$setProp(_el$36, "flexDirection", "column");
                 _$setProp(_el$36, "gap", 1);
                 _$insert(_el$36, _$createComponent(Block, {
@@ -810,6 +815,7 @@ function AutomationsView(props) {
         _$setProp(_el$24, "paddingTop", 1);
         _$setProp(_el$24, "paddingBottom", 1);
         _$setProp(_el$24, "columnGap", 2);
+        _$setProp(_el$24, "flexShrink", 0);
         _$insert(_el$24, _$createComponent(For, {
           each: keyHints,
           children: ([key, label]) => (() => {
