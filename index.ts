@@ -180,7 +180,7 @@ export default Plugin.define({
     // Publish what the config channels look like (no headers or body, so no secrets) for the TUI.
     try {
       const config = Object.fromEntries((opts.channels ?? []).map((c) => [c.id, summarize(c)]))
-      store.mutateChannels((s) => { s.config = config })
+      await store.mutateChannels((s) => { s.config = config })
     } catch (e) { console.error("[automations] channel state:", (e as Error)?.message) }
 
     /**
@@ -262,10 +262,10 @@ export default Plugin.define({
       return [...byID.values()]
     }
 
-    function mutate<T>(fn: (jobs: Job[]) => T): T {
-      return store.mutate((jobs) => {
+    function mutate<T>(fn: (jobs: Job[]) => T | Promise<T>): Promise<T> {
+      return store.mutate(async (jobs) => {
         const merged = load(jobs)
-        const out = fn(merged)
+        const out = await fn(merged)
         jobs.splice(0, jobs.length, ...merged)
         return out
       })
@@ -304,7 +304,7 @@ export default Plugin.define({
         if (job.session === "current") throw new Error(`session ${job.sessionID} is gone`)
       }
       const id = await createSession(job, `⏰ ${job.name}${job.session === "new" ? ` · ${new Date().toLocaleString()}` : ""}`)
-      if (job.session === "sticky") mutate((jobs) => { const j = find(jobs, job.id); if (j) j.sessionID = id })
+      if (job.session === "sticky") await mutate((jobs) => { const j = find(jobs, job.id); if (j) j.sessionID = id })
       return id
     }
 
@@ -328,13 +328,18 @@ export default Plugin.define({
         ...(f.sent ? { notifications: f.sent } : {}),
       }
       store.appendRun(run)
-      mutate((jobs) => { const j = find(jobs, run.jobID); if (j) j.lastStatus = status })
-      // A key's session counts as used when its run ends, so an active key isn't the one evicted.
-      if (f.key !== undefined) {
-        try { store.mutateChannels((s) => touch(s.queues[f.job.id], f.key!, sessionID)) }
-        catch (e) { console.error("[automations] channel state:", (e as Error)?.message) }
-      }
-      notify(f.job, run)
+      // The run is done in memory already (above, synchronously, so a second end event can't finish it twice);
+      // what's saved on disk follows (tracked, so shutdown waits for it).
+      void track((async () => {
+        try { await mutate((jobs) => { const j = find(jobs, run.jobID); if (j) j.lastStatus = status }) }
+        catch (e) { console.error("[automations] job state:", (e as Error)?.message) }
+        // A key's session counts as used when its run ends, so an active key isn't the one evicted.
+        if (f.key !== undefined) {
+          try { await store.mutateChannels((s) => touch(s.queues[f.job.id], f.key!, sessionID)) }
+          catch (e) { console.error("[automations] channel state:", (e as Error)?.message) }
+        }
+        notify(f.job, run)
+      })())
     }
 
     /** The automatic end-of-run notice; what the agent wanted to say went out via automation_notify. */
@@ -419,7 +424,7 @@ export default Plugin.define({
       try {
         found = key !== undefined ? await keySession(job, key, events, savedSession) : undefined
         if (abort.signal.aborted) return STOPPING
-        took = store.mutateChannels((s) => {
+        took = await store.mutateChannels((s) => {
           const q = (s.queues[job.id] ??= emptyQueue())
           // Only what is still waiting: another process may have taken some in the meantime.
           const taken = q.pending.filter((e) => ids.has(uid(e)))
@@ -454,7 +459,7 @@ export default Plugin.define({
           ? taken
           : taken.map((e) => ({ ...e, attempts: (e.attempts ?? 0) + 1 })).filter((e) => e.attempts < MAX_START_ATTEMPTS)
         if (back.length) {
-          try { store.mutateChannels((s) => requeue((s.queues[job.id] ??= emptyQueue()), back)) }
+          try { await store.mutateChannels((s) => requeue((s.queues[job.id] ??= emptyQueue()), back)) }
           catch (e) { console.error(`[automations] ${job.id}: couldn't put events back:`, (e as Error)?.message) }
         }
       }
@@ -505,7 +510,7 @@ export default Plugin.define({
         const failed: Run = { ...base, status: "failed", endedAt: Date.now(), error: String((e as Error)?.message ?? e) }
         for (const [sid, f] of inflight) if (f.run.runID === runID) { clearTimeout(f.timer); inflight.delete(sid) }
         store.appendRun(failed)
-        mutate((jobs) => { const j = find(jobs, job.id); if (j) j.lastStatus = "failed" })
+        await mutate((jobs) => { const j = find(jobs, job.id); if (j) j.lastStatus = "failed" }).catch(() => {})
         notify(job, failed)
         return failed
       }
@@ -527,7 +532,7 @@ export default Plugin.define({
       const now = Date.now()
       const due: Array<[Job, "schedule" | "manual" | "missed"]> = []
 
-      mutate((jobs) => {
+      await mutate((jobs) => {
         for (const job of jobs) {
           if (job.runRequestedAt !== undefined) {
             job.runRequestedAt = undefined
@@ -575,13 +580,13 @@ export default Plugin.define({
         let events: ChannelEvent[]
         try { events = await poll(ch, fetch, abort.signal) } catch (e) {
           if (abort.signal.aborted) return { fresh: 0, error: STOPPING }
-          return pollFailed(ch, jobs, String((e as Error)?.message ?? e).slice(0, 500))
+          return await pollFailed(ch, jobs, String((e as Error)?.message ?? e).slice(0, 500))
         }
         if (abort.signal.aborted) return { fresh: 0, error: STOPPING }
         // Paused automations keep collecting, so nothing is lost while they're paused; disabled or finished ones don't.
         const takers = jobs.filter((j) => listens(j, ch.id) && j.enabled && !j.done)
         try {
-          const fresh = store.mutateChannels((s) => {
+          const fresh = await store.mutateChannels((s) => {
             const src = (s.sources[ch.id] ??= emptySource())
             src.lastPollAt = src.lastOkAt = Date.now()
             src.lastError = src.pollRequestedAt = undefined
@@ -607,11 +612,11 @@ export default Plugin.define({
     }
 
     /** Record a failed request, and tell the user once when a channel keeps failing (expired key, API down). */
-    function pollFailed(ch: Channel, jobs: Job[], error: string): { fresh: number; error: string } {
+    async function pollFailed(ch: Channel, jobs: Job[], error: string): Promise<{ fresh: number; error: string }> {
       console.error(`[automations] channel ${ch.id} poll failed:`, error)
       let failures = 0
       try {
-        failures = store.mutateChannels((s) => {
+        failures = await store.mutateChannels((s) => {
           const src = (s.sources[ch.id] ??= emptySource())
           src.lastPollAt = Date.now()
           src.lastError = error
@@ -645,7 +650,7 @@ export default Plugin.define({
       const { sources, defs, queues } = store.loadChannels()
       // Queues of automations that no longer exist (deleted from chat, the TUI, or config).
       const orphans = Object.keys(queues).filter((id) => !jobs.some((j) => j.id === id))
-      if (orphans.length) store.mutateChannels((s) => { for (const id of orphans) delete s.queues[id] })
+      if (orphans.length) await store.mutateChannels((s) => { for (const id of orphans) delete s.queues[id] })
       const due = [...allChannels(defs).values()].filter((ch) => {
         const src = sources[ch.id]
         const requested = src?.pollRequestedAt !== undefined
@@ -807,7 +812,7 @@ export default Plugin.define({
             try {
               directory = (await ctx.session.get({ sessionID: tc.sessionID })).location.directory ?? directory
             } catch {}
-            const job = mutate((jobs) => {
+            const job = await mutate((jobs) => {
               // Again under the jobs lock: channel deletes check for users under it too.
               if (on) checkChannels({ on })
               const base = slug(input.name)
@@ -890,7 +895,7 @@ export default Plugin.define({
         execute: async (input: any) => {
           try {
             let dropQueue: { all: boolean; channels: string[] } | undefined
-            const msg = mutate((jobs) => {
+            const msg = await mutate(async (jobs) => {
               const j = find(jobs, input.id)
               if (!j) throw new Error(`no job "${input.id}"`)
               const edits = input.prompt || input.cron || input.every || input.at || input.timeoutMinutes || input.channels
@@ -925,7 +930,7 @@ export default Plugin.define({
               // Last, after every check: a throw above leaves both the job and its queue as they were.
               if (dropQueue) {
                 const drop = dropQueue
-                store.mutateChannels((s) => {
+                await store.mutateChannels((s) => {
                   if (drop.all) delete s.queues[j.id]
                   else forget(s.queues[j.id], drop.channels)
                 })
@@ -947,12 +952,12 @@ export default Plugin.define({
         input: { type: "object", properties: { id: { type: "string" } }, required: ["id"], additionalProperties: false },
         execute: async (input: any) => {
           try {
-            const name = mutate((jobs) => {
+            const name = await mutate(async (jobs) => {
               const j = find(jobs, input.id)
               if (!j) throw new Error(`no job "${input.id}"`)
               if (j.source === "config") throw new Error("config jobs are removed from opencode.json(c); use automation_update enabled=false to pause")
               jobs.splice(jobs.indexOf(j), 1)
-              store.mutateChannels((s) => { delete s.queues[j.id] })
+              await store.mutateChannels((s) => { delete s.queues[j.id] })
               return j.name
             })
             return text(`Deleted "${name}".`)
@@ -1042,7 +1047,7 @@ export default Plugin.define({
           const ch = findChannel(input.id)
           if (!ch) return text(`error: no channel "${input.id}"`)
           if (!leader) {
-            store.mutateChannels((s) => requestPoll(s, ch.id))
+            await store.mutateChannels((s) => requestPoll(s, ch.id))
             return text(`Poll of ${ch.id} queued; the leader process runs it within ${tickMs / 1000}s.`)
           }
           if (polling.has(ch.id)) return text(`${ch.id} is already polling.`)
@@ -1162,7 +1167,7 @@ export default Plugin.define({
             if (!CHANNEL_ID.test(input.id ?? "")) throw new Error('id must be lowercase letters, digits, - and _ (e.g. "datadog-alerts")')
             if (configChannels.has(input.id)) throw new Error(`"${input.id}" is a config channel; pick another id`)
             const { config } = draft(input, input.id)
-            store.mutateChannels((s) => {
+            await store.mutateChannels((s) => {
               if (s.defs[input.id]) throw new Error(`channel "${input.id}" exists; change it with channel_update`)
               s.defs[input.id] = config
             })
@@ -1190,7 +1195,7 @@ export default Plugin.define({
         execute: async (input: any) => {
           try {
             if (configChannels.has(input.id)) throw new Error(`"${input.id}" is defined in opencode.json(c); edit it there`)
-            const updated = store.mutateChannels((s) => {
+            const updated = await store.mutateChannels((s) => {
               const prev = s.defs[input.id]
               if (!prev) throw new Error(`no channel "${input.id}" created with channel_create`)
               const merged = { ...prev, ...Object.fromEntries(Object.entries(input).filter(([k, v]) => k !== "id" && v !== undefined)) }
@@ -1224,7 +1229,7 @@ export default Plugin.define({
             if (configChannels.has(id)) throw new Error(`"${id}" is defined in opencode.json(c); remove it there`)
             if (!store.loadChannels().defs[id]) throw new Error(`no channel "${id}" created with channel_create`)
             // Under the jobs lock, so an automation can't attach the channel between the check and the delete.
-            const { users, paused } = mutate((jobs) => {
+            const { users, paused } = await mutate(async (jobs) => {
               const users = jobs.filter((j) => listens(j, id))
               const fromConfig = users.filter((j) => j.source === "config")
               if (fromConfig.length) throw new Error(`config automations use it (${fromConfig.map((j) => j.id).join(", ")}); change them in opencode.json(c) first`)
@@ -1240,7 +1245,7 @@ export default Plugin.define({
                   if (!runnable(j)) { j.paused = true; paused.push(j.id) }
                 }
               }
-              store.mutateChannels((s) => removeChannel(s, id))
+              await store.mutateChannels((s) => removeChannel(s, id))
               return { users, paused }
             })
             return text(

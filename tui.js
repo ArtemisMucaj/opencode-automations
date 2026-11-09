@@ -143,20 +143,20 @@ export function createState(ctx, dataDir) {
     }
   }
 
-  /** Write an intent and re-read. Returns an error message instead of throwing (callers toast it). */
-  function act(fn) {
+  /** Write an intent and re-read. Resolves to an error message instead of throwing (callers toast it). */
+  async function act(fn) {
     try {
-      mutateRaw(store, fn);
+      await mutateRaw(store, fn);
       refresh();
     } catch (e) {
       return e.message;
     }
   }
 
-  /** Write channel state (a poll intent, a delete) and re-read. Returns an error message instead of throwing. */
-  function actChannels(fn) {
+  /** Write channel state (a poll intent, a delete) and re-read. Resolves to an error message instead of throwing. */
+  async function actChannels(fn) {
     try {
-      store.mutateChannels(fn, LOCK_WAIT_MS);
+      await store.mutateChannels(fn, LOCK_WAIT_MS);
       refresh();
     } catch (e) {
       return e.message;
@@ -219,10 +219,13 @@ function AutomationsView(props) {
     if (next) state.setSelectedChannel(next.id);
   };
   const running = createMemo(() => new Set(state.runs().filter(r => r.status === "running").map(r => r.jobID)));
-  const toastErr = msg => {
-    if (msg) ctx.ui.toast.show({
+
+  /** Toast an error message; also takes the promise act() returns, and resolves once it has settled. */
+  const toastErr = async msg => {
+    const m = await msg;
+    if (m) ctx.ui.toast.show({
       title: "Automations",
-      message: msg,
+      message: m,
       variant: "error"
     });
   };
@@ -257,11 +260,12 @@ function AutomationsView(props) {
     poll: () => {
       const c = chSelected();
       if (!c) return;
-      toastErr(state.actChannels(s => requestPoll(s, c.id)));
+      const done = toastErr(state.actChannels(s => requestPoll(s, c.id)));
       ctx.ui.toast.show({
         message: `Polling “${c.name}” on the automations plugin's next tick`,
         variant: "info"
       });
+      return done;
     },
     remove: nested(async () => {
       const c = chSelected();
@@ -277,10 +281,10 @@ function AutomationsView(props) {
       });
       if (!ok) return;
       // Checked again under the jobs lock: this list may be up to 15 s old, and chat may have attached it since.
-      toastErr(state.act(jobs => {
+      await toastErr(state.act(async jobs => {
         const now = jobs.filter(j => listens(j, c.id));
         if (now.length) throw new Error(`Used by ${now.map(j => j.name).join(", ")} now. Detach it from chat: channel_delete with detach.`);
-        state.store.mutateChannels(s => removeChannel(s, c.id), LOCK_WAIT_MS);
+        await state.store.mutateChannels(s => removeChannel(s, c.id), LOCK_WAIT_MS);
       }));
     })
   };
@@ -298,11 +302,12 @@ function AutomationsView(props) {
       if (!x.paused) x.nextRunAt = nextRun(x.schedule, Date.now(), x.createdAt);
     })),
     runNow: withJob(j => {
-      update(j.id, x => void (x.runRequestedAt = Date.now()));
+      const done = update(j.id, x => void (x.runRequestedAt = Date.now()));
       ctx.ui.toast.show({
         message: `Queued “${j.name}” — fires on the automations plugin's next tick`,
         variant: "info"
       });
+      return done;
     }),
     editPrompt: nested(withJob(async j => {
       if (!editable(j)) return;
@@ -310,7 +315,7 @@ function AutomationsView(props) {
         title: `Prompt · ${j.name}`,
         value: j.prompt
       });
-      if (v?.trim()) update(j.id, x => void (x.prompt = v.trim()));
+      if (v?.trim()) await update(j.id, x => void (x.prompt = v.trim()));
     })),
     editSchedule: nested(withJob(async j => {
       if (!editable(j)) return;
@@ -320,7 +325,7 @@ function AutomationsView(props) {
         value: j.schedule.kind === "cron" ? `${j.schedule.expr}${j.schedule.tz ? ` ${j.schedule.tz}` : ""}` : ""
       });
       if (!v?.trim()) return;
-      update(j.id, x => {
+      await update(j.id, x => {
         x.schedule = parseScheduleText(v);
         x.createdAt = Date.now();
         x.done = undefined;
@@ -343,7 +348,7 @@ function AutomationsView(props) {
           category: m.providerID
         }))]
       });
-      if (choice !== undefined) update(j.id, x => void (x.model = choice || undefined));
+      if (choice !== undefined) await update(j.id, x => void (x.model = choice || undefined));
     })),
     remove: nested(withJob(async j => {
       if (!editable(j)) return;
@@ -351,7 +356,7 @@ function AutomationsView(props) {
         title: "Delete automation",
         message: `Delete “${j.name}”? Its history is kept.`
       });
-      if (ok) toastErr(state.act(jobs => void jobs.splice(jobs.findIndex(x => x.id === j.id), 1)));
+      if (ok) await toastErr(state.act(jobs => void jobs.splice(jobs.findIndex(x => x.id === j.id), 1)));
     })),
     openSession: withJob(j => {
       const sid = jobRuns().find(r => r.sessionID)?.sessionID ?? j.sessionID;
@@ -399,7 +404,7 @@ function AutomationsView(props) {
       });
       if (!session) return;
       const directory = ctx.location?.directory ?? process.cwd();
-      toastErr(state.act(jobs => {
+      await toastErr(state.act(jobs => {
         const now = Date.now();
         jobs.push({
           id: uniqueID(jobs, name),

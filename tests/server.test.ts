@@ -501,7 +501,7 @@ test("a poll still running at shutdown starts nothing and is waited for", async 
 
 test("channel state starts in an empty data dir without a pre-made file", async () => {
   const app = await start()
-  expect(app.store.mutateChannels((s) => { s.sources.x = { seen: ["a"] }; return 1 })).toBe(1)
+  expect(await app.store.mutateChannels((s) => { s.sources.x = { seen: ["a"] }; return 1 })).toBe(1)
   expect(app.store.loadChannels().sources.x.seen).toEqual(["a"])
 })
 
@@ -745,7 +745,7 @@ test("automation_run says when an automation's channels are gone, and such an au
     await app.call("automation_create", { name: "Watch", prompt: "p", channels: ["dd"], every: "1h" })
     await app.call("channel_poll", { id: "dd" })
     // The channel disappears without a detach (e.g. it was a config channel that got removed).
-    app.store.mutateChannels((s) => { delete s.defs.dd })
+    await app.store.mutateChannels((s) => { delete s.defs.dd })
     expect((await app.call("automation_run", { id: "watch" })).content).toContain("Nothing started: none of its channels exist any more (dd).")
 
     // An event-only automation paused by channel_delete can't be resumed without channels or a schedule.
@@ -761,7 +761,7 @@ test("a tick drops queues of automations that no longer exist", async () => {
   const dataDir = mkdtempSync(join(tmpdir(), "automations-orphans-"))
   try {
     // An automation deleted elsewhere (the TUI, or removed from config) left its queue behind.
-    new Store(dataDir).mutateChannels((s) => { s.queues.ghost = { pending: [{ channel: "dd", id: "1", title: "x" }], sessions: {} } })
+    await new Store(dataDir).mutateChannels((s) => { s.queues.ghost = { pending: [{ channel: "dd", id: "1", title: "x" }], sessions: {} } })
     const app = await start({ dataDir })
     expect(app.store.loadChannels().queues.ghost).toBeUndefined()
   } finally { rmSync(dataDir, { recursive: true, force: true }) }
@@ -830,7 +830,7 @@ test("a session made for a chunk that someone else took is removed again", async
     // Another process takes the events while this one creates the key's session.
     const create = app.ctx.session.create
     app.ctx.session.create = async (input: any) => {
-      app.store.mutateChannels((s) => { s.queues.triage.pending = [] })
+      await app.store.mutateChannels((s) => { s.queues.triage.pending = [] })
       return create(input)
     }
     expect((await app.call("automation_run", { id: "triage" })).content).toContain("another process already took these events")

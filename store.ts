@@ -63,16 +63,16 @@ function read(path: string): string | undefined {
   }
 }
 
-/** Sleep without yielding; for the short waits between lock attempts. */
-const pause = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
-
-/** Take a file lock, retrying for up to `waitMs` while another holder has it. */
-function lockSync(path: string, waitMs = 2000): () => void {
+/**
+ * Take a file lock, retrying for up to `waitMs` while another holder has it (another process, or another
+ * call in this one). The waits are async, so a busy lock never blocks the server's event loop or the TUI.
+ */
+async function lock(path: string, waitMs = 2000): Promise<() => Promise<void>> {
   const deadline = Date.now() + waitMs
   for (;;) {
-    try { return lockfile.lockSync(path, { realpath: false }) } catch (error) {
+    try { return await lockfile.lock(path, { realpath: false }) } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ELOCKED" || Date.now() >= deadline) throw error
-      pause(10)
+      await new Promise((r) => setTimeout(r, 10))
     }
   }
 }
@@ -114,15 +114,19 @@ export class Store {
     writeAtomic(this.jobsPath, JSON.stringify(jobs, null, 2) + "\n")
   }
 
-  mutate<T>(fn: (jobs: Job[]) => T): T {
+  /**
+   * Change jobs under the lock. `fn` may be async only to take the channels lock inside it (jobs, then
+   * channels: that order everywhere), never to wait on anything slow.
+   */
+  async mutate<T>(fn: (jobs: Job[]) => T | Promise<T>): Promise<T> {
     // Retried like the channels lock: deletes and edits hold this one while they update channels.json.
-    const unlock = lockSync(this.jobsPath)
+    const unlock = await lock(this.jobsPath)
     try {
       const jobs = this.loadJobs()
-      const result = fn(jobs)
+      const result = await fn(jobs)
       this.saveJobs(jobs)
       return result
-    } finally { unlock() }
+    } finally { await unlock() }
   }
 
   loadChannels(): ChannelsState {
@@ -135,16 +139,16 @@ export class Store {
 
   /** Change channel state (poll state, automation queues) under the lock. */
   /** `waitMs`: how long to wait for another holder of the lock (the TUI waits less, so it never feels stuck). */
-  mutateChannels<T>(fn: (state: ChannelsState) => T, waitMs = 2000): T {
+  async mutateChannels<T>(fn: (state: ChannelsState) => T, waitMs = 2000): Promise<T> {
     // No file is created before locking: the lock doesn't need it, and loadChannels() treats it as empty.
     // Retried: polls, deliveries and finished runs all write here, possibly from several processes.
-    const unlock = lockSync(this.channelsPath, waitMs)
+    const unlock = await lock(this.channelsPath, waitMs)
     try {
       const state = this.loadChannels()
       const result = fn(state)
       writeAtomic(this.channelsPath, JSON.stringify(state) + "\n") // compact: rewritten on every poll
       return result
-    } finally { unlock() }
+    } finally { await unlock() }
   }
 
   appendRun(run: Run): void {

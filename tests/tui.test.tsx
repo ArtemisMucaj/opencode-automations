@@ -101,7 +101,7 @@ test("TUI channels tab shows status, mapping and listeners, and queues a poll", 
     directory: dataDir, session: "sticky", timeoutMinutes: 30, runMissed: true, enabled: true,
     on: { channels: ["datadog", "sentry"] }, source: "tool", createdAt: Date.now(),
   } satisfies Job])
-  store.mutateChannels((s) => {
+  await store.mutateChannels((s) => {
     s.config.datadog = {
       name: "Datadog", url: "https://api.example.test/api/v1/monitor", everyMs: 60_000, items: "",
       filter: { overall_state: ["Alert"] }, event: { id: "{id}:{overall_state_modified}", sessionKey: "{id}", title: "{name}" }, env: ["DD_API_KEY"],

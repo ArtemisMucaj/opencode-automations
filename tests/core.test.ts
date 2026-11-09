@@ -60,7 +60,7 @@ test("store persists edits and keeps latest status per run", async () => {
   const b = new Store(dir)
   expect(a.loadJobs()).toEqual([])
   a.saveJobs([{ id: "one", enabled: true }] as any)
-  mutateRaw(b, (jobs) => { jobs[0].paused = true })
+  await mutateRaw(b, (jobs) => { jobs[0].paused = true })
   expect(a.loadJobs()[0].paused).toBe(true)
   a.appendRun({ runID: "r1", jobID: "one", startedAt: 1, status: "running" })
   a.appendRun({ runID: "r1", jobID: "one", startedAt: 1, endedAt: 2, status: "succeeded", output: "done" })
@@ -105,8 +105,31 @@ test("channel state waits for a lock held by another process instead of failing"
   const reader = holder.stdout.getReader()
   await reader.read() // "locked"
   const started = Date.now()
-  store.mutateChannels((s) => { s.sources.x = { seen: ["a"] } })
+  await store.mutateChannels((s) => { s.sources.x = { seen: ["a"] } })
   expect(Date.now() - started).toBeGreaterThanOrEqual(100)
   expect(store.loadChannels().sources.x.seen).toEqual(["a"])
+  await holder.exited
+})
+
+test("waiting for a busy lock doesn't block the event loop", async () => {
+  const { Store } = await import("../store.ts")
+  const dir = temp()
+  const store = new Store(dir)
+  const holder = Bun.spawn(["bun", "-e", `
+    const lockfile = require("proper-lockfile")
+    const release = lockfile.lockSync(${JSON.stringify(join(dir, "channels.json"))}, { realpath: false })
+    console.log("locked")
+    setTimeout(() => { release(); process.exit(0) }, 400)
+  `], { cwd: join(import.meta.dir, ".."), stdout: "pipe" })
+  await holder.stdout.getReader().read()
+  // A timer set while the write waits for the lock must fire on time, not after the lock is free.
+  let fired = 0
+  const started = Date.now()
+  const timer = new Promise<void>((r) => setTimeout(() => { fired = Date.now() - started; r() }, 50))
+  const write = store.mutateChannels((s) => { s.sources.x = { seen: [] } })
+  await timer
+  expect(fired).toBeLessThan(250)
+  await write
+  expect(Date.now() - started).toBeGreaterThanOrEqual(200)
   await holder.exited
 })
