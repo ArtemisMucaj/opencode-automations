@@ -197,12 +197,12 @@ export default Plugin.define({
       }
       store.appendRun(run)
       mutate((jobs) => { const j = find(jobs, run.jobID); if (j) j.lastStatus = status })
-      notify(f.job, run, f.sent)
+      notify(f.job, run)
     }
 
     /** The automatic end-of-run notice; what the agent wanted to say went out via automation_notify. */
-    function notify(job: Job, run: Run, sent = 0) {
-      if (shouldNotify(opts.notify, job, run.status, sent)) {
+    function notify(job: Job, run: Run) {
+      if (shouldNotify(opts.notify, job, run.status)) {
         void send(opts.notify!, compose(job, run)).catch((error) => console.error("[automations] notify:", error))
       }
     }

@@ -11,7 +11,7 @@
         // Sent by the server, so they work with no TUI open. Use any subset.
         "notify": {
           // The run's agent sends notifications with automation_notify (at most maxPerRun per run).
-          // `on` adds automatic notices for these outcomes; "succeeded" only fires if the agent sent nothing.
+          // `on` adds automatic notices for these outcomes. Successful runs only notify through the agent.
           "on": ["failed", "timeout"],
           "maxPerRun": 5,
           "native": true,

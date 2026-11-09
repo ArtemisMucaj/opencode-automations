@@ -174,20 +174,20 @@ test("format cleans up markdown for each channel", () => {
   expect(format("[x](https://a.test?q=1&r=2) <script>", "html")).toBe('<a href="https://a.test?q=1&amp;r=2">x</a> &lt;script&gt;')
 })
 
-test("automatic notices: failures by default, success only when opted in and the agent sent nothing", () => {
+test("automatic notices: failures by default, never for success", () => {
   const cfg = { native: true }
   expect(shouldNotify(cfg, job, "failed")).toBe(true)
   expect(shouldNotify(cfg, job, "timeout")).toBe(true)
   expect(shouldNotify(cfg, job, "succeeded")).toBe(false)
-  expect(shouldNotify({ ...cfg, on: ["succeeded"] }, job, "succeeded")).toBe(true)
-  expect(shouldNotify({ ...cfg, on: ["succeeded"] }, job, "succeeded", 1)).toBe(false)
+  expect(shouldNotify({ ...cfg, on: ["succeeded"] }, job, "succeeded")).toBe(false)
+  expect(shouldNotify(cfg, { ...job, notify: ["succeeded"] }, "succeeded")).toBe(false)
   expect(shouldNotify(cfg, { ...job, notify: false }, "failed")).toBe(false)
   expect(shouldNotify(cfg, { ...job, notify: ["timeout"] }, "failed")).toBe(false)
   expect(shouldNotify({}, job, "failed")).toBe(false)
 })
 
 test("compose writes a short notice and never includes the agent's output", () => {
-  expect(compose(job, { ...run, output: "y".repeat(3000) })).toEqual({ title: "Morning", body: "Finished in 2s.", priority: "normal" })
+  expect(compose(job, { ...run, status: "failed", output: "y".repeat(3000) }).body).toBe("Failed after 2s.")
   expect(compose(job, { ...run, status: "failed", error: "boom" })).toEqual({ title: "Morning failed", body: "boom", priority: "high" })
   expect(compose(job, { ...run, status: "timeout", error: "exceeded 30m" }).body).toBe("Stopped: exceeded 30m.")
 })

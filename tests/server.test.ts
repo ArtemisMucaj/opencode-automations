@@ -131,12 +131,12 @@ test("V2 execution success completes the run without waiting for legacy idle", a
     await flush()
     expect(app.store.history()[0]).toMatchObject({ status: "succeeded", output: "Ok" })
     expect(app.store.loadJobs()[0].lastStatus).toBe("succeeded")
-    // A compatibility idle event must not produce another notification.
+    // A compatibility idle event must not finish the run again.
     app.events.emit("event", { type: "session.idle", data: { sessionID: "session-1" } })
     await new Promise((resolve) => setTimeout(resolve, 80))
     expect(app.store.history()[0].status).toBe("succeeded")
-    expect(fetch.mock.calls).toHaveLength(1)
-    expect(JSON.parse(fetch.mock.calls[0][1]?.body as string)).toMatchObject({ title: "Morning", priority: 0 })
+    // Success is never notified automatically, even with "succeeded" in `on`.
+    expect(fetch.mock.calls).toHaveLength(0)
   } finally { fetch.mockRestore() }
 })
 
@@ -171,7 +171,7 @@ const bodies = (fetch: any) => fetch.mock.calls.map((c: any) => JSON.parse(c[1]?
 test("the run's agent sends notifications itself; a successful run then sends nothing else", async () => {
   const fetch = spyOn(globalThis, "fetch").mockResolvedValue(new Response("ok"))
   try {
-    const app = await start({ notify: { on: ["succeeded", "failed"], ...pushover } }, [job()])
+    const app = await start({ notify: pushover }, [job()])
     await app.call("automation_run", { id: "morning" })
     const sent = await app.call("automation_notify", {
       title: "2 MRs need you", message: "- **!12** blocked\n- !15 approved", priority: "high", url: "https://mr.test", url_title: "Open",

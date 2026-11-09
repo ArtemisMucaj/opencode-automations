@@ -117,7 +117,7 @@ Sent by the **server** plugin (`notify` in `opencode.jsonc`), so no TUI needs to
 
 **Limits.** Pushover takes 1024 characters per message: longer ones are split into numbered parts (`Title (1/3)`), up to 4. At most `maxPerRun` notifications per run (default 5).
 
-**Automatic notices** go out only when a run fails or times out (`on`, default `["failed", "timeout"]`). Add `"succeeded"` to get a short notice when the agent sent nothing. Per job, `notify: false` turns everything off; an array picks that job's automatic notices.
+**Automatic notices** go out only when a run fails or times out (`on`, default `["failed", "timeout"]`). A successful run is notified only if the agent found something worth sending. Per job, `notify: false` turns everything off; an array picks that job's automatic notices.
 
 A failing channel is logged and never affects the run. The TUI's own OS notification is off by default (`notify` in `cli.json`).
 

@@ -10,7 +10,7 @@ import { spawn } from "node:child_process"
 import type { Job, Run, RunStatus } from "./store.ts"
 
 export interface NotifyConfig {
-  /** Run outcomes that get an automatic notice. Default: failed, timeout. */
+  /** Run outcomes that get an automatic notice. Default: failed, timeout. Successful runs never do. */
   on?: RunStatus[]
   /** Most automation_notify calls one run may make. Default 5. */
   maxPerRun?: number
@@ -60,10 +60,9 @@ export function canNotify(cfg: NotifyConfig | undefined, job: Job): cfg is Notif
 }
 
 /** Whether a finished run gets an automatic notice. */
-export function shouldNotify(cfg: NotifyConfig | undefined, job: Job, status: RunStatus, sent = 0) {
-  if (!canNotify(cfg, job)) return false
-  // The agent already told the user what mattered.
-  if (status === "succeeded" && sent > 0) return false
+export function shouldNotify(cfg: NotifyConfig | undefined, job: Job, status: RunStatus) {
+  // On success the agent notifies if something needs it; silence means nothing did.
+  if (status === "succeeded" || !canNotify(cfg, job)) return false
   const on = Array.isArray(job.notify) ? job.notify : (cfg.on ?? DEFAULT_ON)
   return on.includes(status)
 }
@@ -82,7 +81,7 @@ export function compose(job: Job, run: Run): Message {
     case "timeout":
       return { title: `${job.name} timed out`, body: error ? `Stopped: ${error}.` : `Stopped after ${duration(run)}.`, priority: "high" }
     default:
-      return { title: job.name, body: `Finished in ${duration(run)}.`, priority: "normal" }
+      return { title: `${job.name} ${run.status}`, body: error || `After ${duration(run)}.`, priority: "normal" }
   }
 }
 
