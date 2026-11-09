@@ -115,7 +115,8 @@ export class Store {
   }
 
   mutate<T>(fn: (jobs: Job[]) => T): T {
-    const unlock = lockfile.lockSync(this.jobsPath, { realpath: false })
+    // Retried like the channels lock: deletes and edits hold this one while they update channels.json.
+    const unlock = lockSync(this.jobsPath)
     try {
       const jobs = this.loadJobs()
       const result = fn(jobs)

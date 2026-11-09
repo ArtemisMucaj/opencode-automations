@@ -173,7 +173,7 @@ Create channels from chat with `/channel <what you want>` (below), or define the
 
 **Untrusted input.** Event text goes inside `<event>` tags, and the prompt tells the agent it is data, not instructions. Still, anyone who can write into the polled system (an alert message, an issue title) writes into the prompt: run these automations with an agent whose permissions fit unattended work on untrusted input.
 
-**Status.** `channel_list` shows each channel's last poll, errors, and the automations on it with their waiting events. `channel_poll` polls now. Pause an automation as usual; a paused automation gets no events. After 3 failed polls in a row (expired key, API down) you get one notification.
+**Status.** `channel_list` shows each channel's last poll, errors, and the automations on it with their waiting events. `channel_poll` polls now. Pause an automation as usual; its events wait while it is paused (up to 500) and go in when it resumes. A disabled automation gets none. After 3 failed polls in a row (expired key, API down) you get one notification.
 
 ## Reference
 

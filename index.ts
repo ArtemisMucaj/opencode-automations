@@ -415,18 +415,20 @@ export default Plugin.define({
     ): Promise<Run | string> {
       const ids = new Set(events.map(uid))
       let took: { taken: ChannelEvent[]; sessionID?: string }
+      let found: { id: string; read?: string } | undefined
       try {
-        const found = key !== undefined ? await keySession(job, key, events, savedSession) : undefined
+        found = key !== undefined ? await keySession(job, key, events, savedSession) : undefined
         if (abort.signal.aborted) return STOPPING
         took = store.mutateChannels((s) => {
           const q = (s.queues[job.id] ??= emptyQueue())
           // Only what is still waiting: another process may have taken some in the meantime.
           const taken = q.pending.filter((e) => ids.has(uid(e)))
           q.pending = q.pending.filter((e) => !ids.has(uid(e)))
-          if (!taken.length || !found) return { taken }
+          const f = found
+          if (!taken.length || !f) return { taken }
           // Someone else set this key's session since we read it: keep theirs.
           const current = q.sessions[key!]?.id
-          const id = current && current !== found.read && current !== found.id ? current : found.id
+          const id = current && current !== f.read && current !== f.id ? current : f.id
           const keep = [...inflight.values()].filter((f) => f.job.id === job.id && f.key !== undefined).map((f) => f.key!)
           assign(q, key!, id, Date.now(), keep)
           return { taken, sessionID: id }
@@ -436,6 +438,10 @@ export default Plugin.define({
         return "the events couldn't be handed over; they're retried on the next tick"
       }
       const { taken, sessionID } = took
+      // A session made for this chunk but not used (the events were gone, or the key got another session) goes again.
+      if (found && found.id !== found.read && sessionID !== found.id) {
+        void ctx.session.remove?.({ sessionID: found.id }).catch(() => {})
+      }
       if (!taken.length) return "another process already took these events"
       const run = await startSession(job, reason, {
         text: composeEvents(job.prompt, taken, names),
@@ -566,46 +572,61 @@ export default Plugin.define({
     async function pollChannel(ch: Channel, jobs = load()): Promise<{ fresh: number; error?: string }> {
       polling.add(ch.id)
       try {
-        const events = await poll(ch, fetch, abort.signal)
-        if (abort.signal.aborted) return { fresh: 0, error: "plugin stopping" }
-        const subs = subscribers(ch.id, jobs)
-        const fresh = store.mutateChannels((s) => {
-          const src = (s.sources[ch.id] ??= emptySource())
-          src.lastPollAt = src.lastOkAt = Date.now()
-          src.lastError = src.pollRequestedAt = undefined
-          src.failures = 0
-          const fresh = ingest(src, events)
-          // An automation's first poll of a channel gets everything currently there; after that, only what's new.
-          for (const j of subs) {
-            const q = (s.queues[j.id] ??= emptyQueue())
-            const first = !q.started?.includes(ch.id)
-            if (first) q.started = [...(q.started ?? []), ch.id]
-            enqueue(q, first ? events : fresh) // enqueue skips repeated IDs
-          }
-          return fresh.length
-        })
-        return { fresh }
-      } catch (e) {
-        if (abort.signal.aborted) return { fresh: 0, error: "plugin stopping" }
-        const error = String((e as Error)?.message ?? e).slice(0, 500)
-        const failures = store.mutateChannels((s) => {
+        let events: ChannelEvent[]
+        try { events = await poll(ch, fetch, abort.signal) } catch (e) {
+          if (abort.signal.aborted) return { fresh: 0, error: STOPPING }
+          return pollFailed(ch, jobs, String((e as Error)?.message ?? e).slice(0, 500))
+        }
+        if (abort.signal.aborted) return { fresh: 0, error: STOPPING }
+        // Paused automations keep collecting, so nothing is lost while they're paused; disabled or finished ones don't.
+        const takers = jobs.filter((j) => listens(j, ch.id) && j.enabled && !j.done)
+        try {
+          const fresh = store.mutateChannels((s) => {
+            const src = (s.sources[ch.id] ??= emptySource())
+            src.lastPollAt = src.lastOkAt = Date.now()
+            src.lastError = src.pollRequestedAt = undefined
+            src.failures = 0
+            const fresh = ingest(src, events)
+            // An automation's first poll of a channel gets everything currently there; after that, only what's new.
+            for (const j of takers) {
+              const q = (s.queues[j.id] ??= emptyQueue())
+              const first = !q.started?.includes(ch.id)
+              if (first) q.started = [...(q.started ?? []), ch.id]
+              enqueue(q, first ? events : fresh) // enqueue skips repeated IDs
+            }
+            return fresh.length
+          })
+          return { fresh }
+        } catch (e) {
+          // The API answered; only saving failed (the lock stayed busy). Not a failed poll: the next one catches up.
+          const error = `couldn't save the poll: ${(e as Error)?.message}`
+          console.error(`[automations] channel ${ch.id}:`, error)
+          return { fresh: 0, error }
+        }
+      } finally { polling.delete(ch.id) }
+    }
+
+    /** Record a failed request, and tell the user once when a channel keeps failing (expired key, API down). */
+    function pollFailed(ch: Channel, jobs: Job[], error: string): { fresh: number; error: string } {
+      console.error(`[automations] channel ${ch.id} poll failed:`, error)
+      let failures = 0
+      try {
+        failures = store.mutateChannels((s) => {
           const src = (s.sources[ch.id] ??= emptySource())
           src.lastPollAt = Date.now()
           src.lastError = error
           src.pollRequestedAt = undefined
           return (src.failures = (src.failures ?? 0) + 1)
         })
-        console.error(`[automations] channel ${ch.id} poll failed:`, error)
-        // Tell the user once when a channel keeps failing (expired key, API down), not on every poll.
-        if (failures === CHANNEL_FAILURE_NOTICE && subscribers(ch.id, jobs).some((j) => canNotify(opts.notify, j))) {
-          void send(opts.notify!, {
-            title: `Channel ${ch.name} can't poll`,
-            body: `${failures} failed polls in a row. Last error: ${error}`,
-            priority: "normal",
-          }).catch((err) => console.error("[automations] notify:", err))
-        }
-        return { fresh: 0, error }
-      } finally { polling.delete(ch.id) }
+      } catch (e) { console.error(`[automations] channel ${ch.id}: couldn't record the failure:`, (e as Error)?.message) }
+      if (failures === CHANNEL_FAILURE_NOTICE && subscribers(ch.id, jobs).some((j) => canNotify(opts.notify, j))) {
+        void send(opts.notify!, {
+          title: `Channel ${ch.name} can't poll`,
+          body: `${failures} failed polls in a row. Last error: ${error}`,
+          priority: "normal",
+        }).catch((err) => console.error("[automations] notify:", err))
+      }
+      return { fresh: 0, error }
     }
 
     /** Start runs for jobs that take events as they arrive. */
@@ -868,6 +889,7 @@ export default Plugin.define({
         },
         execute: async (input: any) => {
           try {
+            let dropQueue: { all: boolean; channels: string[] } | undefined
             const msg = mutate((jobs) => {
               const j = find(jobs, input.id)
               if (!j) throw new Error(`no job "${input.id}"`)
@@ -883,13 +905,8 @@ export default Plugin.define({
                 const removed = (j.on?.channels ?? []).filter((c) => !ids?.includes(c))
                 if (ids) j.on = { channels: ids }
                 else delete j.on
-                // Drop what it held from channels it no longer uses; with none left, its whole queue.
-                if (removed.length || !ids) {
-                  store.mutateChannels((s) => {
-                    if (!ids) delete s.queues[j.id]
-                    else forget(s.queues[j.id], removed)
-                  })
-                }
+                // What it held from channels it no longer uses is dropped below, once every check has passed.
+                if (removed.length || !ids) dropQueue = { all: !ids, channels: removed }
               }
               if (input.cron || input.every || input.at) {
                 j.schedule = toSchedule(input, !!j.on)
@@ -905,6 +922,14 @@ export default Plugin.define({
                 throw new Error("it has no channels and no schedule, so it would never run: add channels or a schedule (cron/every/at)")
               }
               if (j.enabled && j.nextRunAt === undefined) j.nextRunAt = nextRun(j.schedule, Date.now(), j.createdAt)
+              // Last, after every check: a throw above leaves both the job and its queue as they were.
+              if (dropQueue) {
+                const drop = dropQueue
+                store.mutateChannels((s) => {
+                  if (drop.all) delete s.queues[j.id]
+                  else forget(s.queues[j.id], drop.channels)
+                })
+              }
               return `Updated ${j.id}: ${isActive(j) ? "enabled" : "paused"}, ${describe(j.schedule)}` +
                 `${j.on ? `, channels ${j.on.channels.join(", ")}` : ""}, next ${fmt(j.nextRunAt)}.`
             })
@@ -1212,7 +1237,7 @@ export default Plugin.define({
                 if (rest.length) j.on = { channels: rest }
                 else {
                   delete j.on
-                  if (!runnable(j)) { j.paused = true; j.enabled = false; paused.push(j.id) }
+                  if (!runnable(j)) { j.paused = true; paused.push(j.id) }
                 }
               }
               store.mutateChannels((s) => removeChannel(s, id))

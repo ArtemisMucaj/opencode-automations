@@ -18,6 +18,7 @@ async function start(options: Record<string, unknown> = {}, jobs: Job[] = []) {
   store.saveJobs(jobs)
   const tools = new Map<string, any>()
   const namespaces: any[] = []
+  const removed: string[] = []
   const commands = new Map<string, any>()
   const prompts: any[] = []
   const sessions: any[] = []
@@ -41,6 +42,7 @@ async function start(options: Record<string, unknown> = {}, jobs: Job[] = []) {
         return { id: `session-${sessions.length}` }
       },
       prompt: async (input: any) => { prompts.push(input) },
+      remove: async ({ sessionID }: any) => { removed.push(sessionID) },
       interrupt: async () => {},
       hook: async (name: string, fn: any) => { hooks.set(name, fn); return { dispose: async () => {} } },
     },
@@ -65,7 +67,7 @@ async function start(options: Record<string, unknown> = {}, jobs: Job[] = []) {
     hooks.get("context")!(c)
     return { system: c.system.map((p) => p.text).join("\n"), tools: Object.keys(c.tools) }
   }
-  return { store, tools, namespaces, commands, prompts, sessions, events, call, context, dataDir, stop, ctx }
+  return { store, tools, namespaces, commands, prompts, sessions, removed, events, call, context, dataDir, stop, ctx }
 }
 
 function job(overrides: Partial<Job> = {}): Job {
@@ -491,7 +493,7 @@ test("a poll still running at shutdown starts nothing and is waited for", async 
     await flush()
     await app.stop()
     release()
-    expect((await pending).content).toContain("plugin stopping")
+    expect((await pending).content).toContain("plugin is stopping")
     expect(app.prompts).toEqual([])
     expect(app.sessions).toEqual([])
   } finally { fetch.mockRestore() }
@@ -775,3 +777,82 @@ test("every tool goes through code mode, in two namespaces", async () => {
   expect([...app.tools.keys()]).toContain("automation_notify")
   expect([...app.tools.keys()]).toContain("channel_test")
 })
+
+// ---------- review fixes: update ordering, pause, sessions, saves ----------
+
+test("a rejected automation_update leaves the job's queue untouched", async () => {
+  let current: unknown[] = []
+  const fetch = api(() => current)
+  try {
+    const app = await start({ channels: [channel(), channel({ id: "two", request: { url: "https://api.dd.test/two" } })] })
+    await app.call("automation_create", { name: "Digest", prompt: "p", channels: ["dd"], every: "1h" })
+    current = [monitor(1)]
+    await app.call("channel_poll", { id: "dd" })
+    const before = app.store.loadChannels().queues.digest
+    expect((await app.call("automation_update", { id: "digest", channels: ["two"], cron: "bogus" })).content).toContain("error")
+    expect(app.store.loadChannels().queues.digest).toEqual(before)
+    expect(app.store.loadJobs()[0].on).toEqual({ channels: ["dd"] })
+  } finally { fetch.mockRestore() }
+})
+
+test("events wait for a paused automation and go in when it resumes", async () => {
+  let current: unknown[] = []
+  const fetch = api(() => current)
+  try {
+    const app = await start({ channels: [channel()], jobs: [triage(), triage({ id: "other", name: "Other" })] })
+    await app.call("automation_update", { id: "other", enabled: false })
+    current = [monitor(1)]
+    await app.call("channel_poll", { id: "dd" }) // triage runs; other is paused
+    expect(app.prompts.map((p) => p.metadata.automation.jobID)).toEqual(["triage"])
+    expect(app.store.loadChannels().queues.other.pending.map((e) => e.id)).toEqual(["1:t1"])
+    await app.call("automation_update", { id: "other", enabled: true })
+    await app.call("channel_poll", { id: "dd" })
+    expect(app.prompts.map((p) => p.metadata.automation.jobID)).toEqual(["triage", "other"])
+  } finally { fetch.mockRestore() }
+})
+
+test("detaching an event-only automation's last channel pauses it, and the pause alone can be lifted", async () => {
+  process.env.TEST_DD_KEY = "k"
+  const fetch = api(() => [])
+  try {
+    const app = await start()
+    await app.call("channel_create", { id: "dd", ...draftChannel() })
+    await app.call("automation_create", { name: "Live", prompt: "p", channels: ["dd"] })
+    await app.call("channel_delete", { id: "dd", detach: true })
+    expect(app.store.loadJobs()[0]).toMatchObject({ paused: true, enabled: true })
+  } finally { fetch.mockRestore(); delete process.env.TEST_DD_KEY }
+})
+
+test("a session made for a chunk that someone else took is removed again", async () => {
+  const fetch = api(() => [monitor(1)])
+  try {
+    const app = await start({ channels: [channel()], jobs: [triage({ session: "sticky", cron: "0 0 1 1 *" })] })
+    // Another process takes the events while this one creates the key's session.
+    const create = app.ctx.session.create
+    app.ctx.session.create = async (input: any) => {
+      app.store.mutateChannels((s) => { s.queues.triage.pending = [] })
+      return create(input)
+    }
+    expect((await app.call("automation_run", { id: "triage" })).content).toContain("another process already took these events")
+    expect(app.removed).toEqual(["session-1"])
+    expect(app.prompts).toEqual([])
+  } finally { fetch.mockRestore() }
+})
+
+test("a poll whose results can't be saved isn't counted as a failed poll", async () => {
+  const fetch = api(() => [monitor(1)])
+  try {
+    const app = await start({ channels: [channel()], jobs: [triage({ cron: "0 0 1 1 *" })] })
+    const holder = Bun.spawn(["bun", "-e", `
+      const lockfile = require("proper-lockfile")
+      const release = lockfile.lockSync(${JSON.stringify(join(app.dataDir, "channels.json"))}, { realpath: false })
+      console.log("locked")
+      setTimeout(() => { release(); process.exit(0) }, 2600)
+    `], { cwd: join(import.meta.dir, ".."), stdout: "pipe" })
+    await holder.stdout.getReader().read()
+    const out = (await app.call("channel_poll", { id: "dd" })).content
+    await holder.exited
+    expect(out).toContain("couldn't save the poll")
+    expect(app.store.loadChannels().sources.dd.failures ?? 0).toBe(0)
+  } finally { fetch.mockRestore() }
+}, 10_000)

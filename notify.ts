@@ -2,8 +2,8 @@
 // Channels: native desktop notifications (macOS/Linux) and Pushover.
 //
 // During a run, the agent decides what to send with the automation_notify tool.
-// The plugin itself only sends a notice when a run fails or times out (and, if
-// asked, when a run succeeds without the agent sending anything).
+// The plugin itself only sends a notice when a run fails or times out (`on`);
+// a successful run is never notified automatically.
 // Failures are logged and never affect the run.
 
 import { spawn } from "node:child_process"
@@ -112,7 +112,7 @@ function line(src: string, style: Style): string {
   // Quote markers.
   s = s.replace(/^\s*(&gt;|>)\s?/, "")
   // Links.
-  s = s.replace(/\[([^\]]+)\]\((\S+?)\)/g, (_, t: string, u: string) => (html ? `<a href="${u}">${t}</a>` : `${t} (${u})`))
+  s = s.replace(/\[([^\]]+)\]\((\S+?)\)/g, (_, t: string, u: string) => (html ? `<a href="${u.replace(/"/g, "&quot;")}">${t}</a>` : `${t} (${u})`))
   // **bold** / __bold__ (not snake_case or lone asterisks).
   s = s.replace(/\*\*(?=\S)(.+?)(?<=\S)\*\*/g, (_, t: string) => bold(t))
   s = s.replace(/(^|[^\w])__(?=\S)(.+?)(?<=\S)__(?!\w)/g, (_, p: string, t: string) => p + bold(t))

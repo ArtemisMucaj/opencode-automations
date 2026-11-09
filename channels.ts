@@ -251,7 +251,8 @@ export function enqueue(queue: QueueState, events: ChannelEvent[]) {
 /** Put events back at the front of a queue (a run with them didn't start), skipping any already waiting. */
 export function requeue(queue: QueueState, events: ChannelEvent[]) {
   const waiting = new Set(queue.pending.map(uid))
-  queue.pending = [...events.filter((e) => !waiting.has(uid(e))), ...queue.pending].slice(0, MAX_QUEUE)
+  // Past the cap, the oldest go, as in enqueue: the events put back are the oldest here.
+  queue.pending = [...events.filter((e) => !waiting.has(uid(e))), ...queue.pending].slice(-MAX_QUEUE)
 }
 
 /** Remove everything a queue holds from these channels: waiting events, first-poll marks, sessions. */

@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test"
 import {
-  arrayPaths, envNames, fieldPaths, literalSecrets,
+  arrayPaths, envNames, fieldPaths, literalSecrets, requeue,
   assign, chunks, composeEvents, emptyQueue, emptySource, enqueue, extract, get, ingest, MAX_QUEUE, parseChannel, poll,
   render, touch, withEnv,
   type ChannelConfig,
@@ -185,4 +185,14 @@ test("field paths and array paths help write templates", () => {
   expect(paths.find((p) => p.startsWith("message"))!.endsWith("…")).toBe(true)
   expect(arrayPaths({ meta: {}, data: { items: [] }, list: [1] })).toEqual(["data.items", "list"])
   expect(arrayPaths([1])).toEqual(["(response)"])
+})
+
+test("putting events back into a full queue drops the oldest, like adding does", () => {
+  const ev = (id: string) => ({ channel: "dd", id, title: id })
+  const queue = emptyQueue()
+  enqueue(queue, Array.from({ length: MAX_QUEUE }, (_, i) => ev(`new-${i}`)))
+  requeue(queue, [ev("old-1"), ev("old-2")])
+  expect(queue.pending.length).toBe(MAX_QUEUE)
+  expect(queue.pending.at(-1)!.id).toBe(`new-${MAX_QUEUE - 1}`) // the newest stay
+  expect(queue.pending.some((e) => e.id.startsWith("old-"))).toBe(false) // the events put back are the oldest: they go
 })
