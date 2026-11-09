@@ -19,7 +19,7 @@ import {
 import {
   arrayPaths, assign, CHANNEL_ID, chunks, composeEvents, emptyQueue, emptySource, enqueue, envNames, extract, fetchJSON,
   fieldPaths, forget, get, ingest, literalSecrets, MAX_START_ATTEMPTS, parseChannel, poll, removeChannel, requeue, requestPoll,
-  summarize, touch, uid,
+  CHANNEL_ENV_PREFIX, redact, summarize, touch, uid,
   type Channel, type ChannelConfig, type ChannelEvent, type ChannelsState,
 } from "./channels.ts"
 
@@ -32,6 +32,8 @@ interface Options {
   notify?: NotifyConfig
   jobs?: ConfigJob[]
   channels?: ChannelConfig[]
+  /** Environment variables channels created from chat may read, besides those starting with CHANNEL_. */
+  channelEnv?: string[]
 }
 
 interface ScheduleInput {
@@ -136,8 +138,9 @@ const CHANNEL_GUIDE =
   "Set up event sources (channels) and the automations that run on them.\n" +
   "1. channel_list: if a channel already polls what is needed, reuse it instead of creating another.\n" +
   "2. For a new one, find the API endpoint that lists the items: from its docs, an example the user gives, or a connected tool.\n" +
-  "3. Keys: never write a secret into the definition. Use {env:NAME} (e.g. header \"DD-API-KEY\": \"{env:DD_API_KEY}\") " +
-  "and tell the user to set NAME where the opencode server runs; channel_test says if it is missing.\n" +
+  "3. Keys: never write a secret into the definition. Use {env:NAME}, with a NAME that starts with CHANNEL_ " +
+  "(e.g. header \"DD-API-KEY\": \"{env:CHANNEL_DD_API_KEY}\"), and tell the user to set it where the opencode server runs; " +
+  "channel_test says if it is missing. Other variables can't be read unless the user lists them under channelEnv.\n" +
   "4. channel_test the draft and iterate until the sample events look right: items (the array), filter, " +
   "event.id (must change when something happens again, e.g. \"{id}:{updated_at}\"), event.sessionKey (which events share a " +
   "conversation, e.g. one per monitor), and a title/body/url the agent can act on. Pick an interval that respects rate limits.\n" +
@@ -177,11 +180,19 @@ export default Plugin.define({
       if (configChannels.has(ch.id)) throw new Error(`[automations] channel ids must be unique ("${ch.id}")`)
       configChannels.set(ch.id, ch)
     }
-    // Publish what the config channels look like (no headers or body, so no secrets) for the TUI.
-    try {
-      const config = Object.fromEntries((opts.channels ?? []).map((c) => [c.id, summarize(c)]))
-      await store.mutateChannels((s) => { s.config = config })
-    } catch (e) { console.error("[automations] channel state:", (e as Error)?.message) }
+    /**
+     * What the config channels look like (no headers or body, so no secrets), for the TUI. Only the leader
+     * publishes it, since it is the one that polls: another process with other config mustn't overwrite it.
+     */
+    let published = false
+    async function publishConfig() {
+      if (published) return
+      try {
+        const config = Object.fromEntries((opts.channels ?? []).map((c) => [c.id, summarize(c)]))
+        await store.mutateChannels((s) => { s.config = config })
+        published = true
+      } catch (e) { console.error("[automations] channel state:", (e as Error)?.message) }
+    }
 
     /**
      * Config channels plus those created with channel_create, read from disk each time so a channel
@@ -421,9 +432,17 @@ export default Plugin.define({
       const ids = new Set(events.map(uid))
       let took: { taken: ChannelEvent[]; sessionID?: string }
       let found: { id: string; read?: string } | undefined
+      // A key's session that can't be made is a failed start (recorded, notified, counted), not a retry forever.
+      let sessionError: unknown
+      if (key !== undefined) {
+        try { found = await keySession(job, key, events, savedSession) } catch (e) { sessionError = e }
+      }
+      /** Remove the session made for this chunk, unless it is the one in use. */
+      const discard = (used?: string) => {
+        if (found && found.id !== found.read && used !== found.id) void ctx.session.remove?.({ sessionID: found.id }).catch(() => {})
+      }
+      if (abort.signal.aborted) { discard(); return STOPPING }
       try {
-        found = key !== undefined ? await keySession(job, key, events, savedSession) : undefined
-        if (abort.signal.aborted) return STOPPING
         took = await store.mutateChannels((s) => {
           const q = (s.queues[job.id] ??= emptyQueue())
           // Only what is still waiting: another process may have taken some in the meantime.
@@ -439,18 +458,17 @@ export default Plugin.define({
           return { taken, sessionID: id }
         })
       } catch (e) {
+        discard()
         console.error(`[automations] ${job.id}: couldn't hand over events, will retry:`, (e as Error)?.message)
         return "the events couldn't be handed over; they're retried on the next tick"
       }
       const { taken, sessionID } = took
       // A session made for this chunk but not used (the events were gone, or the key got another session) goes again.
-      if (found && found.id !== found.read && sessionID !== found.id) {
-        void ctx.session.remove?.({ sessionID: found.id }).catch(() => {})
-      }
+      discard(sessionID)
       if (!taken.length) return "another process already took these events"
       const run = await startSession(job, reason, {
         text: composeEvents(job.prompt, taken, names),
-        session: sessionID ? async () => sessionID : () => resolveSession(job),
+        session: sessionError !== undefined ? () => Promise.reject(sessionError) : sessionID ? async () => sessionID : () => resolveSession(job),
         key,
         events: taken.map((e) => `${e.channel}:${e.id}`),
       })
@@ -488,6 +506,8 @@ export default Plugin.define({
         const entry: InFlight = { job, run, sent: 0, key: how.key }
         inflight.set(sessionID, entry)
         store.appendRun(run)
+        await mutate((jobs) => { const j = find(jobs, job.id); if (j) j.lastRunAt = run.startedAt })
+          .catch((e) => console.error("[automations] job state:", (e as Error)?.message))
         entry.timer = setTimeout(() => {
           void ctx.session.interrupt({ sessionID }).catch(() => {})
           finish(sessionID, "timeout", `exceeded ${job.timeoutMinutes}m`)
@@ -510,7 +530,7 @@ export default Plugin.define({
         const failed: Run = { ...base, status: "failed", endedAt: Date.now(), error: String((e as Error)?.message ?? e) }
         for (const [sid, f] of inflight) if (f.run.runID === runID) { clearTimeout(f.timer); inflight.delete(sid) }
         store.appendRun(failed)
-        await mutate((jobs) => { const j = find(jobs, job.id); if (j) j.lastStatus = "failed" }).catch(() => {})
+        await mutate((jobs) => { const j = find(jobs, job.id); if (j) { j.lastStatus = "failed"; j.lastRunAt = base.startedAt } }).catch(() => {})
         notify(job, failed)
         return failed
       }
@@ -528,7 +548,8 @@ export default Plugin.define({
 
     async function tickOnce() {
       leader = store.lease(tickMs * 3)
-      if (!leader) return
+      if (!leader) { published = false; return }
+      await publishConfig()
       const now = Date.now()
       const due: Array<[Job, "schedule" | "manual" | "missed"]> = []
 
@@ -536,7 +557,6 @@ export default Plugin.define({
         for (const job of jobs) {
           if (job.runRequestedAt !== undefined) {
             job.runRequestedAt = undefined
-            job.lastRunAt = now
             due.push([{ ...job }, "manual"])
             continue
           }
@@ -548,17 +568,15 @@ export default Plugin.define({
           if (now < job.nextRunAt) continue
           const missed = now - job.nextRunAt > Math.max(MISSED_GRACE_MS, tickMs * 2)
           const reason = !missed ? "schedule" : job.runMissed ? "missed" : undefined
-          if (reason) {
-            due.push([job, reason])
-            job.lastRunAt = now
-          }
+          if (reason) due.push([job, reason])
           job.nextRunAt = nextRun(job.schedule, now, job.createdAt)
           if (job.nextRunAt === undefined) job.done = true // one-shot done
         }
       })
-      const loaded = due.some(([j]) => j.on) ? loadAll() : undefined
+      // Channel state is read once per tick and shared; it's read again only after something changed it.
+      const loaded = loadAll()
       for (const [job, reason] of due) await runAutomation(job, reason, loaded)
-      await tickChannels(now)
+      await tickChannels(now, loaded, due.some(([j]) => j.on))
     }
 
     // ---------- channel polling ----------
@@ -573,70 +591,82 @@ export default Plugin.define({
     }
     const subscribers = (channelID: string, jobs = load()) => jobs.filter((j) => listens(j, channelID) && isActive(j))
 
-    /** Poll once and queue new events for each active subscriber. */
-    async function pollChannel(ch: Channel, jobs = load()): Promise<{ fresh: number; error?: string }> {
-      polling.add(ch.id)
-      try {
-        let events: ChannelEvent[]
-        try { events = await poll(ch, fetch, abort.signal) } catch (e) {
-          if (abort.signal.aborted) return { fresh: 0, error: STOPPING }
-          return await pollFailed(ch, jobs, String((e as Error)?.message ?? e).slice(0, 500))
-        }
-        if (abort.signal.aborted) return { fresh: 0, error: STOPPING }
-        // Paused automations keep collecting, so nothing is lost while they're paused; disabled or finished ones don't.
-        const takers = jobs.filter((j) => listens(j, ch.id) && j.enabled && !j.done)
-        try {
-          const fresh = await store.mutateChannels((s) => {
-            const src = (s.sources[ch.id] ??= emptySource())
-            src.lastPollAt = src.lastOkAt = Date.now()
-            src.lastError = src.pollRequestedAt = undefined
-            src.failures = 0
-            const fresh = ingest(src, events)
-            // An automation's first poll of a channel gets everything currently there; after that, only what's new.
-            for (const j of takers) {
-              const q = (s.queues[j.id] ??= emptyQueue())
-              const first = !q.started?.includes(ch.id)
-              if (first) q.started = [...(q.started ?? []), ch.id]
-              enqueue(q, first ? events : fresh) // enqueue skips repeated IDs
-            }
-            return fresh.length
-          })
-          return { fresh }
-        } catch (e) {
-          // The API answered; only saving failed (the lock stayed busy). Not a failed poll: the next one catches up.
-          const error = `couldn't save the poll: ${(e as Error)?.message}`
-          console.error(`[automations] channel ${ch.id}:`, error)
-          return { fresh: 0, error }
-        }
-      } finally { polling.delete(ch.id) }
-    }
+    type Polled = { ch: Channel; events?: ChannelEvent[]; error?: string }
+    type PollResult = { fresh: number; error?: string }
 
-    /** Record a failed request, and tell the user once when a channel keeps failing (expired key, API down). */
-    async function pollFailed(ch: Channel, jobs: Job[], error: string): Promise<{ fresh: number; error: string }> {
-      console.error(`[automations] channel ${ch.id} poll failed:`, error)
-      let failures = 0
+    /**
+     * Poll channels in parallel (one slow API doesn't hold up the others) and save all the results in one
+     * write: new events are queued for each subscriber. Returns each channel's result, and the saved state.
+     */
+    async function pollChannels(list: Channel[], jobs = load()): Promise<{ results: Map<string, PollResult>; state?: ChannelsState }> {
+      const results = new Map<string, PollResult>()
+      if (!list.length) return { results }
+      for (const ch of list) polling.add(ch.id)
       try {
-        failures = await store.mutateChannels((s) => {
-          const src = (s.sources[ch.id] ??= emptySource())
-          src.lastPollAt = Date.now()
-          src.lastError = error
-          src.pollRequestedAt = undefined
-          return (src.failures = (src.failures ?? 0) + 1)
-        })
-      } catch (e) { console.error(`[automations] channel ${ch.id}: couldn't record the failure:`, (e as Error)?.message) }
-      if (failures === CHANNEL_FAILURE_NOTICE && subscribers(ch.id, jobs).some((j) => canNotify(opts.notify, j))) {
-        void send(opts.notify!, {
-          title: `Channel ${ch.name} can't poll`,
-          body: `${failures} failed polls in a row. Last error: ${error}`,
-          priority: "normal",
-        }).catch((err) => console.error("[automations] notify:", err))
-      }
-      return { fresh: 0, error }
+        const polled = await Promise.all(list.map(async (ch): Promise<Polled> => {
+          try { return { ch, events: await poll(ch, fetch, abort.signal) } }
+          catch (e) { return { ch, error: String((e as Error)?.message ?? e).slice(0, 500) } }
+        }))
+        if (abort.signal.aborted) {
+          for (const ch of list) results.set(ch.id, { fresh: 0, error: STOPPING })
+          return { results }
+        }
+        const notices: Array<{ ch: Channel; failures: number; error: string }> = []
+        let state: ChannelsState | undefined
+        try {
+          state = await store.mutateChannels((s) => {
+            for (const p of polled) {
+              const src = (s.sources[p.ch.id] ??= emptySource())
+              src.lastPollAt = Date.now()
+              src.pollRequestedAt = undefined
+              if (p.events === undefined) {
+                src.lastError = p.error
+                src.failures = (src.failures ?? 0) + 1
+                results.set(p.ch.id, { fresh: 0, error: p.error })
+                if (src.failures === CHANNEL_FAILURE_NOTICE) notices.push({ ch: p.ch, failures: src.failures, error: p.error! })
+                continue
+              }
+              src.lastOkAt = src.lastPollAt
+              src.lastError = undefined
+              src.failures = 0
+              const fresh = ingest(src, p.events)
+              // Paused automations keep collecting, so nothing is lost while they're paused; finished ones don't.
+              for (const j of jobs) {
+                if (!listens(j, p.ch.id) || !j.enabled || j.done) continue
+                const q = (s.queues[j.id] ??= emptyQueue())
+                // An automation's first poll of a channel gets everything currently there; after that, only what's new.
+                const first = !q.started?.includes(p.ch.id)
+                if (first) q.started = [...(q.started ?? []), p.ch.id]
+                enqueue(q, first ? p.events : fresh) // enqueue skips repeated IDs
+              }
+              results.set(p.ch.id, { fresh: fresh.length })
+            }
+            return s
+          })
+        } catch (e) {
+          // The APIs answered; only saving failed (the lock stayed busy). Not failed polls: the next ones catch up.
+          const error = `couldn't save the poll: ${(e as Error)?.message}`
+          console.error("[automations] channels:", error)
+          for (const p of polled) results.set(p.ch.id, { fresh: 0, error: p.error ?? error })
+          return { results }
+        }
+        for (const p of polled) if (p.error) console.error(`[automations] channel ${p.ch.id} poll failed:`, p.error)
+        // Tell the user once when a channel keeps failing (expired key, API down).
+        for (const n of notices) {
+          if (!subscribers(n.ch.id, jobs).some((j) => canNotify(opts.notify, j))) continue
+          void send(opts.notify!, {
+            title: `Channel ${n.ch.name} can't poll`,
+            body: `${n.failures} failed polls in a row. Last error: ${n.error}`,
+            priority: "normal",
+          }).catch((err) => console.error("[automations] notify:", err))
+        }
+        return { results, state }
+      } finally { for (const ch of list) polling.delete(ch.id) }
     }
 
     /** Start runs for jobs that take events as they arrive. */
-    async function processArrivals(jobs = load(), channelID?: string): Promise<number> {
-      const loaded = loadAll()
+    async function processArrivals(jobs = load(), channelID?: string, state = store.loadChannels()): Promise<number> {
+      const loaded: Loaded = { state, channels: allChannels(state.defs) }
       let started = 0
       for (const job of jobs) {
         if (job.schedule.kind !== "event" || !isActive(job) || (channelID && !listens(job, channelID))) continue
@@ -645,13 +675,22 @@ export default Plugin.define({
       return started
     }
 
-    async function tickChannels(now: number) {
+    /** `changed`: this tick's due runs took events, so `loaded` is stale. */
+    async function tickChannels(now: number, loaded: Loaded, changed: boolean) {
       const jobs = load()
-      const { sources, defs, queues } = store.loadChannels()
-      // Queues of automations that no longer exist (deleted from chat, the TUI, or config).
-      const orphans = Object.keys(queues).filter((id) => !jobs.some((j) => j.id === id))
-      if (orphans.length) await store.mutateChannels((s) => { for (const id of orphans) delete s.queues[id] })
-      const due = [...allChannels(defs).values()].filter((ch) => {
+      const { sources, queues } = loaded.state
+      // Queues of automations that no longer exist (deleted from chat, the TUI, or config). Checked again
+      // under the lock against the jobs saved now: an automation created during this tick keeps its queue.
+      if (Object.keys(queues).some((id) => !jobs.some((j) => j.id === id))) {
+        try {
+          await store.mutateChannels((s) => {
+            const ids = new Set(load().map((j) => j.id))
+            for (const id of Object.keys(s.queues)) if (!ids.has(id)) delete s.queues[id]
+          })
+          changed = true
+        } catch (e) { console.error("[automations] channel state:", (e as Error)?.message) }
+      }
+      const due = [...loaded.channels.values()].filter((ch) => {
         const src = sources[ch.id]
         const requested = src?.pollRequestedAt !== undefined
         // Channels nobody listens to aren't polled.
@@ -659,9 +698,8 @@ export default Plugin.define({
         // Half a tick of slack keeps polls close to `every` instead of drifting a whole tick late.
         return requested || !src?.lastPollAt || now - src.lastPollAt >= ch.everyMs - tickMs / 2
       })
-      // In parallel: one slow API shouldn't hold up the others.
-      await Promise.allSettled(due.map((ch) => pollChannel(ch, jobs)))
-      await processArrivals(jobs)
+      const { state } = await pollChannels(due, jobs)
+      await processArrivals(jobs, undefined, state ?? (changed || due.length ? store.loadChannels() : loaded.state))
     }
 
     // ---------- event pump: track runs to completion ----------
@@ -920,8 +958,9 @@ export default Plugin.define({
                 j.nextRunAt = undefined
               }
               if (typeof input.enabled === "boolean") {
+                // Paused, not disabled: its channels' events keep waiting for it, as when paused from the TUI.
                 j.paused = !input.enabled
-                if (j.source === "tool") j.enabled = input.enabled
+                if (input.enabled) j.enabled = true
               }
               if (j.enabled && !j.paused && !runnable(j)) {
                 throw new Error("it has no channels and no schedule, so it would never run: add channels or a schedule (cron/every/at)")
@@ -1051,9 +1090,10 @@ export default Plugin.define({
             return text(`Poll of ${ch.id} queued; the leader process runs it within ${tickMs / 1000}s.`)
           }
           if (polling.has(ch.id)) return text(`${ch.id} is already polling.`)
-          const r = await track(pollChannel(ch))
+          const polled = await track(pollChannels([ch]))
+          const r = polled.results.get(ch.id)!
           if (r.error) return text(`error: poll of ${ch.id} failed: ${r.error}`)
-          const started = await track(processArrivals(load(), ch.id))
+          const started = await track(processArrivals(load(), ch.id, polled.state))
           return text(`Polled ${ch.id}: ${r.fresh} new event${r.fresh === 1 ? "" : "s"}, ${started} run${started === 1 ? "" : "s"} started.`)
         },
       })
@@ -1093,11 +1133,19 @@ export default Plugin.define({
           ...(input.filter ? { filter: input.filter } : {}),
         }
         const channel = parseChannel(config)
+        // Event text is untrusted and may steer an agent: a channel made from chat can't read any variable it likes.
+        const refused = envNames(config.request).names.filter((n) => !n.startsWith(CHANNEL_ENV_PREFIX) && !opts.channelEnv?.includes(n))
+        if (refused.length) {
+          throw new Error(
+            `channels created from chat can't read ${refused.join(", ")}: only variables starting with ${CHANNEL_ENV_PREFIX} ` +
+            `(e.g. {env:${CHANNEL_ENV_PREFIX}${refused[0]}}), or listed under channelEnv in the plugin options. Ask the user to set one of those.`,
+          )
+        }
         const secrets = literalSecrets(config.request)
         if (secrets.length) {
           throw new Error(
             `${secrets.join(", ")} look${secrets.length === 1 ? "s" : ""} like a secret written out. ` +
-            "Use {env:NAME} instead (e.g. \"DD-API-KEY\": \"{env:DD_API_KEY}\") and ask the user to set NAME where the opencode server runs.",
+            `Use {env:NAME} instead (e.g. "DD-API-KEY": "{env:${CHANNEL_ENV_PREFIX}DD_API_KEY}") and ask the user to set NAME where the opencode server runs.`,
           )
         }
         return { config, channel }
@@ -1121,12 +1169,14 @@ export default Plugin.define({
               "Ask the user to set it there (then restart opencode) and test again.",
             )
           }
+          // An API that echoes the request mustn't put a key into the conversation.
+          const shown = (s: string) => text(redact(s, names))
           let json: unknown
-          try { json = await fetchJSON(channel, fetch, abort.signal) } catch (e) { return text(`error: request failed: ${(e as Error).message}`) }
+          try { json = await fetchJSON(channel, fetch, abort.signal) } catch (e) { return shown(`error: request failed: ${(e as Error).message}`) }
           const items = get(json, channel.items)
           if (!Array.isArray(items)) {
             const arrays = arrayPaths(json)
-            return text(
+            return shown(
               `error: items "${channel.items || "(response)"}" is not an array.` +
               (arrays.length ? ` Arrays in the response: ${arrays.join(", ")}.` : "") +
               `\nResponse fields:\n${fieldPaths(json).join("\n")}`,
@@ -1142,7 +1192,7 @@ export default Plugin.define({
             ...(blank("title") ? ["event.title came out empty for some items: check its field paths."] : []),
             ...(blank("sessionKey") ? ["event.sessionKey came out empty for some items: check its field paths."] : []),
           ]
-          return text(
+          return shown(
             `OK: ${items.length} item${items.length === 1 ? "" : "s"}, ${events.length} after the filter.` +
             `${names.length ? ` Uses ${names.join(", ")} from the environment.` : ""}\n` +
             `Fields of the first item:\n${items.length ? fieldPaths(items[0]).join("\n") : "(no items now; the mapping can't be checked yet)"}\n` +

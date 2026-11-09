@@ -192,6 +192,8 @@ export function withEnv<T>(value: T, env: Record<string, string | undefined> = p
 /** Turn an API response into events, in response order. */
 export function extract(ch: Channel, response: unknown): ChannelEvent[] {
   const items = get(response, ch.items)
+  // Some APIs leave the array out, or send null, when there is nothing to list.
+  if (items === undefined || items === null) return []
   if (!Array.isArray(items)) throw new Error(`items "${ch.items || "(response)"}" is not an array`)
   const out: ChannelEvent[] = []
   for (const item of items) {
@@ -396,6 +398,18 @@ export function literalSecrets(request: ChannelConfig["request"]): string[] {
   }
   walk(request.body, "")
   return found
+}
+
+/** Channels created from chat may read variables with this prefix (and those the user allows in the options). */
+export const CHANNEL_ENV_PREFIX = "CHANNEL_"
+
+/** Replace the values of these environment variables in text with their {env:NAME} reference. */
+export function redact(text: string, names: string[], env: Record<string, string | undefined> = process.env): string {
+  for (const n of names) {
+    const v = env[n]
+    if (v) text = text.split(v).join(`{env:${n}}`)
+  }
+  return text
 }
 
 /** Environment variables a request reads, and which of them aren't set. */

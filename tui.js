@@ -356,7 +356,11 @@ function AutomationsView(props) {
         title: "Delete automation",
         message: `Delete “${j.name}”? Its history is kept.`
       });
-      if (ok) await toastErr(state.act(jobs => void jobs.splice(jobs.findIndex(x => x.id === j.id), 1)));
+      if (ok) await toastErr(state.act(jobs => {
+        // Already gone (deleted from chat or another TUI): splice(-1) would remove another automation.
+        const i = jobs.findIndex(x => x.id === j.id);
+        if (i >= 0) jobs.splice(i, 1);
+      }));
     })),
     openSession: withJob(j => {
       const sid = jobRuns().find(r => r.sessionID)?.sessionID ?? j.sessionID;

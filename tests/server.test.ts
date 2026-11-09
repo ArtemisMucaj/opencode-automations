@@ -86,7 +86,7 @@ test("server loads with current command API and exposes working CRUD tools", asy
   expect(app.store.loadJobs()[0].directory).toBe(app.dataDir)
   expect((await app.call("automation_list")).content).toContain("audit")
   await app.call("automation_update", { id: "audit", enabled: false })
-  expect(app.store.loadJobs()[0].enabled).toBe(false)
+  expect(app.store.loadJobs()[0]).toMatchObject({ paused: true, enabled: true })
   await app.call("automation_delete", { id: "audit" })
   expect(app.store.loadJobs()).toEqual([])
   expect(app.commands.has("automation")).toBe(true)
@@ -546,20 +546,20 @@ test("automation_notify is offered, with guidance, only to runs that may notify"
 
 const draftChannel = (overrides: Record<string, unknown> = {}) => ({
   name: "Datadog", every: "1m",
-  request: { url: "https://api.dd.test/api/v1/monitor", headers: { "DD-API-KEY": "{env:TEST_DD_KEY}" } },
+  request: { url: "https://api.dd.test/api/v1/monitor", headers: { "DD-API-KEY": "{env:CHANNEL_TEST_DD_KEY}" } },
   filter: { overall_state: "Alert" },
   event: { id: "{id}:{overall_state_modified}", sessionKey: "{id}", title: "{name}", body: "{message}" },
   ...overrides,
 })
 
 test("channel_test dry-runs a definition: fields, sample events, and nothing saved", async () => {
-  process.env.TEST_DD_KEY = "k"
+  process.env.CHANNEL_TEST_DD_KEY = "k"
   const fetch = api(() => [monitor(1), monitor(2, "t1", "OK")])
   try {
     const app = await start()
     const out = (await app.call("channel_test", draftChannel())).content
     expect(out).toContain("OK: 2 items, 1 after the filter")
-    expect(out).toContain("Uses TEST_DD_KEY")
+    expect(out).toContain("Uses CHANNEL_TEST_DD_KEY")
     expect(out).toContain("overall_state_modified: \"t1\"")
     expect(out).toContain("- id=1:t1 sessionKey=1\n  title: Monitor 1")
     expect(fetch.mock.calls[0][1]?.headers).toMatchObject({ "DD-API-KEY": "k" })
@@ -568,7 +568,7 @@ test("channel_test dry-runs a definition: fields, sample events, and nothing sav
     // A wrong items path lists the arrays it could have meant.
     fetch.mockImplementation((async () => new Response(JSON.stringify({ data: { monitors: [monitor(1)] } }))) as any)
     expect((await app.call("channel_test", draftChannel())).content).toContain("Arrays in the response: data.monitors")
-  } finally { fetch.mockRestore(); delete process.env.TEST_DD_KEY }
+  } finally { fetch.mockRestore(); delete process.env.CHANNEL_TEST_DD_KEY }
 })
 
 test("channel_test and channel_create refuse secrets written out and say what env is missing", async () => {
@@ -579,14 +579,14 @@ test("channel_test and channel_create refuse secrets written out and say what en
     const refused = (await app.call("channel_create", { id: "dd", ...literal })).content
     expect(refused).toContain("header Authorization, query parameter api_key look like a secret")
     expect((await app.call("channel_test", literal)).content).toContain("{env:NAME}")
-    expect((await app.call("channel_test", draftChannel())).content).toContain("TEST_DD_KEY is not set")
+    expect((await app.call("channel_test", draftChannel())).content).toContain("CHANNEL_TEST_DD_KEY is not set")
     expect(fetch.mock.calls).toHaveLength(0)
     expect((await app.call("channel_create", { id: "Bad Id", ...draftChannel() })).content).toContain("lowercase")
   } finally { fetch.mockRestore() }
 })
 
 test("a created channel feeds automations like a config one, and can be updated and deleted", async () => {
-  process.env.TEST_DD_KEY = "k"
+  process.env.CHANNEL_TEST_DD_KEY = "k"
   let current: unknown[] = []
   const fetch = api(() => current)
   try {
@@ -616,7 +616,7 @@ test("a created channel feeds automations like a config one, and can be updated 
     expect(state.defs.dd).toBeUndefined()
     expect(state.sources.dd).toBeUndefined()
     expect(state.queues.triage.sessions).toEqual({})
-  } finally { fetch.mockRestore(); delete process.env.TEST_DD_KEY }
+  } finally { fetch.mockRestore(); delete process.env.CHANNEL_TEST_DD_KEY }
 })
 
 test("config channels can't be changed or shadowed from chat, and are published without secrets", async () => {
@@ -737,7 +737,7 @@ test("changing or deleting an automation cleans its queue", async () => {
 })
 
 test("automation_run says when an automation's channels are gone, and such an automation can't be resumed", async () => {
-  process.env.TEST_DD_KEY = "k"
+  process.env.CHANNEL_TEST_DD_KEY = "k"
   const fetch = api(() => [monitor(1)])
   try {
     const app = await start()
@@ -754,7 +754,7 @@ test("automation_run says when an automation's channels are gone, and such an au
     await app.call("channel_delete", { id: "dd", detach: true })
     expect((await app.call("automation_update", { id: "live", enabled: true })).content).toContain("would never run")
     expect((await app.call("automation_update", { id: "live", enabled: true, every: "1h" })).content).toContain("enabled")
-  } finally { fetch.mockRestore(); delete process.env.TEST_DD_KEY }
+  } finally { fetch.mockRestore(); delete process.env.CHANNEL_TEST_DD_KEY }
 })
 
 test("a tick drops queues of automations that no longer exist", async () => {
@@ -812,7 +812,7 @@ test("events wait for a paused automation and go in when it resumes", async () =
 })
 
 test("detaching an event-only automation's last channel pauses it, and the pause alone can be lifted", async () => {
-  process.env.TEST_DD_KEY = "k"
+  process.env.CHANNEL_TEST_DD_KEY = "k"
   const fetch = api(() => [])
   try {
     const app = await start()
@@ -820,7 +820,7 @@ test("detaching an event-only automation's last channel pauses it, and the pause
     await app.call("automation_create", { name: "Live", prompt: "p", channels: ["dd"] })
     await app.call("channel_delete", { id: "dd", detach: true })
     expect(app.store.loadJobs()[0]).toMatchObject({ paused: true, enabled: true })
-  } finally { fetch.mockRestore(); delete process.env.TEST_DD_KEY }
+  } finally { fetch.mockRestore(); delete process.env.CHANNEL_TEST_DD_KEY }
 })
 
 test("a session made for a chunk that someone else took is removed again", async () => {
@@ -856,3 +856,97 @@ test("a poll whose results can't be saved isn't counted as a failed poll", async
     expect(app.store.loadChannels().sources.dd.failures ?? 0).toBe(0)
   } finally { fetch.mockRestore() }
 }, 10_000)
+
+test("a key's session that can't be created is a failed run, counted and given up after 3 attempts", async () => {
+  const fetch = api(() => [monitor(1)])
+  try {
+    const app = await start({ channels: [channel()], jobs: [triage({ session: "sticky", cron: "0 0 1 1 *" })] })
+    app.ctx.session.create = async () => { throw new Error("model not found") }
+    for (let i = 1; i <= 3; i++) {
+      expect((await app.call("automation_run", { id: "triage" })).content).toContain("failed — model not found")
+      expect(app.store.loadChannels().queues.triage.pending.map((e) => e.attempts)).toEqual(i < 3 ? [i] : [])
+    }
+    expect(app.store.history("triage").map((r) => r.status)).toEqual(["failed", "failed", "failed"])
+    expect(app.store.loadJobs()[0].lastStatus).toBe("failed")
+  } finally { fetch.mockRestore() }
+})
+
+test("a session made for a chunk is removed when its events can't be taken", async () => {
+  const fetch = api(() => [monitor(1)])
+  try {
+    const app = await start({ channels: [channel()], jobs: [triage({ session: "sticky", cron: "0 0 1 1 *" })] })
+    const mutateChannels = Store.prototype.mutateChannels
+    const create = app.ctx.session.create
+    app.ctx.session.create = async (input: any) => {
+      Store.prototype.mutateChannels = async () => { throw new Error("Lock file is already being held") }
+      return create(input)
+    }
+    try {
+      expect((await app.call("automation_run", { id: "triage" })).content).toContain("retried on the next tick")
+    } finally { Store.prototype.mutateChannels = mutateChannels }
+    expect(app.removed).toEqual(["session-1"])
+    expect(waiting(app, "triage")).toEqual(["1:t1"])
+  } finally { fetch.mockRestore() }
+})
+
+test("runs on events set the last run time; a digest with nothing waiting doesn't", async () => {
+  let current: unknown[] = []
+  const fetch = api(() => current)
+  try {
+    const app = await start({ tickSeconds: 5, channels: [channel()], jobs: [triage(), triage({ id: "digest", every: "1m" })] })
+    const jobs = app.store.loadJobs().map((j) => (j.id === "digest" ? { ...j, nextRunAt: Date.now() - 1000 } : j))
+    app.store.saveJobs(jobs)
+    current = [monitor(1)]
+    await app.call("channel_poll", { id: "dd" })
+    const byID = Object.fromEntries(app.store.loadJobs().map((j) => [j.id, j]))
+    expect(byID.triage.lastRunAt).toBeGreaterThan(0)
+    expect(byID.digest.lastRunAt).toBeUndefined()
+  } finally { fetch.mockRestore() }
+})
+
+test("channels created from chat read only CHANNEL_ variables or allowed ones, and test output hides their values", async () => {
+  process.env.CHANNEL_TEST_DD_KEY = "s3cret-value"
+  process.env.TEST_OTHER_KEY = "other"
+  // An API that echoes the key back.
+  const fetch = spyOn(globalThis, "fetch").mockImplementation((async (_: any, init: any) =>
+    new Response(JSON.stringify([{ ...monitor(1), echoed: init.headers["DD-API-KEY"] }]))) as any)
+  try {
+    const app = await start()
+    const other = draftChannel({ request: { url: "https://x.test/?q={env:TEST_OTHER_KEY}" } })
+    expect((await app.call("channel_test", other)).content).toContain("can't read TEST_OTHER_KEY")
+    expect((await app.call("channel_create", { id: "x", ...other })).content).toContain("can't read TEST_OTHER_KEY")
+    expect(fetch.mock.calls).toHaveLength(0)
+    const out = (await app.call("channel_test", draftChannel({ event: { id: "{id}", title: "{echoed}" } }))).content
+    expect(out).toContain("OK: 1 item")
+    expect(out).not.toContain("s3cret-value")
+    expect(out).toContain("{env:CHANNEL_TEST_DD_KEY}")
+
+    const allowed = await start({ channelEnv: ["TEST_OTHER_KEY"] })
+    expect((await allowed.call("channel_create", { id: "x", ...other })).content).toContain("Created channel x")
+  } finally { fetch.mockRestore(); delete process.env.CHANNEL_TEST_DD_KEY; delete process.env.TEST_OTHER_KEY }
+})
+
+test("only the leader publishes its config channels", async () => {
+  const fetch = api(() => [])
+  try {
+    const dataDir = mkdtempSync(join(tmpdir(), "automations-shared-"))
+    cleanups.push(async () => rmSync(dataDir, { recursive: true, force: true }))
+    await start({ dataDir, channels: [channel()] })
+    await start({ dataDir }) // another project, no channels, not the leader
+    expect(Object.keys(new Store(dataDir).loadChannels().config)).toEqual(["dd"])
+  } finally { fetch.mockRestore() }
+})
+
+test("an API that leaves the items out when there is nothing is an empty poll, not a failure", async () => {
+  let body: unknown = { data: {} }
+  const fetch = spyOn(globalThis, "fetch").mockImplementation((async () => new Response(JSON.stringify(body))) as any)
+  try {
+    const app = await start({ channels: [channel({ items: "data.issues" })], jobs: [triage({ cron: "0 0 1 1 *" })] })
+    expect((await app.call("channel_poll", { id: "dd" })).content).toContain("0 new events")
+    body = { data: { issues: null } }
+    expect((await app.call("channel_poll", { id: "dd" })).content).toContain("0 new events")
+    expect(app.store.loadChannels().sources.dd.failures).toBe(0)
+    body = { data: { issues: "nope" } }
+    expect((await app.call("channel_poll", { id: "dd" })).content).toContain("is not an array")
+  } finally { fetch.mockRestore() }
+})

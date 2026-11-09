@@ -145,7 +145,7 @@ Create channels from chat with `/channel <what you want>` (below), or define the
 4. `channel_create` saves it in `channels.json`, next to the config channels.
 5. With your agreement on what to do with the events, `automation_create` (or `automation_update`) attaches it with `channels: [...]`.
 
-**Keys stay out of chat.** A channel created from chat must reference secrets as `{env:NAME}`. Headers, query parameters and body fields that look like credentials (`Authorization`, `api_key`, `token`, …) with a written-out value are refused. `channel_test` and `channel_list` say which variables aren't set; set them where the opencode server runs and restart it.
+**Keys stay out of chat.** A channel created from chat must reference secrets as `{env:NAME}`. Headers, query parameters and body fields that look like credentials (`Authorization`, `api_key`, `token`, …) with a written-out value are refused. `channel_test` and `channel_list` say which variables aren't set; set them where the opencode server runs and restart it. Such a channel can only read variables whose name starts with `CHANNEL_` (e.g. `{env:CHANNEL_DD_API_KEY}`), or that you list under the plugin option `channelEnv` (e.g. `"channelEnv": ["DD_API_KEY"]`): event text is untrusted, and an agent steered by it mustn't be able to send any variable of the server to any URL. `channel_test` also replaces a key's value with its `{env:NAME}` reference in what it shows. Config channels can read any variable.
 
 `channel_update` changes a created channel (changing `event.id` makes current items look new, so they're delivered again). `channel_delete` removes one; if automations use it, pass `detach: true` to remove it from them, which pauses any event-only automation left with no channel. Config channels are edited in config.
 
@@ -173,7 +173,7 @@ Create channels from chat with `/channel <what you want>` (below), or define the
 
 **Untrusted input.** Event text goes inside `<event>` tags, and the prompt tells the agent it is data, not instructions. Still, anyone who can write into the polled system (an alert message, an issue title) writes into the prompt: run these automations with an agent whose permissions fit unattended work on untrusted input.
 
-**Status.** `channel_list` shows each channel's last poll, errors, and the automations on it with their waiting events. `channel_poll` polls now. Pause an automation as usual; its events wait while it is paused (up to 500) and go in when it resumes. A disabled automation gets none. After 3 failed polls in a row (expired key, API down) you get one notification.
+**Status.** `channel_list` shows each channel's last poll, errors, and the automations on it with their waiting events. `channel_poll` polls now. Pause an automation as usual; its events wait while it is paused (up to 500) and go in when it resumes. An automation disabled in config (`enabled: false`) gets none. A response where the `items` path is missing or null counts as no items. After 3 failed polls in a row (expired key, API down) you get one notification.
 
 ## Reference
 
