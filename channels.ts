@@ -400,9 +400,6 @@ export function literalSecrets(request: ChannelConfig["request"]): string[] {
   return found
 }
 
-/** Channels created from chat may read variables with this prefix (and those the user allows in the options). */
-export const CHANNEL_ENV_PREFIX = "CHANNEL_"
-
 /** Replace the values of these environment variables in text with their {env:NAME} reference. */
 export function redact(text: string, names: string[], env: Record<string, string | undefined> = process.env): string {
   for (const n of names) {

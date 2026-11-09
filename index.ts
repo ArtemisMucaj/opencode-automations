@@ -19,7 +19,7 @@ import {
 import {
   arrayPaths, assign, CHANNEL_ID, chunks, composeEvents, emptyQueue, emptySource, enqueue, envNames, extract, fetchJSON,
   fieldPaths, forget, get, ingest, literalSecrets, MAX_START_ATTEMPTS, parseChannel, poll, removeChannel, requeue, requestPoll,
-  CHANNEL_ENV_PREFIX, redact, summarize, touch, uid,
+  redact, summarize, touch, uid,
   type Channel, type ChannelConfig, type ChannelEvent, type ChannelsState,
 } from "./channels.ts"
 
@@ -32,8 +32,6 @@ interface Options {
   notify?: NotifyConfig
   jobs?: ConfigJob[]
   channels?: ChannelConfig[]
-  /** Environment variables channels created from chat may read, besides those starting with CHANNEL_. */
-  channelEnv?: string[]
 }
 
 interface ScheduleInput {
@@ -138,9 +136,8 @@ const CHANNEL_GUIDE =
   "Set up event sources (channels) and the automations that run on them.\n" +
   "1. channel_list: if a channel already polls what is needed, reuse it instead of creating another.\n" +
   "2. For a new one, find the API endpoint that lists the items: from its docs, an example the user gives, or a connected tool.\n" +
-  "3. Keys: never write a secret into the definition. Use {env:NAME}, with a NAME that starts with CHANNEL_ " +
-  "(e.g. header \"DD-API-KEY\": \"{env:CHANNEL_DD_API_KEY}\"), and tell the user to set it where the opencode server runs; " +
-  "channel_test says if it is missing. Other variables can't be read unless the user lists them under channelEnv.\n" +
+  "3. Keys: never write a secret into the definition. Use {env:NAME} (e.g. header \"DD-API-KEY\": \"{env:DD_API_KEY}\") " +
+  "and tell the user to set NAME where the opencode server runs; channel_test says if it is missing.\n" +
   "4. channel_test the draft and iterate until the sample events look right: items (the array), filter, " +
   "event.id (must change when something happens again, e.g. \"{id}:{updated_at}\"), event.sessionKey (which events share a " +
   "conversation, e.g. one per monitor), and a title/body/url the agent can act on. Pick an interval that respects rate limits.\n" +
@@ -1125,7 +1122,10 @@ export default Plugin.define({
       } as const
 
       /** A channel definition from tool input, validated, with its problems spelled out. */
-      function draft(input: any, id: string): { config: ChannelConfig; channel: Channel } {
+      function draft(input: any, id: string, sessionID: string): { config: ChannelConfig; channel: Channel } {
+        // A run reads event text from outside, which may try to steer it: it can't define requests,
+        // or it could be made to send any variable of the server's environment to any URL.
+        if (inflight.has(sessionID)) throw new Error("channels can't be tested, created or changed from inside an automation run; the user does that in chat")
         const config: ChannelConfig = {
           id, every: input.every ?? "5m", request: input.request, event: input.event,
           ...(input.name ? { name: input.name } : {}),
@@ -1133,19 +1133,11 @@ export default Plugin.define({
           ...(input.filter ? { filter: input.filter } : {}),
         }
         const channel = parseChannel(config)
-        // Event text is untrusted and may steer an agent: a channel made from chat can't read any variable it likes.
-        const refused = envNames(config.request).names.filter((n) => !n.startsWith(CHANNEL_ENV_PREFIX) && !opts.channelEnv?.includes(n))
-        if (refused.length) {
-          throw new Error(
-            `channels created from chat can't read ${refused.join(", ")}: only variables starting with ${CHANNEL_ENV_PREFIX} ` +
-            `(e.g. {env:${CHANNEL_ENV_PREFIX}${refused[0]}}), or listed under channelEnv in the plugin options. Ask the user to set one of those.`,
-          )
-        }
         const secrets = literalSecrets(config.request)
         if (secrets.length) {
           throw new Error(
             `${secrets.join(", ")} look${secrets.length === 1 ? "s" : ""} like a secret written out. ` +
-            `Use {env:NAME} instead (e.g. "DD-API-KEY": "{env:${CHANNEL_ENV_PREFIX}DD_API_KEY}") and ask the user to set NAME where the opencode server runs.`,
+            `Use {env:NAME} instead (e.g. "DD-API-KEY": "{env:DD_API_KEY}") and ask the user to set NAME where the opencode server runs.`,
           )
         }
         return { config, channel }
@@ -1159,9 +1151,9 @@ export default Plugin.define({
           "fields and sample events; adjust items/filter/event until they look right, then channel_create it. " +
           'event.id must change when something happens again (e.g. "{id}:{updated_at}"). Secrets only as {env:NAME}.',
         input: { type: "object", properties: channelProps, required: ["request", "event"], additionalProperties: false },
-        execute: async (input: any) => {
+        execute: async (input: any, tc) => {
           let channel: Channel
-          try { ({ channel } = draft(input, "test")) } catch (e) { return text(`error: ${(e as Error).message}`) }
+          try { ({ channel } = draft(input, "test", tc.sessionID)) } catch (e) { return text(`error: ${(e as Error).message}`) }
           const { names, missing } = envNames(channel.request)
           if (missing.length) {
             return text(
@@ -1212,11 +1204,11 @@ export default Plugin.define({
           required: ["id", "request", "event"],
           additionalProperties: false,
         },
-        execute: async (input: any) => {
+        execute: async (input: any, tc) => {
           try {
             if (!CHANNEL_ID.test(input.id ?? "")) throw new Error('id must be lowercase letters, digits, - and _ (e.g. "datadog-alerts")')
             if (configChannels.has(input.id)) throw new Error(`"${input.id}" is a config channel; pick another id`)
-            const { config } = draft(input, input.id)
+            const { config } = draft(input, input.id, tc.sessionID)
             await store.mutateChannels((s) => {
               if (s.defs[input.id]) throw new Error(`channel "${input.id}" exists; change it with channel_update`)
               s.defs[input.id] = config
@@ -1242,14 +1234,14 @@ export default Plugin.define({
           required: ["id"],
           additionalProperties: false,
         },
-        execute: async (input: any) => {
+        execute: async (input: any, tc) => {
           try {
             if (configChannels.has(input.id)) throw new Error(`"${input.id}" is defined in opencode.json(c); edit it there`)
             const updated = await store.mutateChannels((s) => {
               const prev = s.defs[input.id]
               if (!prev) throw new Error(`no channel "${input.id}" created with channel_create`)
               const merged = { ...prev, ...Object.fromEntries(Object.entries(input).filter(([k, v]) => k !== "id" && v !== undefined)) }
-              const { config } = draft(merged, input.id)
+              const { config } = draft(merged, input.id, tc.sessionID)
               s.defs[input.id] = config
               return config
             })
