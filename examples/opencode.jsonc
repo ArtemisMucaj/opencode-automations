@@ -10,7 +10,10 @@
         "defaultModel": "anthropic/claude-sonnet-4-5",
         // Sent by the server, so they work with no TUI open. Use any subset.
         "notify": {
-          "on": ["succeeded", "failed", "timeout"],
+          // The run's agent sends notifications with automation_notify (at most maxPerRun per run).
+          // `on` adds automatic notices for these outcomes. Successful runs only notify through the agent.
+          "on": ["failed", "timeout"],
+          "maxPerRun": 5,
           "native": true,
           // Optional phone notifications via Pushover.
           // "pushover": { "token": "<app token>", "user": "<user key>" },
@@ -33,7 +36,7 @@
             "agent": "build",
             "model": "lmstudio/qwen3-coder",
             "timeoutMinutes": 20,
-            "notify": ["failed", "timeout"], // only bother me when it breaks
+            "notify": ["failed", "timeout"], // automatic notices when it breaks; the agent decides the rest
             "directory": "/Users/artemis/src/home-plus",
           },
         ],

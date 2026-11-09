@@ -39,6 +39,8 @@ export interface Run {
   status: RunStatus
   output?: string
   error?: string
+  /** automation_notify calls the agent made. */
+  notifications?: number
 }
 
 function read(path: string): string | undefined {

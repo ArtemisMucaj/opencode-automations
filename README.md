@@ -102,31 +102,30 @@ The session sidebar lists upcoming jobs and marks sessions created by an automat
 
 ## Create automations 
 
-`/automation <request>` or plain language. Tools: `automation_create`, `automation_list`, `automation_update`, `automation_delete`, `automation_run`, `automation_history`.
+`/automation <request>` or plain language. Tools: `automation_create`, `automation_list`, `automation_update`, `automation_delete`, `automation_run`, `automation_history`, plus `automation_notify`, which only automation runs see (below).
 
 ## Notifications
 
-Configured on the **server** plugin (`notify` in `opencode.jsonc`), so they fire even with no TUI open:
+Sent by the **server** plugin (`notify` in `opencode.jsonc`), so no TUI needs to be open.
 
-| channel | reaches | setup |
+| channel | setup | notes |
 |---|---|---|
-| `native` | macOS or Linux desktop | `"native": true` |
-| `pushover` | iPhone, Android, desktop | `"pushover": { "token", "user" }` |
+| `native` | `"native": true` | macOS via `osascript` (optional `{ "sound": "Ping" }`), Linux via `notify-send` (needs `libnotify` and a desktop session). Shows on the server machine. |
+| `pushover` | `"pushover": { "token", "user" }` | Phone and desktop. |
 
-`native` picks the server's OS backend automatically:
+**The run's agent decides what to send.** Runs get an `automation_notify` tool (`title`, `message`, optional `priority` and `url`) and are told to write plain text with no markdown, newlines for structure and bare links. Their final reply is not sent. Stray markdown is cleaned up anyway.
 
-- **macOS:** `osascript` (AppleScript). Allow notifications for Script Editor in System Settings if prompted. Optional macOS-only sound: `"native": { "sound": "Ping" }` (empty string disables sound).
-- **Linux:** `notify-send` (install `libnotify-bin` on Debian/Ubuntu, `libnotify` on Fedora/Arch). Requires a running desktop notification service and access to its user D-Bus session. The OpenCode server must inherit that desktop session environment; a headless server or isolated system service will not display local notifications.
+**Limits.** Pushover takes 1024 characters per message: longer ones are split into numbered parts (`Title (1/3)`), up to 4. At most `maxPerRun` notifications per run (default 5).
 
-No TUI needs to be open, but native notifications appear on the **server machine**, not a remote client's desktop. Missing utilities, unavailable desktop sessions, or unsupported OSes are logged as `native` delivery failures without failing the automation; Pushover can still deliver. The old `macos` option is no longer supported—replace it with `native`.
+**Automatic notices** go out only when a run fails or times out (`on`, default `["failed", "timeout"]`). A successful run is notified only if the agent found something worth sending. Per job, `notify: false` turns everything off; an array picks that job's automatic notices.
 
-Failures get elevated priority in Pushover. `on` picks outcomes (default: succeeded, failed, timeout). Per job, `notify: false` silences it and `notify: ["failed"]` limits it. A failing channel is logged and never affects the run. The TUI's own OS notification is now off by default (`notify` in `cli.json` to turn it back on) to avoid duplicates.
+A failing channel is logged and never affects the run. The TUI's own OS notification is off by default (`notify` in `cli.json`).
 
 ## Reference
 
 **Model** — `"provider/model[:variant]"`, per job or via `defaultModel`. Applied at session creation: every run for `new`, first run only for `reuse`; `current` retains the chat's model.
 
-**Output** — in the run's session (`⏰ name · time` in your session list), the last text block in `history.jsonl` (`automation_history`, the TUI), and a toast/notification from the TUI.
+**Output** — in the run's session (`⏰ name · time` in your session list), the last text block in `history.jsonl` (`automation_history`, the TUI, with the number of notifications sent), and a toast/notification from the TUI. Phone/desktop notifications carry what the agent sent with `automation_notify`.
 
 **Working directory** — the session's `location`, the calling session's directory for chat-created jobs, the TUI's directory for TUI-created jobs, `directory` for config jobs.
 
