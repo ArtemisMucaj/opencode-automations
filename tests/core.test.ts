@@ -41,9 +41,13 @@ test("TUI timing parser accepts cron, intervals, dates and rejects bad timezones
   expect(parseScheduleText("2099-11-02T09:00:00Z")).toEqual({ kind: "at", time: Date.parse("2099-11-02T09:00:00Z") })
   expect(() => parseScheduleText("@daily Not/AZone")).toThrow()
   expect(() => parseScheduleText("2000-01-01T00:00:00Z")).toThrow()
-  expect(isActive({ enabled: true, paused: true } as any)).toBe(false)
-  expect(isActive({ enabled: true, done: true } as any)).toBe(false)
-  expect(isActive({ enabled: true } as any)).toBe(true)
+  const every = { kind: "every", ms: 60_000 }
+  expect(isActive({ enabled: true, paused: true, schedule: every } as any)).toBe(false)
+  expect(isActive({ enabled: true, done: true, schedule: every } as any)).toBe(false)
+  expect(isActive({ enabled: true, schedule: every } as any)).toBe(true)
+  // Runs only on events but has no channel: it can never run, so it isn't active.
+  expect(isActive({ enabled: true, schedule: { kind: "event" } } as any)).toBe(false)
+  expect(isActive({ enabled: true, schedule: { kind: "event" }, on: { channels: ["dd"] } } as any)).toBe(true)
   expect(uniqueID([{ id: "morning" }] as any, "Morning")).toBe("morning-2")
   expect(relative(120_000, 0)).toBe("in 2m")
 })
@@ -56,7 +60,7 @@ test("store persists edits and keeps latest status per run", async () => {
   const b = new Store(dir)
   expect(a.loadJobs()).toEqual([])
   a.saveJobs([{ id: "one", enabled: true }] as any)
-  mutateRaw(b, (jobs) => { jobs[0].paused = true })
+  await mutateRaw(b, (jobs) => { jobs[0].paused = true })
   expect(a.loadJobs()[0].paused).toBe(true)
   a.appendRun({ runID: "r1", jobID: "one", startedAt: 1, status: "running" })
   a.appendRun({ runID: "r1", jobID: "one", startedAt: 1, endedAt: 2, status: "succeeded", output: "done" })
@@ -86,4 +90,46 @@ test("lease elects one store instance and releases ownership", async () => {
     a.release()
     b.release()
   }
+})
+
+test("channel state waits for a lock held by another process instead of failing", async () => {
+  const { Store } = await import("../store.ts")
+  const dir = temp()
+  const store = new Store(dir)
+  const holder = Bun.spawn(["bun", "-e", `
+    const lockfile = require("proper-lockfile")
+    const release = lockfile.lockSync(${JSON.stringify(join(dir, "channels.json"))}, { realpath: false })
+    console.log("locked")
+    setTimeout(() => { release(); process.exit(0) }, 300)
+  `], { cwd: join(import.meta.dir, ".."), stdout: "pipe" })
+  const reader = holder.stdout.getReader()
+  await reader.read() // "locked"
+  const started = Date.now()
+  await store.mutateChannels((s) => { s.sources.x = { seen: ["a"] } })
+  expect(Date.now() - started).toBeGreaterThanOrEqual(100)
+  expect(store.loadChannels().sources.x.seen).toEqual(["a"])
+  await holder.exited
+})
+
+test("waiting for a busy lock doesn't block the event loop", async () => {
+  const { Store } = await import("../store.ts")
+  const dir = temp()
+  const store = new Store(dir)
+  const holder = Bun.spawn(["bun", "-e", `
+    const lockfile = require("proper-lockfile")
+    const release = lockfile.lockSync(${JSON.stringify(join(dir, "channels.json"))}, { realpath: false })
+    console.log("locked")
+    setTimeout(() => { release(); process.exit(0) }, 400)
+  `], { cwd: join(import.meta.dir, ".."), stdout: "pipe" })
+  await holder.stdout.getReader().read()
+  // A timer set while the write waits for the lock must fire on time, not after the lock is free.
+  let fired = 0
+  const started = Date.now()
+  const timer = new Promise<void>((r) => setTimeout(() => { fired = Date.now() - started; r() }, 50))
+  const write = store.mutateChannels((s) => { s.sources.x = { seen: [] } })
+  await timer
+  expect(fired).toBeLessThan(250)
+  await write
+  expect(Date.now() - started).toBeGreaterThanOrEqual(200)
+  await holder.exited
 })

@@ -6,8 +6,12 @@ import { type Job, type Store } from "./store.ts"
 export const defaultDataDir = () =>
   join(process.env.XDG_DATA_HOME ?? join(homedir(), ".local", "share"), "opencode", "plugins", "automations")
 
-export const isActive = (job: Job) => job.enabled && !job.paused && !job.done
-export const mutateRaw = <T>(store: Store, fn: (jobs: Job[]) => T): T => store.mutate(fn)
+/** Whether a job uses a channel. */
+export const listens = (job: Job, channelID: string) => !!job.on?.channels.includes(channelID)
+/** A job that only runs on events needs a channel; otherwise nothing would ever start it. */
+export const runnable = (job: Job) => job.schedule.kind !== "event" || !!job.on?.channels.length
+export const isActive = (job: Job) => job.enabled && !job.paused && !job.done && runnable(job)
+export const mutateRaw = <T>(store: Store, fn: (jobs: Job[]) => T | Promise<T>): Promise<T> => store.mutate(fn)
 
 export function uniqueID(jobs: Job[], name: string): string {
   const base = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 32) || "automation"

@@ -191,3 +191,8 @@ test("compose writes a short notice and never includes the agent's output", () =
   expect(compose(job, { ...run, status: "failed", error: "boom" })).toEqual({ title: "Morning failed", body: "boom", priority: "high" })
   expect(compose(job, { ...run, status: "timeout", error: "exceeded 30m" }).body).toBe("Stopped: exceeded 30m.")
 })
+
+test("quotes in link URLs can't break the href", async () => {
+  const { format } = await import("../notify.ts")
+  expect(format('[dash](https://x.test/?q="a")', "html")).toBe('<a href="https://x.test/?q=&quot;a&quot;">dash</a>')
+})

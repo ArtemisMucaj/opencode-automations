@@ -26,18 +26,61 @@
             "tz": "Europe/Paris",
             "session": "new",
             // Required: the server's cwd is not your project.
-            "directory": "/Users/artemis/src/home-plus",
+            "directory": "/path/to/your/project",
           },
           {
             "id": "dep-audit",
             "prompt": "Run the dependency audit, compare against the previous findings in this session, and report only what changed.",
             "cron": "@weekly",
-            "session": "reuse",
+            "session": "sticky",
             "agent": "build",
             "model": "lmstudio/qwen3-coder",
             "timeoutMinutes": 20,
             "notify": ["failed", "timeout"], // automatic notices when it breaks; the agent decides the rest
-            "directory": "/Users/artemis/src/home-plus",
+            "directory": "/path/to/your/project",
+          },
+          {
+            // No schedule: runs as alerts arrive. "sticky" + the channel's sessionKey: one session per monitor.
+            "id": "alert-triage",
+            "on": { "channels": ["datadog"] },
+            "session": "sticky",
+            "prompt": "These Datadog monitors started alerting. Check recent deploys, logs and the related code, and find the likely cause. If it needs a human, notify me with the cause and a link; if it is noise or already resolved, don't.",
+            "agent": "build",
+            "timeoutMinutes": 20,
+            "directory": "/path/to/your/project",
+          },
+          {
+            // With a schedule: a digest of everything that alerted since the last run.
+            "id": "alert-digest",
+            "on": { "channels": ["datadog"] },
+            "cron": "0 18 * * 1-5",
+            "tz": "Europe/Paris",
+            "prompt": "Summarise today's Datadog alerts: what fired, how often, and which look like they need follow-up. Notify me with the summary.",
+            "directory": "/path/to/your/project",
+          },
+        ],
+        // Channels are event sources: they poll an API. Jobs run on them with `on` (see alert-triage, alert-digest).
+        "channels": [
+          {
+            "id": "datadog",
+            "name": "Datadog",
+            "every": "1m",
+            "request": {
+              // api.datadoghq.com for US1; match your Datadog site.
+              "url": "https://api.datadoghq.eu/api/v1/monitor?monitor_tags=team:my-team",
+              "headers": { "DD-API-KEY": "{env:DD_API_KEY}", "DD-APPLICATION-KEY": "{env:DD_APP_KEY}" },
+            },
+            // The response is the array itself; keep monitors that are alerting.
+            "filter": { "overall_state": ["Alert", "Warn"] },
+            "event": {
+              // A new state change is a new event, so a monitor that recovers and fires again is delivered again.
+              "id": "{id}:{overall_state_modified}",
+              // Which alerts share a session for automations with session "sticky": one per monitor.
+              "sessionKey": "{id}",
+              "title": "[{overall_state}] {name}",
+              "body": "{message}",
+              "url": "https://app.datadoghq.eu/monitors/{id}",
+            },
           },
         ],
       },

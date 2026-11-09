@@ -1,12 +1,12 @@
 # opencode automations (v2 plugin)
 
-Run prompts on a schedule inside opencode 2 — cron, fixed intervals, or one-shot — declared in config, created from chat, or managed from a TUI dialog.
+Run prompts on a schedule inside opencode 2 — cron, fixed intervals, or one-shot — declared in config, created from chat, or managed from a TUI dialog. Or run them on events: channels poll an API (Datadog, Sentry, GitHub…) and hand new items to the automations that listen.
 
 Two halves, one package:
 
 | part | runs in | does |
 |---|---|---|
-| `index.ts` (server plugin) | the opencode background server | owns the ticker, fires runs, tracks them to completion, exposes `automation_*` tools |
+| `index.ts` (server plugin) | the opencode background server | owns the ticker, fires runs, polls channels (`channels.ts`), tracks runs to completion, exposes `automation_*` and `channel_*` tools |
 | `tui.tsx` (TUI plugin) | each TUI | `/automations` dialog, sidebar section, toasts + OS notifications when runs finish |
 
 Both share `jobs.json` / `history.jsonl` on disk. The TUI only writes *intents* (pause, edit, delete, run-now); the server's leader executes them, so there's still exactly one firer and one history.
@@ -97,12 +97,15 @@ Uses `@opencode/plugin@2.2.1`, OpenTUI `0.7.0`, `cron-parser` for timezone/DST-a
 - **m** picks from the models available at the current location.
 - **n** is a small wizard; schedules accept `0 9 * * 1-5 Europe/Paris`, `@daily`, `every 30m`, or an ISO date. New jobs use the TUI's current directory.
 - Config-defined jobs can be paused and run, not edited — their definition lives in config.
+- **c** switches to the **channels** tab: each channel's status (polling, idle, failing), what it polls and how often, its last poll and error, the environment variables it reads, its event mapping, and the automations it feeds with their waiting events. **p** polls the selected channel on the server's next tick; **d** deletes a channel created from chat that no automation uses. Channels are created and changed from chat (`/channel`).
 
 The session sidebar lists upcoming jobs and marks sessions created by an automation run ("this session: mr-triage ✓"). Finished runs raise a toast (OS/phone notifications come from the server — see below).
 
 ## Create automations 
 
 `/automation <request>` or plain language. Tools: `automation_create`, `automation_list`, `automation_update`, `automation_delete`, `automation_run`, `automation_history`, plus `automation_notify`, which only automation runs see (below).
+
+**Code mode.** Every tool goes through opencode's code mode, in two namespaces: `automation` (create, list, update, delete, run, history, and notify inside runs) and `channel` (list, poll, test, create, update, delete). Their schemas don't ride along on every request; the model reaches them through code mode when needed. `automation_notify` is offered only inside automation runs. `/automation` and `/channel` also give the agent a short guide.
 
 ## Notifications
 
@@ -121,9 +124,60 @@ Sent by the **server** plugin (`notify` in `opencode.jsonc`), so no TUI needs to
 
 A failing channel is logged and never affects the run. The TUI's own OS notification is off by default (`notify` in `cli.json`).
 
+## Channels
+
+A channel is an event source: it polls an HTTP API and turns new items into events. Automations run on those events with `on: { channels: [...] }`, from one channel or several. The agent investigates and, if it's worth it, notifies you with `automation_notify`. Polling needs no public URL, so it works on a laptop.
+
+```
+Datadog API ──poll every 1m──▶ new alerts ──▶ automation "alert-triage" ──▶ session ──▶ automation_notify ──▶ phone
+                                          └─▶ automation "alert-digest" (6pm: everything since yesterday)
+```
+
+Create channels from chat with `/channel <what you want>` (below), or define them under `channels` in the plugin options; see the Datadog example in `examples/opencode.jsonc`. Then point automations at them.
+
+### Creating channels from chat
+
+`/channel alert me about Datadog monitors for my-team` (or plain language) starts a guided loop:
+
+1. `channel_list`: the agent reuses a channel that already polls what's needed.
+2. It finds the endpoint (API docs, an example you paste, or a connected tool) and drafts a definition.
+3. `channel_test` dry-runs it: the real request, nothing saved or marked seen. It reports the item count before and after the filter, the fields of the first item, and the first events as an automation would get them. The agent adjusts `items`, `filter` and `event` until those look right.
+4. `channel_create` saves it in `channels.json`, next to the config channels.
+5. With your agreement on what to do with the events, `automation_create` (or `automation_update`) attaches it with `channels: [...]`.
+
+**Keys stay out of chat.** A channel created from chat must reference secrets as `{env:NAME}`. Headers, query parameters and body fields that look like credentials (`Authorization`, `api_key`, `token`, …) with a written-out value are refused. `channel_test` and `channel_list` say which variables aren't set; set them where the opencode server runs and restart it. Channels can't be tested, created or changed from inside an automation run: a run reads event text from outside, and mustn't be steerable into sending the server's variables somewhere. `channel_test` also replaces a key's value with its `{env:NAME}` reference in what it shows.
+
+`channel_update` changes a created channel (changing `event.id` makes current items look new, so they're delivered again). `channel_delete` removes one; if automations use it, pass `detach: true` to remove it from them, which pauses any event-only automation left with no channel. Config channels are edited in config.
+
+**Channel fields**
+
+| field | |
+|---|---|
+| `id`, `name` | |
+| `every` | poll interval, at least `1m`. Polls happen on the leader's tick, so within `tickSeconds` of it. |
+| `request` | `url`, optional `method`, `headers` and JSON `body`. `{env:NAME}` reads an environment variable, so keys stay out of config. |
+| `items` | dot path to the array of items in the response (`data`, `result.items`). Empty: the response is the array. |
+| `filter` | keep items whose field equals a value or one of several: `{ "overall_state": ["Alert", "Warn"] }` |
+| `event` | templates over each item with `{dot.path}`: `id` (required: what counts as a new event), `sessionKey` (which events share a session for automations with `session: "sticky"`, e.g. `{id}` for one per monitor), `title`, `body`, `url` |
+
+**Automations on channels** take `on: { "channels": ["<id>", …] }` (or `on: { "channel": "<id>" }` for one), from config, or `channels` in `automation_create` and `automation_update`. Events from all of an automation's channels go into one queue and are delivered together, each tagged with its channel:
+
+- **No schedule:** runs as events arrive, at most `maxEvents` (default 10) per run.
+- **With a schedule** (`cron`/`every`/`at`): a digest. Events wait, and each run gets everything that arrived since the last one (up to `maxEvents`, default 50). A scheduled digest with nothing waiting doesn't run.
+- **`session`** picks where runs go:
+  - `new` (default): a fresh session per run.
+  - `sticky`: one session for all runs, accumulating context. If the channel sets `event.sessionKey`, one session per key instead: with `"sessionKey": "{id}"`, each monitor gets its own session, so a flapping alert stays in one conversation. Keys are per channel: monitor `123` and Sentry issue `123` get different sessions.
+  - `current`: the chat that created the automation (chat-created only).
+
+**How events flow.** An automation's first poll of each of its channels gets every item currently there (what's alerting right now), including an automation added later to a channel that's been running. After that, each poll's items are compared with the event IDs already seen (kept in `channels.json`, so restarts don't repeat them), and new events join the queue of every active automation on that channel, so a triage and a digest can share one source. An automation's events wait while its session is busy, then go in as one prompt, queued behind any turn in progress. Put what makes an event new into `id`: `{id}:{overall_state_modified}` delivers a monitor again when it fires again after recovering. A channel no active automation uses isn't polled.
+
+**Untrusted input.** Event text goes inside `<event>` tags, and the prompt tells the agent it is data, not instructions. Still, anyone who can write into the polled system (an alert message, an issue title) writes into the prompt: run these automations with an agent whose permissions fit unattended work on untrusted input.
+
+**Status.** `channel_list` shows each channel's last poll, errors, and the automations on it with their waiting events. `channel_poll` polls now. Pause an automation as usual; its events wait while it is paused (up to 500) and go in when it resumes. An automation disabled in config (`enabled: false`) gets none. A response where the `items` path is missing or null counts as no items. After 3 failed polls in a row (expired key, API down) you get one notification.
+
 ## Reference
 
-**Model** — `"provider/model[:variant]"`, per job or via `defaultModel`. Applied at session creation: every run for `new`, first run only for `reuse`; `current` retains the chat's model.
+**Model** — `"provider/model[:variant]"`, per job or via `defaultModel`. Applied at session creation: every run for `new`, first run only for `sticky`; `current` retains the chat's model.
 
 **Output** — in the run's session (`⏰ name · time` in your session list), the last text block in `history.jsonl` (`automation_history`, the TUI, with the number of notifications sent), and a toast/notification from the TUI. Phone/desktop notifications carry what the agent sent with `automation_notify`.
 
@@ -131,7 +185,7 @@ A failing channel is logged and never affects the run. The TUI's own OS notifica
 
 **Session modes** —
 * `new`: fresh per run
-* `reuse`: one session across runs
+* `sticky`: one session across runs (formerly `reuse`, still accepted)
 * `current`: queued into the chat that created it
 
 **Reliability** — missed runs fire on restart
