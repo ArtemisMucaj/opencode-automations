@@ -21,6 +21,7 @@ async function start(options: Record<string, unknown> = {}, jobs: Job[] = []) {
   const prompts: any[] = []
   const sessions: any[] = []
   const events = new EventEmitter()
+  const hooks = new Map<string, (input: any) => void>()
   const ctx = {
     options: { dataDir, ...options },
     location: { directory: dataDir },
@@ -34,6 +35,7 @@ async function start(options: Record<string, unknown> = {}, jobs: Job[] = []) {
       },
       prompt: async (input: any) => { prompts.push(input) },
       interrupt: async () => {},
+      hook: async (name: string, fn: any) => { hooks.set(name, fn); return { dispose: async () => {} } },
     },
     event: {
       async *subscribe({ signal }: { signal: AbortSignal }) {
@@ -47,8 +49,14 @@ async function start(options: Record<string, unknown> = {}, jobs: Job[] = []) {
   const stop = await plugin.setup(ctx as any)
   if (typeof stop === "function") cleanups.push(async () => { await stop() })
   await flush()
-  const call = (name: string, input = {}) => tools.get(name).execute(input, { sessionID: "caller" })
-  return { store, tools, commands, prompts, sessions, events, call, dataDir }
+  const call = (name: string, input = {}, sessionID = "caller") => tools.get(name).execute(input, { sessionID })
+  /** What the model would see for a session: system prompt additions and tool names. */
+  const context = (sessionID: string) => {
+    const c = { sessionID, system: [] as any[], tools: Object.fromEntries([...tools.keys()].map((k) => [k, {}])) }
+    hooks.get("context")!(c)
+    return { system: c.system.map((p) => p.text).join("\n"), tools: Object.keys(c.tools) }
+  }
+  return { store, tools, commands, prompts, sessions, events, call, context, dataDir }
 }
 
 function job(overrides: Partial<Job> = {}): Job {
@@ -61,7 +69,7 @@ function job(overrides: Partial<Job> = {}): Job {
 
 test("server loads with current command API and exposes working CRUD tools", async () => {
   const app = await start()
-  expect(app.tools.size).toBe(6)
+  expect(app.tools.size).toBe(7)
   const created = await app.call("automation_create", { name: "Audit", prompt: "Check dependencies", every: "1h" })
   expect(created.content).toContain("Audit")
   expect(app.store.loadJobs()[0].directory).toBe(app.dataDir)
@@ -112,7 +120,7 @@ test("one-shot completion survives reload and run output reaches history", async
 test("V2 execution success completes the run without waiting for legacy idle", async () => {
   const fetch = spyOn(globalThis, "fetch").mockResolvedValue(new Response("ok"))
   try {
-    const app = await start({ notify: { pushover: { token: "test-token", user: "test-user" } } }, [job({ timeoutMinutes: 0.001 })])
+    const app = await start({ notify: { on: ["succeeded"], pushover: { token: "test-token", user: "test-user" } } }, [job({ timeoutMinutes: 0.001 })])
     await app.call("automation_run", { id: "morning" })
     app.events.emit("event", { type: "session.text.ended", data: { sessionID: "session-1", text: "Ok" } })
     app.events.emit("event", {
@@ -128,7 +136,7 @@ test("V2 execution success completes the run without waiting for legacy idle", a
     await new Promise((resolve) => setTimeout(resolve, 80))
     expect(app.store.history()[0].status).toBe("succeeded")
     expect(fetch.mock.calls).toHaveLength(1)
-    expect(JSON.parse(fetch.mock.calls[0][1]?.body as string)).toMatchObject({ message: "Ok", priority: 0 })
+    expect(JSON.parse(fetch.mock.calls[0][1]?.body as string)).toMatchObject({ title: "Morning", priority: 0 })
   } finally { fetch.mockRestore() }
 })
 
@@ -157,17 +165,86 @@ test("editing a completed one-shot schedule reactivates it", async () => {
   expect(app.store.loadJobs()[0].nextRunAt).toBeGreaterThan(Date.now())
 })
 
-test("finished runs send configured Pushover notifications", async () => {
+const pushover = { pushover: { token: "test-token", user: "test-user" } }
+const bodies = (fetch: any) => fetch.mock.calls.map((c: any) => JSON.parse(c[1]?.body as string))
+
+test("the run's agent sends notifications itself; a successful run then sends nothing else", async () => {
   const fetch = spyOn(globalThis, "fetch").mockResolvedValue(new Response("ok"))
   try {
-    const app = await start({ notify: { pushover: { token: "test-token", user: "test-user" } } }, [job()])
+    const app = await start({ notify: { on: ["succeeded", "failed"], ...pushover } }, [job()])
+    await app.call("automation_run", { id: "morning" })
+    const sent = await app.call("automation_notify", {
+      title: "2 MRs need you", message: "- **!12** blocked\n- !15 approved", priority: "high", url: "https://mr.test", url_title: "Open",
+    }, "session-1")
+    expect(sent.content).toContain("Sent via pushover")
+    expect(bodies(fetch)).toEqual([{
+      token: "test-token", user: "test-user", title: "2 MRs need you", message: "• <b>!12</b> blocked\n• !15 approved",
+      html: 1, priority: 1, url: "https://mr.test", url_title: "Open",
+    }])
+    app.events.emit("event", { type: "session.text.ended", data: { sessionID: "session-1", text: "Done, notified." } })
+    app.events.emit("event", { type: "session.idle", data: { sessionID: "session-1" } })
+    await new Promise((resolve) => setTimeout(resolve, 80))
+    expect(fetch.mock.calls).toHaveLength(1) // the final reply is not sent
+    expect(app.store.history()[0]).toMatchObject({ status: "succeeded", output: "Done, notified.", notifications: 1 })
+    expect((await app.call("automation_history")).content).toContain("1 notified")
+  } finally { fetch.mockRestore() }
+})
+
+test("failed runs notify automatically even after the agent notified", async () => {
+  const fetch = spyOn(globalThis, "fetch").mockResolvedValue(new Response("ok"))
+  try {
+    const app = await start({ notify: pushover }, [job()])
+    await app.call("automation_run", { id: "morning" })
+    await app.call("automation_notify", { title: "Started", message: "Looking" }, "session-1")
+    app.events.emit("event", { type: "session.execution.failed", data: { sessionID: "session-1", error: "model overloaded" } })
+    for (let i = 0; i < 50 && fetch.mock.calls.length < 2; i++) await flush()
+    expect(bodies(fetch)[1]).toMatchObject({ title: "Morning failed", message: '"model overloaded"', priority: 1 })
+  } finally { fetch.mockRestore() }
+})
+
+test("a successful run without notifications is silent by default", async () => {
+  const fetch = spyOn(globalThis, "fetch").mockResolvedValue(new Response("ok"))
+  try {
+    const app = await start({ notify: pushover }, [job()])
     await app.call("automation_run", { id: "morning" })
     app.events.emit("event", { type: "session.text.ended", data: { sessionID: "session-1", text: "All clear" } })
     app.events.emit("event", { type: "session.idle", data: { sessionID: "session-1" } })
-    for (let i = 0; i < 50 && !fetch.mock.calls.length; i++) await flush()
-    expect(fetch.mock.calls).toHaveLength(1)
-    const [url, input] = fetch.mock.calls[0]
-    expect(url).toBe("https://api.pushover.net/1/messages.json")
-    expect(JSON.parse(input?.body as string)).toMatchObject({ token: "test-token", user: "test-user", message: "All clear", priority: 0 })
+    await new Promise((resolve) => setTimeout(resolve, 80))
+    expect(fetch.mock.calls).toHaveLength(0)
   } finally { fetch.mockRestore() }
+})
+
+test("automation_notify is limited per run and rejects text too long to split", async () => {
+  const fetch = spyOn(globalThis, "fetch").mockResolvedValue(new Response("ok"))
+  try {
+    const app = await start({ notify: { maxPerRun: 2, ...pushover } }, [job()])
+    await app.call("automation_run", { id: "morning" })
+    const long = await app.call("automation_notify", { title: "Dump", message: "word ".repeat(1200) }, "session-1")
+    expect(long.content).toContain("error: message is")
+    expect(fetch.mock.calls).toHaveLength(0)
+    expect((await app.call("automation_notify", { title: "A", message: "one" }, "session-1")).content).toContain("1 notifications left")
+    expect((await app.call("automation_notify", { title: "B", message: "two" }, "session-1")).content).toContain("0 notifications left")
+    expect((await app.call("automation_notify", { title: "C", message: "three" }, "session-1")).content).toContain("limit 2")
+    expect(fetch.mock.calls).toHaveLength(2)
+  } finally { fetch.mockRestore() }
+})
+
+test("automation_notify is offered, with guidance, only to runs that may notify", async () => {
+  const app = await start({ notify: { native: true } }, [job(), job({ id: "quiet", name: "Quiet", notify: false })])
+  await app.call("automation_run", { id: "morning" })
+  await app.call("automation_run", { id: "quiet" })
+
+  const run = app.context("session-1")
+  expect(run.tools).toContain("automation_notify")
+  expect(run.system).toContain('automation "Morning"')
+  expect(run.system).toContain("not sent anywhere")
+
+  for (const sid of ["session-2", "caller"]) {
+    const c = app.context(sid)
+    expect(c.tools).not.toContain("automation_notify")
+    expect(c.tools).toContain("automation_list")
+    expect(c.system).toBe("")
+  }
+  expect((await app.call("automation_notify", { title: "x", message: "y" })).content).toContain("only available inside an automation run")
+  expect((await app.call("automation_notify", { title: "x", message: "y" }, "session-2")).content).toContain("error")
 })

@@ -102,7 +102,7 @@ The session sidebar lists upcoming jobs and marks sessions created by an automat
 
 ## Create automations 
 
-`/automation <request>` or plain language. Tools: `automation_create`, `automation_list`, `automation_update`, `automation_delete`, `automation_run`, `automation_history`.
+`/automation <request>` or plain language. Tools: `automation_create`, `automation_list`, `automation_update`, `automation_delete`, `automation_run`, `automation_history`, plus `automation_notify`, which only automation runs see (below).
 
 ## Notifications
 
@@ -120,13 +120,36 @@ Configured on the **server** plugin (`notify` in `opencode.jsonc`), so they fire
 
 No TUI needs to be open, but native notifications appear on the **server machine**, not a remote client's desktop. Missing utilities, unavailable desktop sessions, or unsupported OSes are logged as `native` delivery failures without failing the automation; Pushover can still deliver. The old `macos` option is no longer supported—replace it with `native`.
 
-Failures get elevated priority in Pushover. `on` picks outcomes (default: succeeded, failed, timeout). Per job, `notify: false` silences it and `notify: ["failed"]` limits it. A failing channel is logged and never affects the run. The TUI's own OS notification is now off by default (`notify` in `cli.json` to turn it back on) to avoid duplicates.
+### What gets sent
+
+The run's agent decides. Each run that may notify gets an `automation_notify` tool and a short system note saying nobody is watching the session, so it should notify when it has something worth the user's attention and stay quiet otherwise. The run's final reply stays in the session; it is not sent.
+
+`automation_notify` takes a `title` (the outcome, e.g. "3 MRs need your review"), a plain-text `message`, an optional `priority` (`low`, `normal`, `high`) and an optional `url` + `url_title` (a button in Pushover). Other sessions don't see the tool.
+
+Formatting is plain text built for a lock screen. Models tend to write markdown anyway, so it is cleaned up per channel:
+
+| written | Pushover (HTML mode) | desktop |
+|---|---|---|
+| `**bold**`, `# heading` | bold | plain text |
+| `- item` | `• item` | `• item` |
+| `[text](url)` | link | `text (url)` |
+| `` `code` ``, code fences, table rules | removed, text kept | removed, text kept |
+| `\| a \| b \|` | `a · b` | `a · b` |
+
+Limits:
+
+- **Size.** Pushover accepts 1024 characters per message and 250 per title. A longer message is split into numbered parts (`Title (1/3)`), at paragraph breaks first, then lines, then words, and sent in order, with the link button on the last part. The tool refuses a message that would need more than 4 parts and asks the agent to shorten it.
+- **Count.** At most `maxPerRun` notifications per run (default 5). The tool asks the agent to group related items into one notification and send several only for separate findings.
+
+Automatic notices: the plugin itself notifies only when a run fails or times out (high priority), since the agent can't. `on` picks which outcomes get one (default: `failed`, `timeout`). Adding `succeeded` sends a short "Finished in 2m." only when the agent sent nothing. Per job, `notify: false` turns off all notifications (including the tool) and `notify: ["timeout"]` picks that job's automatic notices.
+
+A failing channel is logged and never affects the run. The TUI's own OS notification is now off by default (`notify` in `cli.json` to turn it back on) to avoid duplicates.
 
 ## Reference
 
 **Model** — `"provider/model[:variant]"`, per job or via `defaultModel`. Applied at session creation: every run for `new`, first run only for `reuse`; `current` retains the chat's model.
 
-**Output** — in the run's session (`⏰ name · time` in your session list), the last text block in `history.jsonl` (`automation_history`, the TUI), and a toast/notification from the TUI.
+**Output** — in the run's session (`⏰ name · time` in your session list), the last text block in `history.jsonl` (`automation_history`, the TUI, with the number of notifications sent), and a toast/notification from the TUI. Phone/desktop notifications carry what the agent sent with `automation_notify`.
 
 **Working directory** — the session's `location`, the calling session's directory for chat-created jobs, the TUI's directory for TUI-created jobs, `directory` for config jobs.
 

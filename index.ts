@@ -10,7 +10,10 @@ import { randomUUID } from "node:crypto"
 import { describe, nextRun, parseCron, parseInterval, type Schedule } from "./cron.ts"
 import { Store, type Job, type Run, type SessionMode } from "./store.ts"
 import { defaultDataDir, isActive } from "./jobs.ts"
-import { compose, send, shouldNotify, type JobNotify, type NotifyConfig } from "./notify.ts"
+import {
+  canNotify, compose, DEFAULT_MAX_PER_RUN, MAX_PARTS, PUSHOVER, send, shouldNotify, split,
+  type JobNotify, type NotifyConfig, type Priority,
+} from "./notify.ts"
 
 interface Options {
   dataDir?: string
@@ -47,6 +50,8 @@ interface InFlight {
   job: Job
   run: Run
   lastText?: string
+  /** automation_notify calls that delivered somewhere. */
+  sent: number
   timer?: ReturnType<typeof setTimeout>
 }
 
@@ -79,6 +84,16 @@ const slug = (s: string) =>
   s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 32) || "job"
 const fmt = (t?: number) => (t ? new Date(t).toLocaleString() : "—")
 const text = (content: string) => ({ content })
+
+const NOTIFY_TOOL = "automation_notify"
+
+/** Added to the system prompt of automation runs that may notify. */
+const runGuide = (job: Job, max: number) =>
+  `You are running unattended as the automation "${job.name}". Nobody is watching this session: ` +
+  `your final reply stays here and is not sent anywhere. To reach the user, call ${NOTIFY_TOOL} ` +
+  `with what they need to know or act on, once you know it. If nothing is worth their attention, don't notify. ` +
+  `At most ${max} notifications per run; group related items into one. ` +
+  `Failures and timeouts are reported to the user automatically.`
 
 export default Plugin.define({
   id: "automations",
@@ -174,15 +189,18 @@ export default Plugin.define({
       if (!f) return
       inflight.delete(sessionID)
       clearTimeout(f.timer)
-      const run: Run = { ...f.run, status, endedAt: Date.now(), output: f.lastText?.slice(0, 4000), error }
+      const run: Run = {
+        ...f.run, status, endedAt: Date.now(), output: f.lastText?.slice(0, 4000), error,
+        ...(f.sent ? { notifications: f.sent } : {}),
+      }
       store.appendRun(run)
       mutate((jobs) => { const j = find(jobs, run.jobID); if (j) j.lastStatus = status })
-      // History keeps a capped copy; the notification gets the full text.
-      notify(f.job, { ...run, output: f.lastText })
+      notify(f.job, run, f.sent)
     }
 
-    function notify(job: Job, run: Run) {
-      if (shouldNotify(opts.notify, job, run.status)) {
+    /** The automatic end-of-run notice; what the agent wanted to say went out via automation_notify. */
+    function notify(job: Job, run: Run, sent = 0) {
+      if (shouldNotify(opts.notify, job, run.status, sent)) {
         void send(opts.notify!, compose(job, run)).catch((error) => console.error("[automations] notify:", error))
       }
     }
@@ -200,7 +218,7 @@ export default Plugin.define({
       try {
         const sessionID = await resolveSession(job)
         const run: Run = { ...base, sessionID }
-        const entry: InFlight = { job, run }
+        const entry: InFlight = { job, run, sent: 0 }
         inflight.set(sessionID, entry)
         store.appendRun(run)
         entry.timer = setTimeout(() => {
@@ -303,7 +321,74 @@ export default Plugin.define({
       tz: { type: "string", description: "IANA time zone for cron, e.g. Europe/Paris." },
     } as const
 
+    const maxPerRun = opts.notify?.maxPerRun ?? DEFAULT_MAX_PER_RUN
+    /** The run a session is executing, if it may notify. */
+    const notifiable = (sessionID: string) => {
+      const f = inflight.get(sessionID)
+      return f && canNotify(opts.notify, f.job) ? f : undefined
+    }
+
+    // Offer automation_notify only to runs that may notify, and tell them how to use it.
+    await ctx.session.hook?.("context", (c) => {
+      const f = notifiable(c.sessionID)
+      if (!f) { delete c.tools[NOTIFY_TOOL]; return }
+      c.system.push({ type: "text", text: runGuide(f.job, maxPerRun) })
+    })
+
     await ctx.tool.transform((tools) => {
+      tools.add({
+        name: NOTIFY_TOOL,
+        description:
+          "Send a notification to the user's phone and desktop from this automation run. " +
+          "It is read on a lock screen, so write for a glance: a title that states the outcome " +
+          '(e.g. "3 MRs need your review", not "Report"), then the details that support it. ' +
+          "Plain text: short lines, '- ' bullets, **bold** for the one thing that matters, [text](url) links. " +
+          "No tables, code blocks or headings. " +
+          `Keep the message under ${PUSHOVER.message} characters (Pushover's limit); longer text arrives as ` +
+          `numbered parts, at most ${MAX_PARTS}. One notification per topic: send several only for ` +
+          "separate findings that each deserve attention, not one per item.",
+        input: {
+          type: "object",
+          properties: {
+            title: { type: "string", description: "Headline stating the outcome. Under 60 characters reads best." },
+            message: { type: "string", description: `Body, plain text, ideally under ${PUSHOVER.message} characters.` },
+            priority: {
+              type: "string", enum: ["low", "normal", "high"],
+              description: "high = needs action soon (alerts on the phone); low = FYI, no sound. Default normal.",
+            },
+            url: { type: "string", description: "One link to open, shown as a button (e.g. the MR or dashboard)." },
+            url_title: { type: "string", description: "Button label for url." },
+          },
+          required: ["title", "message"],
+          additionalProperties: false,
+        },
+        execute: async (input: any, tc) => {
+          const f = notifiable(tc.sessionID)
+          if (!f) return text("error: notifications are only available inside an automation run that has them enabled.")
+          if (f.sent >= maxPerRun) return text(`error: this run already sent ${f.sent} notifications (limit ${maxPerRun}). Don't send more.`)
+          const title = String(input.title ?? "").trim()
+          const message = String(input.message ?? "").trim()
+          if (!title || !message) return text("error: title and message are required.")
+          if (opts.notify!.pushover) {
+            const parts = split(message, PUSHOVER.message, "html").length
+            if (parts > MAX_PARTS) {
+              return text(
+                `error: message is ${message.length} characters, ${parts} Pushover messages; the limit is ${MAX_PARTS}. ` +
+                `Shorten it to the essentials (under ${PUSHOVER.message} characters), or send separate topics as separate notifications.`,
+              )
+            }
+          }
+          const priority: Priority = ["low", "normal", "high"].includes(input.priority) ? input.priority : "normal"
+          const result = await send(opts.notify!, { title, body: message, priority, url: input.url, urlTitle: input.url_title })
+          if (!result.sent.length) return text(`error: delivery failed (${result.failed.join(", ")}). It was logged; don't retry.`)
+          f.sent++
+          return text(
+            `Sent via ${result.sent.join(", ")}${result.failed.length ? `; failed: ${result.failed.join(", ")}` : ""}. ` +
+            `${maxPerRun - f.sent} notifications left for this run.`,
+          )
+        },
+      })
+
       tools.add({
         name: "automation_create",
         description:
@@ -474,7 +559,8 @@ export default Plugin.define({
               .map((r) => {
                 const dur = r.endedAt ? ` ${Math.round((r.endedAt - r.startedAt) / 1000)}s` : ""
                 const tail = r.error ? `\n  error: ${r.error}` : r.output ? `\n  ${r.output.slice(0, 300).replace(/\n/g, "\n  ")}` : ""
-                return `- ${fmt(r.startedAt)} ${r.jobID} ${r.status}${dur}${r.sessionID ? ` (${r.sessionID})` : ""}${tail}`
+                const sent = r.notifications ? ` · ${r.notifications} notified` : ""
+                return `- ${fmt(r.startedAt)} ${r.jobID} ${r.status}${dur}${sent}${r.sessionID ? ` (${r.sessionID})` : ""}${tail}`
               })
               .join("\n"),
           )
