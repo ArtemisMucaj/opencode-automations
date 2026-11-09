@@ -41,9 +41,13 @@ test("TUI timing parser accepts cron, intervals, dates and rejects bad timezones
   expect(parseScheduleText("2099-11-02T09:00:00Z")).toEqual({ kind: "at", time: Date.parse("2099-11-02T09:00:00Z") })
   expect(() => parseScheduleText("@daily Not/AZone")).toThrow()
   expect(() => parseScheduleText("2000-01-01T00:00:00Z")).toThrow()
-  expect(isActive({ enabled: true, paused: true } as any)).toBe(false)
-  expect(isActive({ enabled: true, done: true } as any)).toBe(false)
-  expect(isActive({ enabled: true } as any)).toBe(true)
+  const every = { kind: "every", ms: 60_000 }
+  expect(isActive({ enabled: true, paused: true, schedule: every } as any)).toBe(false)
+  expect(isActive({ enabled: true, done: true, schedule: every } as any)).toBe(false)
+  expect(isActive({ enabled: true, schedule: every } as any)).toBe(true)
+  // Runs only on events but has no channel: it can never run, so it isn't active.
+  expect(isActive({ enabled: true, schedule: { kind: "event" } } as any)).toBe(false)
+  expect(isActive({ enabled: true, schedule: { kind: "event" }, on: { channels: ["dd"] } } as any)).toBe(true)
   expect(uniqueID([{ id: "morning" }] as any, "Morning")).toBe("morning-2")
   expect(relative(120_000, 0)).toBe("in 2m")
 })
@@ -86,4 +90,23 @@ test("lease elects one store instance and releases ownership", async () => {
     a.release()
     b.release()
   }
+})
+
+test("channel state waits for a lock held by another process instead of failing", async () => {
+  const { Store } = await import("../store.ts")
+  const dir = temp()
+  const store = new Store(dir)
+  const holder = Bun.spawn(["bun", "-e", `
+    const lockfile = require("proper-lockfile")
+    const release = lockfile.lockSync(${JSON.stringify(join(dir, "channels.json"))}, { realpath: false })
+    console.log("locked")
+    setTimeout(() => { release(); process.exit(0) }, 300)
+  `], { cwd: join(import.meta.dir, ".."), stdout: "pipe" })
+  const reader = holder.stdout.getReader()
+  await reader.read() // "locked"
+  const started = Date.now()
+  store.mutateChannels((s) => { s.sources.x = { seen: ["a"] } })
+  expect(Date.now() - started).toBeGreaterThanOrEqual(100)
+  expect(store.loadChannels().sources.x.seen).toEqual(["a"])
+  await holder.exited
 })

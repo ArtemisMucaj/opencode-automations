@@ -4,6 +4,8 @@ export type Schedule =
   | { kind: "cron"; expr: string; tz?: string }
   | { kind: "every"; ms: number }
   | { kind: "at"; time: number }
+  /** No schedule: runs when its channel has events. */
+  | { kind: "event" }
 
 export function parseInterval(value: string): number {
   const match = /^(\d+(?:\.\d+)?)(m|h|d|w)$/.exec(value.trim())
@@ -22,6 +24,7 @@ export function parseCron(expr: string, tz?: string) {
 export function nextRun(schedule: Schedule, now: number, anchor = now): number | undefined {
   switch (schedule.kind) {
     case "at": return schedule.time > now ? schedule.time : undefined
+    case "event": return undefined
     case "every": {
       if (!Number.isSafeInteger(schedule.ms) || schedule.ms < 60_000) throw new Error("invalid interval")
       return anchor + Math.max(1, Math.floor((now - anchor) / schedule.ms) + 1) * schedule.ms
@@ -36,6 +39,7 @@ export function nextRun(schedule: Schedule, now: number, anchor = now): number |
 export function describe(schedule: Schedule): string {
   if (schedule.kind === "cron") return `cron "${schedule.expr}"${schedule.tz ? ` (${schedule.tz})` : ""}`
   if (schedule.kind === "at") return `at ${new Date(schedule.time).toISOString()}`
+  if (schedule.kind === "event") return "on events"
   const units = [[604_800_000, "w"], [86_400_000, "d"], [3_600_000, "h"], [60_000, "m"]] as const
   const [size, unit] = units.find(([ms]) => schedule.ms % ms === 0) ?? units[3]
   return `every ${schedule.ms / size}${unit}`

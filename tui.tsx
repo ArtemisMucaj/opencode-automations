@@ -5,16 +5,18 @@
 // so there is still exactly one firer and one run history.
 //
 //  - /automations (or the palette) opens a large dialog over the current screen: job list, full config, recent runs, actions.
+//    `c` switches to the channels tab: each channel's poll status, mapping, and the automations it feeds.
 //  - The session sidebar shows upcoming jobs, and flags sessions created by an automation run.
 //  - Finished runs raise a toast, plus an OS notification when the terminal isn't focused.
 
 import type { Renderable, RGBA } from "@opentui/core"
 import { Plugin } from "@opencode/plugin/tui"
 import { watch, type FSWatcher } from "node:fs"
-import { createMemo, createSignal, For, Show, type JSX } from "solid-js"
+import { createMemo, createSignal, For, Index, Show, type JSX } from "solid-js"
 import { describe, nextRun } from "./cron.ts"
-import { defaultDataDir, isActive, mutateRaw, parseScheduleText, relative, uniqueID } from "./jobs.ts"
+import { defaultDataDir, isActive, listens, mutateRaw, parseScheduleText, relative, runnable, uniqueID } from "./jobs.ts"
 import { Store, type Job, type Run, type RunStatus, type SessionMode } from "./store.ts"
+import { emptyChannels, removeChannel, requestPoll, summarize, type ChannelEvent, type ChannelsState, type ChannelSummary } from "./channels.ts"
 
 type Context = Plugin.Context
 
@@ -47,6 +49,7 @@ function look(ctx: Context, surface?: "dialog") {
 }
 
 const keyHints: [string, string][] = [
+  ["c", "channels"],
   ["↑↓", "select"],
   ["space", "pause"],
   ["r", "run now"],
@@ -58,6 +61,30 @@ const keyHints: [string, string][] = [
   ["⏎", "open session"],
   ["esc", "close"],
 ]
+const channelHints: [string, string][] = [
+  ["c", "automations"],
+  ["↑↓", "select"],
+  ["p", "poll now"],
+  ["d", "delete"],
+  ["esc", "close"],
+]
+
+export interface ChannelRow extends ChannelSummary {
+  id: string
+  source: "config" | "created"
+}
+
+/** Config channels (as the server published them) and channels created from chat, by ID. */
+export function channelRows(s: ChannelsState): ChannelRow[] {
+  const rows: ChannelRow[] = Object.entries(s.config).map(([id, sum]) => ({ id, source: "config", ...sum }))
+  for (const [id, def] of Object.entries(s.defs)) {
+    if (!s.config[id]) rows.push({ id, source: "created", ...summarize({ ...def, id }) })
+  }
+  return rows.sort((a, b) => a.id.localeCompare(b.id))
+}
+
+/** The TUI waits only briefly for the channels lock (the server may hold it), so the screen never freezes for long. */
+const LOCK_WAIT_MS = 200
 const stateOf = (j: Job) => (j.done ? "done" : j.paused ? "paused" : !j.enabled ? "disabled" : "active")
 const firstLine = (s?: string) => (s ?? "").split("\n").find((l) => l.trim()) ?? ""
 const duration = (r: Run) => (r.endedAt ? `${Math.max(1, Math.round((r.endedAt - r.startedAt) / 1000))}s` : "")
@@ -69,14 +96,19 @@ export function createState(ctx: Context, dataDir: string) {
   const [jobs, setJobs] = createSignal<Job[]>(store.loadJobs())
   const [runs, setRuns] = createSignal<Run[]>(store.history(undefined, 300))
   const [now, setNow] = createSignal(Date.now())
-  // Kept here, not in the view: the dialog is re-created after nested prompts and must reopen on the same job.
+  const loadChannels = () => { try { return store.loadChannels() } catch { return emptyChannels() } }
+  const [channels, setChannels] = createSignal<ChannelsState>(loadChannels())
+  // Kept here, not in the view: the dialog is re-created after nested prompts and must reopen on the same job and tab.
   const [selectedID, setSelectedID] = createSignal<string>()
+  const [selectedChannel, setSelectedChannel] = createSignal<string>()
+  const [tab, setTab] = createSignal<"jobs" | "channels">("jobs")
 
   const notifyMode = (ctx.options.notify ?? "blurred") as "always" | "blurred" | "off"
   const seen = new Set(runs().filter((r) => r.status !== "running").map((r) => r.runID))
 
   function refresh() {
     setJobs(store.loadJobs())
+    setChannels(loadChannels())
     const next = store.history(undefined, 300)
     setRuns(next)
     setNow(Date.now())
@@ -106,7 +138,17 @@ export function createState(ctx: Context, dataDir: string) {
     }
   }
 
-  return { store, jobs, runs, now, refresh, act, selectedID, setSelectedID }
+  /** Write channel state (a poll intent, a delete) and re-read. Returns an error message instead of throwing. */
+  function actChannels(fn: (s: ChannelsState) => void): string | undefined {
+    try {
+      store.mutateChannels(fn, LOCK_WAIT_MS)
+      refresh()
+    } catch (e) {
+      return (e as Error).message
+    }
+  }
+
+  return { store, jobs, runs, now, refresh, act, selectedID, setSelectedID, channels, actChannels, selectedChannel, setSelectedChannel, tab, setTab }
 }
 
 type State = ReturnType<typeof createState>
@@ -122,6 +164,27 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
   const index = createMemo(() => Math.max(0, sorted().findIndex((j) => j.id === selectedID())))
   const selected = createMemo(() => sorted()[index()])
   const jobRuns = createMemo(() => state.runs().filter((r) => r.jobID === selected()?.id).slice(0, 8))
+
+  // ---- channels tab ----
+  const onChannels = () => state.tab() === "channels"
+  const chRows = createMemo(() => channelRows(state.channels()))
+  const chIndex = createMemo(() => Math.max(0, chRows().findIndex((c) => c.id === state.selectedChannel())))
+  const chSelected = createMemo(() => chRows()[chIndex()])
+  /** Per channel, computed once per refresh: the automations on it, and "failing", "polling" (an active one uses it) or "idle". */
+  const chInfo = createMemo(() => {
+    const info = new Map<string, { users: Job[]; status: "failing" | "polling" | "idle" }>()
+    for (const c of chRows()) {
+      const users = state.jobs().filter((j) => listens(j, c.id))
+      info.set(c.id, { users, status: state.channels().sources[c.id]?.failures ? "failing" : users.some(isActive) ? "polling" : "idle" })
+    }
+    return info
+  })
+  const listeners = (id: string) => chInfo().get(id)?.users ?? []
+  const chStatus = (c: ChannelRow) => chInfo().get(c.id)?.status ?? "idle"
+  const moveChannel = (d: number) => {
+    const next = chRows()[Math.max(0, Math.min(chRows().length - 1, chIndex() + d))]
+    if (next) state.setSelectedChannel(next.id)
+  }
   const running = createMemo(() => new Set(state.runs().filter((r) => r.status === "running").map((r) => r.jobID)))
 
   const toastErr = (msg?: string) => {
@@ -160,9 +223,42 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
       }),
     )
 
+  const channelActions = {
+    poll: () => {
+      const c = chSelected()
+      if (!c) return
+      toastErr(state.actChannels((s) => requestPoll(s, c.id)))
+      ctx.ui.toast.show({ message: `Polling “${c.name}” on the automations plugin's next tick`, variant: "info" })
+    },
+    remove: nested(async () => {
+      const c = chSelected()
+      if (!c) return
+      if (c.source === "config") return toastErr("Config channels are removed in opencode.json(c).")
+      const users = listeners(c.id)
+      if (users.length) {
+        return toastErr(`Used by ${users.map((j) => j.name).join(", ")}. Detach it from chat: channel_delete with detach.`)
+      }
+      const ok = await ctx.ui.dialog.confirm({ title: "Delete channel", message: `Delete the channel “${c.name}”? No automation uses it.` })
+      if (!ok) return
+      // Checked again under the jobs lock: this list may be up to 15 s old, and chat may have attached it since.
+      toastErr(state.act((jobs) => {
+        const now = jobs.filter((j) => listens(j, c.id))
+        if (now.length) throw new Error(`Used by ${now.map((j) => j.name).join(", ")} now. Detach it from chat: channel_delete with detach.`)
+        state.store.mutateChannels((s) => removeChannel(s, c.id), LOCK_WAIT_MS)
+      }))
+    }),
+  }
+  /** Keys that only mean something on one tab. */
+  const jobsOnly = (fn: () => unknown) => () => (onChannels() ? undefined : fn())
+  const channelsOnly = (fn: () => unknown) => () => (onChannels() ? fn() : undefined)
+  const step = (d: number) => (onChannels() ? moveChannel(d) : move(d))
+
   const actions = {
     togglePause: withJob((j) =>
       update(j.id, (x) => {
+        if (x.paused && !runnable(x)) {
+          throw new Error("It has no channels and no schedule, so it would never run. Add channels from chat, or a schedule with s.")
+        }
         x.paused = !x.paused
         // Resuming re-anchors to now, so a long pause doesn't fire a missed run right away.
         if (!x.paused) x.nextRunAt = nextRun(x.schedule, Date.now(), x.createdAt)
@@ -241,7 +337,7 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
         title: "Session",
         options: [
           { title: "New session per run", value: "new", description: "Reports, checks, anything stateless" },
-          { title: "Reuse one session", value: "reuse", description: "Accumulates context between runs" },
+          { title: "Sticky session", value: "sticky", description: "Every run goes to the same session; accumulates context" },
         ],
       })
       if (!session) return
@@ -272,22 +368,30 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
   ctx.keymap.layer(() => ({
     mode: "modal",
     commands: [
-      { title: "up", bind: "up", run: () => move(-1) },
-      { title: "down", bind: "down", run: () => move(1) },
-      { bind: "k", run: () => move(-1) },
-      { bind: "j", run: () => move(1) },
-      { title: "pause/resume", bind: "space", run: actions.togglePause },
-      { title: "run now", bind: "r", run: actions.runNow },
-      { title: "new", bind: "n", run: actions.create },
-      { title: "prompt", bind: "e", run: actions.editPrompt },
-      { title: "schedule", bind: "s", run: actions.editSchedule },
-      { title: "model", bind: "m", run: actions.pickModel },
-      { title: "delete", bind: "d", run: actions.remove },
-      { title: "open session", bind: "return", run: actions.openSession },
+      { title: "up", bind: "up", run: () => step(-1) },
+      { title: "down", bind: "down", run: () => step(1) },
+      { bind: "k", run: () => step(-1) },
+      { bind: "j", run: () => step(1) },
+      { title: "channels/automations", bind: "c", run: () => state.setTab(onChannels() ? "jobs" : "channels") },
+      { title: "pause/resume", bind: "space", run: jobsOnly(actions.togglePause) },
+      { title: "run now", bind: "r", run: jobsOnly(actions.runNow) },
+      { title: "poll now", bind: "p", run: channelsOnly(channelActions.poll) },
+      { title: "new", bind: "n", run: jobsOnly(actions.create) },
+      { title: "prompt", bind: "e", run: jobsOnly(actions.editPrompt) },
+      { title: "schedule", bind: "s", run: jobsOnly(actions.editSchedule) },
+      { title: "model", bind: "m", run: jobsOnly(actions.pickModel) },
+      { title: "delete", bind: "d", run: () => (onChannels() ? channelActions.remove() : actions.remove()) },
+      { title: "open session", bind: "return", run: jobsOnly(actions.openSession) },
     ],
   }))
 
   const L = createMemo(() => look(ctx, "dialog"))
+  const statusLook = (st: "failing" | "polling" | "idle") =>
+    ({
+      failing: { fg: L().bad, bg: t.background.feedback.error.base, dot: "✗" },
+      polling: { fg: L().ok, bg: t.background.feedback.success.base, dot: "●" },
+      idle: { fg: L().muted, bg: L().cap, dot: "○" },
+    })[st]
   const statusColor = (s?: RunStatus) =>
     s === "succeeded" ? L().ok : s === "running" ? L().warn : s === "skipped" || !s ? L().muted : L().bad
   const badge = (j: Job) => {
@@ -353,15 +457,164 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
             paddingTop={1}
           >
             <box flexDirection="row" justifyContent="space-between" paddingBottom={1} flexShrink={0}>
-              <text fg={L().text}>
-                <b>⏰ Automations</b>
-              </text>
-              <text fg={L().muted}>
-                {state.jobs().length} {state.jobs().length === 1 ? "job" : "jobs"} · {activeCount()} active ·{" "}
-                <span style={{ fg: running().size ? L().warn : L().muted }}>{running().size} running</span>
-              </text>
+              <box flexDirection="row" gap={2}>
+                <text fg={L().text}>
+                  <b>⏰ Automations</b>
+                </text>
+                {/* Tabs as separate <text>s so a color change repaints (see the dot below). */}
+                <text fg={onChannels() ? L().muted : L().ink(0)}>{onChannels() ? " jobs " : "[jobs]"}</text>
+                <text fg={onChannels() ? L().ink(0) : L().muted}>{onChannels() ? "[channels]" : " channels "}</text>
+              </box>
+              <Show
+                when={onChannels()}
+                fallback={
+                  <text fg={L().muted}>
+                    {state.jobs().length} {state.jobs().length === 1 ? "job" : "jobs"} · {activeCount()} active ·{" "}
+                    <span style={{ fg: running().size ? L().warn : L().muted }}>{running().size} running</span>
+                  </text>
+                }
+              >
+                <text fg={L().muted}>
+                  {chRows().length} {chRows().length === 1 ? "channel" : "channels"} ·{" "}
+                  {chRows().filter((c) => chStatus(c) !== "idle").length} polled ·{" "}
+                  <span style={{ fg: chRows().some((c) => chStatus(c) === "failing") ? L().bad : L().muted }}>
+                    {chRows().filter((c) => chStatus(c) === "failing").length} failing
+                  </span>
+                </text>
+              </Show>
             </box>
 
+            <Show when={onChannels()}>
+              <Show
+                when={chRows().length}
+                fallback={
+                  <box backgroundColor={L().panel} padding={2} flexDirection="column" gap={1}>
+                    <text fg={L().text}>No channels yet.</text>
+                    <text fg={L().muted}>Ask in chat: “/channel alert me about Datadog monitors that start alerting”.</text>
+                  </box>
+                }
+              >
+                <box flexDirection="row" flexGrow={1} flexShrink={1} flexBasis={0} minHeight={0} gap={2}>
+                  <box flexDirection="column" width={38} backgroundColor={L().panel} paddingTop={1} paddingBottom={1}>
+                    <box paddingLeft={2} paddingBottom={1}>
+                      <text fg={L().muted}>
+                        <b>CHANNELS</b>
+                      </text>
+                    </box>
+                    {/* Index, not For: rows are rebuilt on each refresh, and Index keeps the row components. */}
+                    <Index each={chRows()}>
+                      {(c, i) => {
+                        const isSel = () => i === chIndex()
+                        const status = () => chStatus(c())
+                        const src = () => state.channels().sources[c().id]
+                        const when = () => (status() === "idle" ? "idle" : src()?.lastPollAt ? relative(src()!.lastPollAt, state.now()) : "soon")
+                        const fg = () => (isSel() ? t.text.action.primary.focused : undefined)
+                        return (
+                          <box
+                            flexDirection="row"
+                            justifyContent="space-between"
+                            paddingLeft={2}
+                            paddingRight={2}
+                            backgroundColor={isSel() ? t.background.action.primary.focused : undefined}
+                          >
+                            <box flexDirection="row" gap={1}>
+                              <text fg={statusLook(status()).fg}>{statusLook(status()).dot}</text>
+                              <text fg={fg() ?? L().text}>{c().name.slice(0, 22)}</text>
+                            </box>
+                            <text fg={fg() ?? L().muted}>{when()}</text>
+                          </box>
+                        )
+                      }}
+                    </Index>
+                  </box>
+
+                  <Show when={chSelected()}>
+                    {(c) => {
+                      const src = () => state.channels().sources[c().id]
+                      const users = () => listeners(c().id)
+                      // Each listener's waiting events from this channel, filtered once per refresh.
+                      const waiting = createMemo(() => {
+                        const out = new Map<string, ChannelEvent[]>()
+                        for (const j of users()) out.set(j.id, state.channels().queues[j.id]?.pending.filter((e) => e.channel === c().id) ?? [])
+                        return out
+                      })
+                      const queue = (id: string) => waiting().get(id) ?? []
+                      const status = () => chStatus(c())
+                      return (
+                        <scrollbox flexGrow={1} minHeight={0}>
+                          <box flexDirection="column" gap={1}>
+                            <Block title="Channel" hue={0}>
+                              <text>
+                                <span style={{ fg: L().text }}>
+                                  <b>{c().name}</b>
+                                </span>
+                                {"  "}
+                                <span
+                                  style={{ fg: statusLook(status()).fg, bg: statusLook(status()).bg }}
+                                >
+                                  {` ${status()} `}
+                                </span>
+                                <span style={{ fg: L().muted }}>
+                                  {"  "}
+                                  {c().id} · {c().source === "config" ? "from config" : "created from chat"}
+                                </span>
+                              </text>
+                              <box flexDirection="column">
+                                <Field label="polls" value={c().url} />
+                                <Field label="every" value={describe({ kind: "every", ms: c().everyMs || 60_000 }).replace(/^every /, "")} />
+                                <Field label="last poll" value={src()?.lastPollAt ? `${clock(src()!.lastPollAt)}  (${relative(src()!.lastPollAt, state.now())})` : "never"} />
+                                <Field label="last ok" value={src()?.lastOkAt ? clock(src()!.lastOkAt) : "never"} />
+                                <Show when={src()?.lastError}>
+                                  {(err) => <Field label="error" value={`${err()}  (${src()!.failures}× in a row)`} fg={L().bad} />}
+                                </Show>
+                                <Field label="env" value={c().env.length ? c().env.join(", ") : "none"} />
+                              </box>
+                            </Block>
+
+                            <Block title="Mapping" hue={1}>
+                              <box flexDirection="column">
+                                <Field label="items" value={c().items || "(the response)"} />
+                                <Field label="filter" value={Object.keys(c().filter).length ? JSON.stringify(c().filter) : "none"} />
+                                <Field label="event id" value={c().event.id} />
+                                <Field label="sessionKey" value={c().event.sessionKey ?? "none"} />
+                                <Field label="title" value={c().event.title ?? "(event id)"} />
+                                <Show when={c().event.body}>{(b) => <Field label="body" value={b()} />}</Show>
+                                <Show when={c().event.url}>{(u) => <Field label="url" value={u()} />}</Show>
+                              </box>
+                            </Block>
+
+                            <Block title="Automations" hue={2}>
+                              <Show when={users().length} fallback={<text fg={L().muted}>none use it, so it isn't polled</text>}>
+                                <box flexDirection="column" gap={1}>
+                                  <For each={users()}>
+                                    {(j) => (
+                                      <box flexDirection="column">
+                                        <text fg={L().text}>
+                                          <span style={{ fg: isActive(j) ? L().ok : L().muted }}>{isActive(j) ? "●" : "○"}</span> {j.name}
+                                          <span style={{ fg: L().muted }}>
+                                            {"  "}
+                                            {j.schedule.kind === "event" ? "as events arrive" : describe(j.schedule)} · {queue(j.id).length} waiting
+                                          </span>
+                                        </text>
+                                        <For each={queue(j.id).slice(0, 3)}>
+                                          {(e) => <text fg={L().muted}>{"  " + e.title.slice(0, 90)}</text>}
+                                        </For>
+                                      </box>
+                                    )}
+                                  </For>
+                                </box>
+                              </Show>
+                            </Block>
+                          </box>
+                        </scrollbox>
+                      )
+                    }}
+                  </Show>
+                </box>
+              </Show>
+            </Show>
+
+            <Show when={!onChannels()}>
             <Show
               when={sorted().length}
               fallback={
@@ -427,6 +680,7 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
                           </text>
                           <box flexDirection="column">
                             <Field label="schedule" value={describe(j().schedule)} />
+                            <Show when={j().on}>{(on) => <Field label="channels" value={on().channels.join(", ")} />}</Show>
                             <Field label="next" value={isActive(j()) ? `${clock(j().nextRunAt)}  (${relative(j().nextRunAt, state.now())})` : "—"} />
                             <Field
                               label="last"
@@ -473,9 +727,10 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
                 </Show>
               </box>
             </Show>
+            </Show>
 
             <box flexDirection="row" flexWrap="wrap" paddingTop={1} paddingBottom={1} columnGap={2} flexShrink={0}>
-              <For each={keyHints}>
+              <For each={onChannels() ? channelHints : keyHints}>
                 {([key, label]) => (
                   <text>
                     <span style={{ fg: L().text, bg: L().cap }}> {key} </span>
@@ -540,7 +795,9 @@ export default Plugin.define({
     let debounce: ReturnType<typeof setTimeout> | undefined
     let watcher: FSWatcher | undefined
     try {
-      watcher = watch(dataDir, () => {
+      watcher = watch(dataDir, (_event, file) => {
+        // Lock directories and temp files come and go around every write; the rename that follows is what counts.
+        if (file && /\.(lock|tmp)$/.test(String(file))) return
         clearTimeout(debounce)
         debounce = setTimeout(state.refresh, 150)
       })
