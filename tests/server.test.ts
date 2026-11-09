@@ -238,6 +238,8 @@ test("automation_notify is offered, with guidance, only to runs that may notify"
   expect(run.tools).toContain("automation_notify")
   expect(run.system).toContain('automation "Morning"')
   expect(run.system).toContain("not sent anywhere")
+  expect(run.system).toContain("no markdown")
+  expect(app.tools.get("automation_notify").description).toContain("full URLs")
 
   for (const sid of ["session-2", "caller"]) {
     const c = app.context(sid)

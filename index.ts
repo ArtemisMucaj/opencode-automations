@@ -92,6 +92,8 @@ const runGuide = (job: Job, max: number) =>
   `You are running unattended as the automation "${job.name}". Nobody is watching this session: ` +
   `your final reply stays here and is not sent anywhere. To reach the user, call ${NOTIFY_TOOL} ` +
   `with what they need to know or act on, once you know it. If nothing is worth their attention, don't notify. ` +
+  `Write it as a notification, not a chat reply: plain text, no markdown (no **, #, backticks, tables or [text](url)). ` +
+  `Use new lines to separate items and paste links directly as full URLs. ` +
   `At most ${max} notifications per run; group related items into one. ` +
   `Failures and timeouts are reported to the user automatically.`
 
@@ -342,8 +344,9 @@ export default Plugin.define({
           "Send a notification to the user's phone and desktop from this automation run. " +
           "It is read on a lock screen, so write for a glance: a title that states the outcome " +
           '(e.g. "3 MRs need your review", not "Report"), then the details that support it. ' +
-          "Plain text: short lines, '- ' bullets, **bold** for the one thing that matters, [text](url) links. " +
-          "No tables, code blocks or headings. " +
+          "Format it as a notification, not markdown: plain text, one item per line, new lines (and a blank line " +
+          "between groups) for structure, links pasted directly as full URLs. " +
+          "No **bold**, headings, backticks, tables or [text](url) links. " +
           `Keep the message under ${PUSHOVER.message} characters (Pushover's limit); longer text arrives as ` +
           `numbered parts, at most ${MAX_PARTS}. One notification per topic: send several only for ` +
           "separate findings that each deserve attention, not one per item.",
@@ -351,7 +354,7 @@ export default Plugin.define({
           type: "object",
           properties: {
             title: { type: "string", description: "Headline stating the outcome. Under 60 characters reads best." },
-            message: { type: "string", description: `Body, plain text, ideally under ${PUSHOVER.message} characters.` },
+            message: { type: "string", description: `Plain text, no markdown. New lines for structure, full URLs for links. Ideally under ${PUSHOVER.message} characters.` },
             priority: {
               type: "string", enum: ["low", "normal", "high"],
               description: "high = needs action soon (alerts on the phone); low = FYI, no sound. Default normal.",

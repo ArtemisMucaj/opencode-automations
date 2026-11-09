@@ -106,44 +106,20 @@ The session sidebar lists upcoming jobs and marks sessions created by an automat
 
 ## Notifications
 
-Configured on the **server** plugin (`notify` in `opencode.jsonc`), so they fire even with no TUI open:
+Sent by the **server** plugin (`notify` in `opencode.jsonc`), so no TUI needs to be open.
 
-| channel | reaches | setup |
+| channel | setup | notes |
 |---|---|---|
-| `native` | macOS or Linux desktop | `"native": true` |
-| `pushover` | iPhone, Android, desktop | `"pushover": { "token", "user" }` |
+| `native` | `"native": true` | macOS via `osascript` (optional `{ "sound": "Ping" }`), Linux via `notify-send` (needs `libnotify` and a desktop session). Shows on the server machine. |
+| `pushover` | `"pushover": { "token", "user" }` | Phone and desktop. |
 
-`native` picks the server's OS backend automatically:
+**The run's agent decides what to send.** Runs get an `automation_notify` tool (`title`, `message`, optional `priority` and `url`) and are told to write plain text with no markdown, newlines for structure and bare links. Their final reply is not sent. Stray markdown is cleaned up anyway.
 
-- **macOS:** `osascript` (AppleScript). Allow notifications for Script Editor in System Settings if prompted. Optional macOS-only sound: `"native": { "sound": "Ping" }` (empty string disables sound).
-- **Linux:** `notify-send` (install `libnotify-bin` on Debian/Ubuntu, `libnotify` on Fedora/Arch). Requires a running desktop notification service and access to its user D-Bus session. The OpenCode server must inherit that desktop session environment; a headless server or isolated system service will not display local notifications.
+**Limits.** Pushover takes 1024 characters per message: longer ones are split into numbered parts (`Title (1/3)`), up to 4. At most `maxPerRun` notifications per run (default 5).
 
-No TUI needs to be open, but native notifications appear on the **server machine**, not a remote client's desktop. Missing utilities, unavailable desktop sessions, or unsupported OSes are logged as `native` delivery failures without failing the automation; Pushover can still deliver. The old `macos` option is no longer supported—replace it with `native`.
+**Automatic notices** go out only when a run fails or times out (`on`, default `["failed", "timeout"]`). Add `"succeeded"` to get a short notice when the agent sent nothing. Per job, `notify: false` turns everything off; an array picks that job's automatic notices.
 
-### What gets sent
-
-The run's agent decides. Each run that may notify gets an `automation_notify` tool and a short system note saying nobody is watching the session, so it should notify when it has something worth the user's attention and stay quiet otherwise. The run's final reply stays in the session; it is not sent.
-
-`automation_notify` takes a `title` (the outcome, e.g. "3 MRs need your review"), a plain-text `message`, an optional `priority` (`low`, `normal`, `high`) and an optional `url` + `url_title` (a button in Pushover). Other sessions don't see the tool.
-
-Formatting is plain text built for a lock screen. Models tend to write markdown anyway, so it is cleaned up per channel:
-
-| written | Pushover (HTML mode) | desktop |
-|---|---|---|
-| `**bold**`, `# heading` | bold | plain text |
-| `- item` | `• item` | `• item` |
-| `[text](url)` | link | `text (url)` |
-| `` `code` ``, code fences, table rules | removed, text kept | removed, text kept |
-| `\| a \| b \|` | `a · b` | `a · b` |
-
-Limits:
-
-- **Size.** Pushover accepts 1024 characters per message and 250 per title. A longer message is split into numbered parts (`Title (1/3)`), at paragraph breaks first, then lines, then words, and sent in order, with the link button on the last part. The tool refuses a message that would need more than 4 parts and asks the agent to shorten it.
-- **Count.** At most `maxPerRun` notifications per run (default 5). The tool asks the agent to group related items into one notification and send several only for separate findings.
-
-Automatic notices: the plugin itself notifies only when a run fails or times out (high priority), since the agent can't. `on` picks which outcomes get one (default: `failed`, `timeout`). Adding `succeeded` sends a short "Finished in 2m." only when the agent sent nothing. Per job, `notify: false` turns off all notifications (including the tool) and `notify: ["timeout"]` picks that job's automatic notices.
-
-A failing channel is logged and never affects the run. The TUI's own OS notification is now off by default (`notify` in `cli.json` to turn it back on) to avoid duplicates.
+A failing channel is logged and never affects the run. The TUI's own OS notification is off by default (`notify` in `cli.json`).
 
 ## Reference
 
