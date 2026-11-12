@@ -1,5 +1,5 @@
 import { expect, spyOn, test } from "bun:test"
-import { compose, format, pushoverParts, send, shouldNotify, split, PUSHOVER, type Deps, type Message } from "../notify.ts"
+import { compose, format, longLine, pushoverParts, send, shouldNotify, split, MAX_LINE, PUSHOVER, type Deps, type Message } from "../notify.ts"
 import type { Job, Run } from "../store.ts"
 
 const job: Job = {
@@ -195,4 +195,10 @@ test("compose writes a short notice and never includes the agent's output", () =
 test("quotes in link URLs can't break the href", async () => {
   const { format } = await import("../notify.ts")
   expect(format('[dash](https://x.test/?q="a")', "html")).toBe('<a href="https://x.test/?q=&quot;a&quot;">dash</a>')
+})
+
+test("longLine finds a wall of text but ignores links and short lines", () => {
+  expect(longLine("3 MRs need review\n\n!12 blocked\nhttps://x.test/" + "a".repeat(400))).toBeUndefined()
+  const wall = "word ".repeat(MAX_LINE / 4)
+  expect(longLine(`Fine\n${wall}`)).toBe(wall.trim())
 })

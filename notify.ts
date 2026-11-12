@@ -140,6 +140,14 @@ export function format(text: string, style: Style): string {
   return sourceLines(text).map((l) => line(l, style)).join("\n").replace(/\n{3,}/g, "\n\n").trim()
 }
 
+/** Longest a line may run, links aside, before it reads as a wall of text on a phone. */
+export const MAX_LINE = 200
+
+/** The first line too long to read at a glance (links don't count), or undefined. */
+export function longLine(text: string): string | undefined {
+  return format(text, "plain").split("\n").find((l) => l.replace(/\bhttps?:\/\/\S+/g, "").trim().length > MAX_LINE)
+}
+
 /** Cut a source line into pieces that each render within `max`, preferring word breaks. */
 function cutLine(src: string, max: number, style: Style): string[] {
   if (line(src, style).length <= max) return [src]

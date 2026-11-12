@@ -118,6 +118,10 @@ Sent by the **server** plugin (`notify` in `opencode.jsonc`), so no TUI needs to
 
 **The run's agent decides what to send.** Runs get an `automation_notify` tool (`title`, `message`, optional `priority` and `url`) and are told to write plain text with no markdown, newlines for structure and bare links. Their final reply is not sent. Stray markdown is cleaned up anyway.
 
+**Silent runs are checked once.** A run that may notify, sent nothing, and didn't end its reply with "Nothing worth notifying the user about in this run." gets one follow-up turn in the same session, reminding it that its reply went nowhere. It can then notify or confirm there is nothing. The run's history keeps the original reply.
+
+**Messages must be short-lined.** `automation_notify` refuses a message with a line over 200 characters (links don't count) and asks the agent to put one item per line. The lock screen only shows the title and first lines, so the agent is told to put the most important thing first.
+
 **Limits.** Pushover takes 1024 characters per message: longer ones are split into numbered parts (`Title (1/3)`), up to 4. At most `maxPerRun` notifications per run (default 5).
 
 **Automatic notices** go out only when a run fails or times out (`on`, default `["failed", "timeout"]`). A successful run is notified only if the agent found something worth sending. Per job, `notify: false` turns everything off; an array picks that job's automatic notices.
