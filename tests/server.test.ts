@@ -137,14 +137,14 @@ test("V2 execution success completes the run without waiting for legacy idle", a
   try {
     const app = await start({ notify: { on: ["succeeded"], pushover: { token: "test-token", user: "test-user" } } }, [job({ timeoutMinutes: 0.001 })])
     await app.call("automation_run", { id: "morning" })
-    app.events.emit("event", { type: "session.text.ended", data: { sessionID: "session-1", text: "Ok" } })
+    app.events.emit("event", { type: "session.text.ended", data: { sessionID: "session-1", text: "Ok\nNothing worth notifying the user about in this run." } })
     app.events.emit("event", {
       id: "evt-success", type: "session.execution.succeeded", created: Date.now(),
       durable: { aggregateID: "session-1", seq: 3, version: 1 },
       location: { directory: app.dataDir }, data: { sessionID: "session-1" },
     })
     await flush()
-    expect(app.store.history()[0]).toMatchObject({ status: "succeeded", output: "Ok" })
+    expect(app.store.history()[0]).toMatchObject({ status: "succeeded", output: "Ok\nNothing worth notifying the user about in this run." })
     expect(app.store.loadJobs()[0].lastStatus).toBe("succeeded")
     // A compatibility idle event must not finish the run again.
     app.events.emit("event", { type: "session.idle", data: { sessionID: "session-1" } })
@@ -227,16 +227,51 @@ test("failed runs notify automatically even after the agent notified", async () 
   } finally { fetch.mockRestore() }
 })
 
-test("a successful run without notifications is silent by default", async () => {
+test("a successful run that says there is nothing to report is silent", async () => {
   const fetch = spyOn(globalThis, "fetch").mockResolvedValue(new Response("ok"))
   try {
     const app = await start({ notify: pushover }, [job()])
     await app.call("automation_run", { id: "morning" })
-    app.events.emit("event", { type: "session.text.ended", data: { sessionID: "session-1", text: "All clear" } })
+    app.events.emit("event", { type: "session.text.ended", data: { sessionID: "session-1", text: "All clear.\nnothing worth notifying the user about in this run" } })
     app.events.emit("event", { type: "session.idle", data: { sessionID: "session-1" } })
     await new Promise((resolve) => setTimeout(resolve, 80))
     expect(fetch.mock.calls).toHaveLength(0)
+    expect(app.prompts).toHaveLength(1) // no check turn
+    expect(app.store.history()[0].status).toBe("succeeded")
   } finally { fetch.mockRestore() }
+})
+
+test("a run that ends silently without saying why is asked once whether to notify", async () => {
+  const app = await start({ notify: pushover }, [job()])
+  await app.call("automation_run", { id: "morning" })
+  app.events.emit("event", { type: "session.text.ended", data: { sessionID: "session-1", text: "MR !12 is blocked." } })
+  app.events.emit("event", { type: "session.execution.succeeded", data: { sessionID: "session-1" } })
+  await flush()
+  expect(app.prompts).toHaveLength(2)
+  expect(app.prompts[1]).toMatchObject({ sessionID: "session-1", delivery: "queue" })
+  expect(app.prompts[1].text).toContain("automation_notify")
+  expect(app.prompts[1].metadata.automation).toMatchObject({ jobID: "morning", reason: "check" })
+  expect(app.store.history()[0].status).toBe("running")
+  // A legacy idle after the V2 event doesn't end the check turn early.
+  app.events.emit("event", { type: "session.idle", data: { sessionID: "session-1" } })
+  await flush()
+  expect(app.store.history()[0].status).toBe("running")
+  // The check turn ends the run, whatever it answered, and isn't asked again.
+  app.events.emit("event", { type: "session.text.ended", data: { sessionID: "session-1", text: "Sent." } })
+  app.events.emit("event", { type: "session.execution.succeeded", data: { sessionID: "session-1" } })
+  await flush()
+  expect(app.prompts).toHaveLength(2)
+  expect(app.store.history()[0]).toMatchObject({ status: "succeeded", output: "MR !12 is blocked." })
+})
+
+test("runs that can't notify are never asked", async () => {
+  const app = await start({ notify: pushover }, [job({ notify: false })])
+  await app.call("automation_run", { id: "morning" })
+  app.events.emit("event", { type: "session.text.ended", data: { sessionID: "session-1", text: "Done" } })
+  app.events.emit("event", { type: "session.idle", data: { sessionID: "session-1" } })
+  await flush()
+  expect(app.prompts).toHaveLength(1)
+  expect(app.store.history()[0].status).toBe("succeeded")
 })
 
 test("automation_notify is limited per run and rejects text too long to split", async () => {
@@ -244,10 +279,13 @@ test("automation_notify is limited per run and rejects text too long to split", 
   try {
     const app = await start({ notify: { maxPerRun: 2, ...pushover } }, [job()])
     await app.call("automation_run", { id: "morning" })
-    const long = await app.call("automation_notify", { title: "Dump", message: "word ".repeat(1200) }, "session-1")
+    const long = await app.call("automation_notify", { title: "Dump", message: ("word ".repeat(30) + "\n").repeat(40) }, "session-1")
     expect(long.content).toContain("error: message is")
+    const wall = await app.call("automation_notify", { title: "Brief", message: "This sentence goes on. ".repeat(10) + "https://x.test/" + "a".repeat(300) }, "session-1")
+    expect(wall.content).toContain("too long to read on a phone")
     expect(fetch.mock.calls).toHaveLength(0)
-    expect((await app.call("automation_notify", { title: "A", message: "one" }, "session-1")).content).toContain("1 notifications left")
+    // Long links alone don't make a line too long.
+    expect((await app.call("automation_notify", { title: "Link", message: "MR ready:\nhttps://x.test/" + "a".repeat(300) }, "session-1")).content).toContain("1 notifications left")
     expect((await app.call("automation_notify", { title: "B", message: "two" }, "session-1")).content).toContain("0 notifications left")
     expect((await app.call("automation_notify", { title: "C", message: "three" }, "session-1")).content).toContain("limit 2")
     expect(fetch.mock.calls).toHaveLength(2)

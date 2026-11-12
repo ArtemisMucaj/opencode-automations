@@ -13,7 +13,7 @@ import { describe, nextRun, parseCron, parseInterval, type Schedule } from "./cr
 import { sessionMode, Store, type Job, type Run, type SessionMode } from "./store.ts"
 import { defaultDataDir, isActive, listens, runnable } from "./jobs.ts"
 import {
-  canNotify, compose, DEFAULT_MAX_PER_RUN, MAX_PARTS, PUSHOVER, send, shouldNotify, split,
+  canNotify, compose, DEFAULT_MAX_PER_RUN, longLine, MAX_LINE, MAX_PARTS, PUSHOVER, send, shouldNotify, split,
   type JobNotify, type NotifyConfig, type Priority,
 } from "./notify.ts"
 import {
@@ -67,6 +67,10 @@ interface InFlight {
   timer?: ReturnType<typeof setTimeout>
   /** Session key of a run in its key's session: runs for different keys may overlap. */
   key?: string
+  /** The run ended without notifying and was asked once whether it should have; its reply before that. */
+  checked?: { reply?: string }
+  /** The host reports V2 execution events, so legacy idle events are redundant. */
+  v2?: boolean
 }
 
 type Reason = "schedule" | "manual" | "missed" | "event"
@@ -107,6 +111,9 @@ const text = (content: string) => ({ content })
 
 /** Exposed name of the notify tool (`notify` in the `automation` namespace). */
 const NOTIFY_TOOL = "automation_notify"
+/** What a run ends its reply with when it deliberately sends nothing. */
+const NOTHING_TO_NOTIFY = "Nothing worth notifying the user about in this run."
+const saidNothing = (reply?: string) => !!reply && /nothing worth notifying the user about/i.test(reply)
 /**
  * Every tool goes through opencode's code mode: they're grouped in these namespaces and exposed as
  * `automation_*` / `channel_*`, without their schemas riding along on every request.
@@ -151,9 +158,11 @@ const CHANNEL_GUIDE =
 const runGuide = (job: Job, max: number) =>
   `You are running unattended as the automation "${job.name}". Nobody is watching this session: ` +
   `your final reply stays here and is not sent anywhere. To reach the user, call ${NOTIFY_TOOL} ` +
-  `with what they need to know or act on, once you know it. If nothing is worth their attention, don't notify. ` +
+  `with what they need to know or act on, once you know it. If nothing is worth their attention, don't notify, ` +
+  `and end your final reply with the line "${NOTHING_TO_NOTIFY}" ` +
   `Write it as a notification, not a chat reply: plain text, no markdown (no **, #, backticks, tables or [text](url)). ` +
-  `Use new lines to separate items and paste links directly as full URLs. ` +
+  `Lead with what matters most: a lock screen shows only the title and the first lines. ` +
+  `Short lines, one item per line, a blank line between groups; paste links directly as full URLs. ` +
   `At most ${max} notifications per run; group related items into one. ` +
   `Failures and timeouts are reported to the user automatically.`
 
@@ -332,7 +341,7 @@ export default Plugin.define({
       inflight.delete(sessionID)
       clearTimeout(f.timer)
       const run: Run = {
-        ...f.run, status, endedAt: Date.now(), output: f.lastText?.slice(0, 4000), error,
+        ...f.run, status, endedAt: Date.now(), output: (f.checked?.reply ?? f.lastText)?.slice(0, 4000), error,
         ...(f.sent ? { notifications: f.sent } : {}),
       }
       store.appendRun(run)
@@ -348,6 +357,28 @@ export default Plugin.define({
         }
         notify(f.job, run)
       })())
+    }
+
+    /** A turn ended: finish the run, unless it may notify, sent nothing and didn't say why (then ask once). */
+    function ended(sessionID: string) {
+      const f = inflight.get(sessionID)
+      if (!f) return
+      if (f.checked || f.sent || !canNotify(opts.notify, f.job) || saidNothing(f.lastText)) {
+        return finish(sessionID, "succeeded")
+      }
+      f.checked = { reply: f.lastText }
+      void ctx.session.prompt({
+        sessionID,
+        text:
+          `This run is ending and you haven't called ${NOTIFY_TOOL}, so the user has heard nothing: ` +
+          `your reply above is not sent anywhere. If it holds anything the user should know or act on, ` +
+          `send it now with ${NOTIFY_TOOL}. If there is really nothing, reply "${NOTHING_TO_NOTIFY}"`,
+        delivery: "queue",
+        metadata: { automation: { jobID: f.job.id, runID: f.run.runID, reason: "check" } },
+      }).catch((e) => {
+        console.error("[automations] notify check:", (e as Error)?.message)
+        finish(sessionID, "succeeded")
+      })
     }
 
     /** The automatic end-of-run notice; what the agent wanted to say went out via automation_notify. */
@@ -717,8 +748,11 @@ export default Plugin.define({
                 finish(sid, "failed", JSON.stringify((ev as any).data.error))
                 break
               case "session.execution.succeeded": // V2 execution completed
+                inflight.get(sid)!.v2 = true
+                ended(sid)
+                break
               case "session.idle": // compatibility with hosts emitting legacy idle
-                finish(sid, "succeeded")
+                if (!inflight.get(sid)!.v2) ended(sid)
                 break
             }
           }
@@ -764,9 +798,10 @@ export default Plugin.define({
         description:
           "Send a notification to the user's phone and desktop from this automation run. " +
           "It is read on a lock screen, so write for a glance: a title that states the outcome " +
-          '(e.g. "3 MRs need your review", not "Report"), then the details that support it. ' +
-          "Format it as a notification, not markdown: plain text, one item per line, new lines (and a blank line " +
-          "between groups) for structure, links pasted directly as full URLs. " +
+          '(e.g. "3 MRs need your review", not "Report"), then the details that support it, most important first: ' +
+          "the lock screen shows only the first lines. " +
+          "Format it as a notification, not markdown: plain text, short lines, one item per line, a blank line " +
+          `between groups, links pasted directly as full URLs. Lines over ${MAX_LINE} characters (links aside) are refused. ` +
           "No **bold**, headings, backticks, tables or [text](url) links. " +
           `Keep the message under ${PUSHOVER.message} characters (Pushover's limit); longer text arrives as ` +
           `numbered parts, at most ${MAX_PARTS}. One notification per topic: send several only for ` +
@@ -775,7 +810,7 @@ export default Plugin.define({
           type: "object",
           properties: {
             title: { type: "string", description: "Headline stating the outcome. Under 60 characters reads best." },
-            message: { type: "string", description: `Plain text, no markdown. New lines for structure, full URLs for links. Ideally under ${PUSHOVER.message} characters.` },
+            message: { type: "string", description: `Plain text, no markdown. One item per line, blank lines between groups, full URLs for links. Ideally under ${PUSHOVER.message} characters.` },
             priority: {
               type: "string", enum: ["low", "normal", "high"],
               description: "high = needs action soon (alerts on the phone); low = FYI, no sound. Default normal.",
@@ -793,6 +828,13 @@ export default Plugin.define({
           const title = String(input.title ?? "").trim()
           const message = String(input.message ?? "").trim()
           if (!title || !message) return text("error: title and message are required.")
+          const long = longLine(message)
+          if (long) {
+            return text(
+              `error: a line is ${long.length} characters ("${long.slice(0, 60)}…"), too long to read on a phone. ` +
+              `Break it up: one item per line, at most ${MAX_LINE} characters each, a blank line between groups. Nothing was sent.`,
+            )
+          }
           if (opts.notify!.pushover) {
             const parts = split(message, PUSHOVER.message, "html").length
             if (parts > MAX_PARTS) {
