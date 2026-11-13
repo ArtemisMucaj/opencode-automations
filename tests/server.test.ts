@@ -4,7 +4,8 @@ import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import plugin from "../index.ts"
-import { Store, type Job } from "../store.ts"
+import { cacheLifetime } from "../cache.ts"
+import { Store, type Job, type Memory } from "../store.ts"
 
 const cleanups: Array<() => Promise<void>> = []
 afterEach(async () => {
@@ -12,16 +13,21 @@ afterEach(async () => {
 })
 const flush = () => new Promise((resolve) => setTimeout(resolve, 20))
 
-async function start(options: Record<string, unknown> = {}, jobs: Job[] = []) {
+async function start(options: Record<string, unknown> = {}, jobs: Job[] = [], seed?: (store: Store) => Promise<void>) {
   const dataDir = mkdtempSync(join(tmpdir(), "automations-server-"))
   const store = new Store(dataDir)
   store.saveJobs(jobs)
+  await seed?.(store)
   const tools = new Map<string, any>()
   const namespaces: any[] = []
   const removed: string[] = []
   const commands = new Map<string, any>()
   const prompts: any[] = []
   const sessions: any[] = []
+  /** Compactions asked for, with the summary the plugin's compaction hook gave. */
+  const compactions: Array<{ sessionID: string; summary?: string }> = []
+  /** Whether compact() rejects the call. */
+  const compactMode = { value: "ok" as "ok" | "throw" }
   const events = new EventEmitter()
   const hooks = new Map<string, (input: any) => void>()
   const ctx = {
@@ -42,6 +48,16 @@ async function start(options: Record<string, unknown> = {}, jobs: Job[] = []) {
         return { id: `session-${sessions.length}` }
       },
       prompt: async (input: any) => { prompts.push(input) },
+      // Like opencode: the compaction hook may supply the summary, and the compaction's end event comes after it returns.
+      compact: async ({ sessionID }: any) => {
+        if (compactMode.value === "throw") throw new Error("no compact endpoint")
+        const c: any = { sessionID, system: [], messages: [], tools: {}, options: {} }
+        hooks.get("compaction")?.(c)
+        compactions.push({ sessionID, summary: c.result?.summary })
+        setTimeout(() => events.emit("event", { type: "session.execution.succeeded", data: { sessionID } }), 0)
+        return { id: "msg_compaction", sessionID, type: "compaction" }
+      },
+      wait: async () => {},
       remove: async ({ sessionID }: any) => { removed.push(sessionID) },
       interrupt: async () => {},
       hook: async (name: string, fn: any) => { hooks.set(name, fn); return { dispose: async () => {} } },
@@ -62,12 +78,12 @@ async function start(options: Record<string, unknown> = {}, jobs: Job[] = []) {
   await flush()
   const call = (name: string, input = {}, sessionID = "caller") => tools.get(name).execute(input, { sessionID })
   /** What the model would see for a session: system prompt additions and tool names. */
-  const context = (sessionID: string) => {
-    const c = { sessionID, system: [] as any[], tools: Object.fromEntries([...tools.keys()].map((k) => [k, {}])) }
+  const context = (sessionID: string, options: Record<string, unknown> = {}) => {
+    const c = { sessionID, options, system: [] as any[], tools: Object.fromEntries([...tools.keys()].map((k) => [k, {}])) }
     hooks.get("context")!(c)
     return { system: c.system.map((p) => p.text).join("\n"), tools: Object.keys(c.tools) }
   }
-  return { store, tools, namespaces, commands, prompts, sessions, removed, events, call, context, dataDir, stop, ctx }
+  return { store, tools, namespaces, commands, prompts, sessions, compactions, compactMode, removed, events, call, context, dataDir, stop, ctx }
 }
 
 function job(overrides: Partial<Job> = {}): Job {
@@ -80,7 +96,7 @@ function job(overrides: Partial<Job> = {}): Job {
 
 test("server loads with current command API and exposes working CRUD tools", async () => {
   const app = await start()
-  expect(app.tools.size).toBe(13)
+  expect(app.tools.size).toBe(14)
   const created = await app.call("automation_create", { name: "Audit", prompt: "Check dependencies", every: "1h" })
   expect(created.content).toContain("Audit")
   expect(app.store.loadJobs()[0].directory).toBe(app.dataDir)
@@ -347,7 +363,7 @@ test("an automation on a channel runs on new events with an untrusted prompt", a
     expect(app.prompts[0].metadata.automation).toMatchObject({ jobID: "triage", reason: "event", channels: ["dd"], events: ["dd:2:t1"] })
     expect(app.sessions[0].title).toStartWith("⏰ Alert triage")
     expect(app.store.history()[0].jobID).toBe("triage")
-    expect(app.context("session-1").system).toContain('automation "Alert triage"')
+    expect(app.context("session-1").system).toContain("running unattended as an automation")
 
     // Nothing new on the next poll.
     expect((await app.call("channel_poll", { id: "dd" })).content).toContain("0 new events")
@@ -375,8 +391,11 @@ test("sticky on a channel with session keys keeps one session per key and queues
     expect(app.sessions).toHaveLength(2)
     expect(waiting(app, "triage")).toEqual(["1:t2"])
 
-    // Run for monitor 1 finishes; the waiting event goes to the same session, queued.
+    // Run for monitor 1 finishes (after the one follow-up asking for a note); the waiting event goes to the same session, queued.
     const usedAt = app.store.loadChannels().queues.triage.sessions["dd:1"].at
+    app.events.emit("event", { type: "session.idle", data: { sessionID: "session-1" } })
+    await flush()
+    expect(app.prompts.at(-1)).toMatchObject({ sessionID: "session-1", metadata: { automation: { reason: "check" } } })
     app.events.emit("event", { type: "session.idle", data: { sessionID: "session-1" } })
     await flush()
     await app.call("channel_poll", { id: "dd" })
@@ -565,7 +584,8 @@ test("automation_notify is offered, with guidance, only to runs that may notify"
 
   const run = app.context("session-1")
   expect(run.tools).toContain("automation_notify")
-  expect(run.system).toContain('automation "Morning"')
+  expect(run.system).toContain("running unattended as an automation")
+  expect(run.system).toEndWith('This run is for the automation "Morning" (id: morning). Each run starts in a new session. You can send up to 5 notifications in this run.')
   expect(run.system).toContain("not sent anywhere")
   expect(run.system).toContain("no markdown")
   expect(app.tools.get("automation_notify").description).toContain("full URLs")
@@ -574,10 +594,233 @@ test("automation_notify is offered, with guidance, only to runs that may notify"
     const c = app.context(sid)
     expect(c.tools).not.toContain("automation_notify")
     expect(c.tools).toContain("automation_list")
-    expect(c.system).toBe("")
   }
+  // A run that can't notify gets only its run context; a chat that isn't a run gets nothing.
+  expect(app.context("session-2").system).toBe('This run is for the automation "Quiet" (id: quiet). Each run starts in a new session.')
+  expect(app.context("caller").system).toBe("")
   expect((await app.call("automation_notify", { title: "x", message: "y" })).content).toContain("only available inside an automation run")
   expect((await app.call("automation_notify", { title: "x", message: "y" }, "session-2")).content).toContain("error")
+})
+
+// ---------- sticky memory ----------
+
+/** The memory of a job's sticky session, or of one of its session keys. */
+const memory = (store: Store, jobID: string, key?: string) =>
+  key === undefined ? store.loadJobs().find((j) => j.id === jobID)?.memory : store.loadChannels().queues[jobID]?.sessions[key]
+/** Change it in place: on the job, or on the key's entry in the channel queue. */
+const setMemory = (store: Store, jobID: string, key: string | undefined, fn: (m: Memory) => void) =>
+  key === undefined
+    ? store.mutate((jobs) => { fn(jobs.find((j) => j.id === jobID)!.memory!) })
+    : store.mutateChannels((s) => { fn(s.queues[jobID].sessions[key]) })
+/** Make a job's (or key's) sticky session look cold: its cache went cold a while ago. */
+const chill = (store: Store, jobID: string, key?: string) => setMemory(store, jobID, key, (m) => { m.warmUntil = Date.now() - 60_000 })
+const end = async (app: { events: EventEmitter }, sessionID: string) => {
+  app.events.emit("event", { type: "session.execution.succeeded", data: { sessionID } })
+  await flush()
+}
+
+test("a sticky session is continued while warm, and compacted to its memory once cold", async () => {
+  const app = await start({}, [job({ session: "sticky" })])
+  await app.call("automation_run", { id: "morning" })
+  expect(app.prompts[0]).toMatchObject({ sessionID: "session-1", text: "Check things" })
+  // Sticky runs are offered the memory tool and told to use it; it saves a note for the job.
+  const ctx = app.context("session-1")
+  expect(ctx.tools).toContain("automation_memory_update")
+  expect(ctx.system).toContain("End every run with automation_memory_update")
+  expect(ctx.tools).not.toContain("automation_memory_recall")
+  expect((await app.call("automation_memory_update", { note: "MR !12 reported. Watching !13." }, "session-1")).content).toContain("Saved")
+  await end(app, "session-1")
+  expect(app.prompts).toHaveLength(1) // it saved a note: no follow-up
+  expect(app.store.history()[0].status).toBe("succeeded")
+
+  // Right after: the cache is warm, so the same session goes on, without the note.
+  await app.call("automation_run", { id: "morning" })
+  expect(app.prompts[1]).toMatchObject({ sessionID: "session-1", text: "Check things" })
+  await app.call("automation_memory_update", { note: "MR !12, !13 reported." }, "session-1")
+  await end(app, "session-1")
+
+  // Cold: the same session, compacted first with the latest memory as its summary (no model call).
+  await chill(app.store, "morning")
+  await app.call("automation_run", { id: "morning" })
+  expect(app.compactions).toEqual([{ sessionID: "session-1", summary: "MR !12, !13 reported." }])
+  const run = app.prompts[2]
+  expect(run).toMatchObject({ sessionID: "session-1", text: "Check things" })
+  expect(app.sessions).toHaveLength(1)
+  expect(app.store.loadJobs()[0].sessionID).toBe("session-1")
+})
+
+test("the compaction's end, even delivered after it returns, doesn't end the run or check it before its turn", async () => {
+  const app = await start({}, [job({ session: "sticky" })])
+  await app.call("automation_run", { id: "morning" })
+  await app.call("automation_memory_update", { note: "state" }, "session-1")
+  await end(app, "session-1")
+  await chill(app.store, "morning")
+  await app.call("automation_run", { id: "morning" })
+  await flush()
+  expect(app.compactions).toHaveLength(1)
+  expect(app.prompts.map((p) => p.metadata.automation.reason)).toEqual(["manual", "manual"]) // no check queued
+  expect(app.store.history()[0].status).toBe("running")
+  await app.call("automation_memory_update", { note: "state 2" }, "session-1")
+  await end(app, "session-1")
+  expect(app.store.history()[0].status).toBe("succeeded")
+  expect(memory(app.store, "morning")).toMatchObject({ note: "state 2" })
+})
+
+test("a run that saves no memory drops the old one, and one that sent the model nothing doesn't warm the session", async () => {
+  const app = await start({}, [job({ session: "sticky" })])
+  await app.call("automation_run", { id: "morning" })
+  app.context("session-1") // the run sent the model a request
+  await app.call("automation_memory_update", { note: "run 1" }, "session-1")
+  await end(app, "session-1")
+  expect(memory(app.store, "morning")).toMatchObject({ note: "run 1" })
+  const warm = memory(app.store, "morning")!.warmUntil
+  expect(warm).toBeGreaterThan(Date.now())
+
+  // Run 2 sends nothing to the model (it failed at once) and saves no memory, even when asked.
+  await app.call("automation_run", { id: "morning" })
+  await end(app, "session-1")
+  await end(app, "session-1")
+  expect(memory(app.store, "morning")!.note).toBeUndefined()
+  expect(memory(app.store, "morning")!.warmUntil).toBe(warm)
+
+  // Cold, with no memory: the next run continues the whole session rather than compacting to run 1's note.
+  await chill(app.store, "morning")
+  await app.call("automation_run", { id: "morning" })
+  expect(app.compactions).toEqual([])
+  expect(app.prompts.at(-1).sessionID).toBe("session-1")
+})
+
+test("if compaction can't be done, the cold run goes on in its whole session", async () => {
+  const app = await start({}, [job({ session: "sticky" })])
+  await app.call("automation_run", { id: "morning" })
+  await app.call("automation_memory_update", { note: "state" }, "session-1")
+  await end(app, "session-1")
+  await chill(app.store, "morning")
+  app.compactMode.value = "throw"
+  await app.call("automation_run", { id: "morning" })
+  expect(app.prompts[1]).toMatchObject({ sessionID: "session-1", text: "Check things" })
+  expect(app.compactions).toEqual([])
+  expect(app.store.history()[0].status).toBe("running")
+})
+
+test("a sticky run that saves no note is asked once, with the notify check in the same turn; without a note the session goes on", async () => {
+  const app = await start({ notify: pushover }, [job({ session: "sticky" })])
+  await app.call("automation_run", { id: "morning" })
+  app.events.emit("event", { type: "session.text.ended", data: { sessionID: "session-1", text: "MR !12 is blocked." } })
+  await end(app, "session-1")
+  expect(app.prompts).toHaveLength(2)
+  expect(app.prompts[1].text).toContain("automation_notify")
+  expect(app.prompts[1].text).toContain("automation_memory_update")
+  await end(app, "session-1")
+  expect(app.prompts).toHaveLength(2)
+  expect(app.store.history()[0]).toMatchObject({ status: "succeeded", output: "MR !12 is blocked." })
+
+  // No note was saved, so even a cold session is continued: nothing to start a fresh one from.
+  await chill(app.store, "morning")
+  await app.call("automation_run", { id: "morning" })
+  expect(app.prompts[2]).toMatchObject({ sessionID: "session-1", text: "Check things" })
+  expect(app.sessions).toHaveLength(1)
+})
+
+test("with session keys, each key's session goes cold and is compacted to its own memory", async () => {
+  let current: unknown[] = []
+  const fetch = api(() => current)
+  try {
+    const app = await start({ channels: [channel()], jobs: [triage({ session: "sticky" })] })
+    current = [monitor(1), monitor(2)]
+    await app.call("channel_poll", { id: "dd" })
+    const sid = (key: string) => app.store.loadChannels().queues.triage.sessions[key].id
+    const one = sid("dd:1"), two = sid("dd:2")
+    app.context(one) // each run sent the model a request
+    app.context(two)
+    await app.call("automation_memory_update", { note: "Monitor 1: disk full on db-3." }, one)
+    await app.call("automation_memory_update", { note: "Monitor 2: flaky." }, two)
+    await end(app, one)
+    await end(app, two)
+
+    // Monitor 1 fires again after its cache went cold: its session is compacted to its own memory. Monitor 2 is still warm.
+    await chill(app.store, "triage", "dd:1")
+    current = [monitor(1, "t2"), monitor(2, "t2")]
+    await app.call("channel_poll", { id: "dd" })
+    const for1 = app.prompts.find((p) => p.text.includes('id="1:t2"'))
+    const for2 = app.prompts.find((p) => p.text.includes('id="2:t2"'))
+    expect(for1.sessionID).toBe(one)
+    expect(sid("dd:1")).toBe(one)
+    expect(app.compactions).toEqual([{ sessionID: one, summary: "Monitor 1: disk full on db-3." }])
+    expect(for2.sessionID).toBe(two)
+  } finally { fetch.mockRestore() }
+})
+
+test("the cache lifetime is read from the run's requests, 5 minutes when they don't say", () => {
+  expect(cacheLifetime(undefined)).toBe(5 * 60_000)
+  expect(cacheLifetime({ temperature: 0 })).toBe(5 * 60_000)
+  expect(cacheLifetime({ cache: { ttl: "1h" } })).toBe(3_600_000)
+  expect(cacheLifetime({ prompt_cache_retention: "24h" })).toBe(86_400_000)
+  expect(cacheLifetime({ prompt_cache_retention: "in_memory" })).toBe(5 * 60_000)
+  expect(cacheLifetime({ prompt_cache_options: { ttl: "30m" } })).toBe(30 * 60_000)
+  expect(cacheLifetime({ cache_control: { type: "ephemeral", ttl: "1h" } })).toBe(3_600_000)
+  expect(cacheLifetime({ cache: "none" })).toBe(0)
+})
+
+test("a session with a one-hour cache stays warm for a gap a default cache wouldn't survive", async () => {
+  const app = await start({}, [job({ session: "sticky" }), job({ id: "short", name: "Short", session: "sticky" })])
+  await app.call("automation_run", { id: "morning" })
+  await app.call("automation_run", { id: "short" })
+  app.context("session-1", { cache: { ttl: "1h" } })
+  app.context("session-2")
+  await app.call("automation_memory_update", { note: "a" }, "session-1")
+  await app.call("automation_memory_update", { note: "b" }, "session-2")
+  await end(app, "session-1")
+  await end(app, "session-2")
+  // Warm for 90% of the cache lifetime after the run ended.
+  expect(memory(app.store, "morning")!.warmUntil! - Date.now()).toBeGreaterThan(53 * 60_000)
+  expect(memory(app.store, "short")!.warmUntil! - Date.now()).toBeLessThan(5 * 60_000)
+  // 20 minutes later: the one-hour cache is still warm, the 5-minute one isn't.
+  for (const id of ["morning", "short"]) await setMemory(app.store, id, undefined, (m) => { m.warmUntil! -= 20 * 60_000 })
+  await app.call("automation_run", { id: "morning" })
+  await app.call("automation_run", { id: "short" })
+  expect(app.prompts.at(-2)).toMatchObject({ sessionID: "session-1", text: "Check things" })
+  expect(app.prompts.at(-1).sessionID).toBe("session-2")
+  expect(app.compactions.map((c) => c.sessionID)).toEqual(["session-2"])
+})
+
+test("with caching off, a sticky session is compacted whenever there is memory", async () => {
+  const app = await start({}, [job({ session: "sticky" })])
+  await app.call("automation_run", { id: "morning" })
+  app.context("session-1", { cache: "none" })
+  await app.call("automation_memory_update", { note: "state" }, "session-1")
+  await end(app, "session-1")
+  await app.call("automation_run", { id: "morning" })
+  expect(app.prompts[1].sessionID).toBe("session-1")
+  expect(app.compactions).toEqual([{ sessionID: "session-1", summary: "state" }])
+})
+
+test("automation_memory_update is for sticky runs only, and refuses empty or long notes", async () => {
+  const app = await start({}, [job(), job({ id: "s", name: "S", session: "sticky" })])
+  await app.call("automation_run", { id: "morning" })
+  await app.call("automation_run", { id: "s" })
+  expect(app.context("session-1").tools).not.toContain("automation_memory_update")
+  expect(app.context("caller").tools).not.toContain("automation_memory_update")
+  expect((await app.call("automation_memory_update", { note: "x" }, "session-1")).content).toContain("only kept for runs of sticky")
+  expect((await app.call("automation_memory_update", { note: "x" })).content).toContain("only kept for runs of sticky")
+  expect((await app.call("automation_memory_update", { note: "  " }, "session-2")).content).toContain("empty")
+  expect((await app.call("automation_memory_update", { note: "x".repeat(4001) }, "session-2")).content).toContain("limit is 4000")
+  expect(memory(app.store, "s")?.note).toBeUndefined()
+  expect(app.context("session-2").tools).toContain("automation_memory_update")
+})
+
+test("the memory lives on the session's record: a new session starts fresh, and so does a new key session", async () => {
+  const app = await start({}, [job({ session: "sticky" })])
+  await app.call("automation_run", { id: "morning" })
+  await app.call("automation_memory_update", { note: "state" }, "session-1")
+  await end(app, "session-1")
+  expect(memory(app.store, "morning")).toMatchObject({ note: "state" })
+  // The session is gone: the new one starts without the old session's memory, and nothing is compacted.
+  app.ctx.session.get = async ({ sessionID }: any) => ({ id: sessionID, time: { archived: Date.now() }, location: { directory: app.dataDir } })
+  await app.call("automation_run", { id: "morning" })
+  expect(app.prompts[1]).toMatchObject({ sessionID: "session-2", text: "Check things" })
+  expect(memory(app.store, "morning")).toBeUndefined()
+  expect(app.compactions).toEqual([])
 })
 
 // ---------- creating channels from chat ----------
@@ -810,7 +1053,7 @@ test("every tool goes through code mode, in two namespaces", async () => {
   expect(app.namespaces.map((n: any) => n.name)).toEqual(["automation", "channel"])
   for (const [name, tool] of app.tools) {
     expect(tool.options).toEqual({ namespace: name.split("_")[0], codemode: true })
-    expect(`${tool.options.namespace}_${tool.name}`).toBe(name) // exposed names stay automation_* / channel_*
+    expect(`${tool.options.namespace}_${tool.name}`).toBe(name) // exposed names stay automation_* / channel_* 
   }
   expect([...app.tools.keys()]).toContain("automation_notify")
   expect([...app.tools.keys()]).toContain("channel_test")

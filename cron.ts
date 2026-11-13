@@ -7,10 +7,17 @@ export type Schedule =
   /** No schedule: runs when its channel has events. */
   | { kind: "event" }
 
+const UNITS: Record<string, number> = { ms: 1, s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000, w: 604_800_000 }
+
+export function parseDuration(value: unknown, units?: string[]): number | undefined {
+  const match = typeof value === "string" ? /^(\d+(?:\.\d+)?)([a-z]+)$/.exec(value.trim()) : null
+  const unit = match?.[2]
+  return unit && Object.hasOwn(UNITS, unit) && (!units || units.includes(unit)) ? Number(match![1]) * UNITS[unit] : undefined
+}
+
 export function parseInterval(value: string): number {
-  const match = /^(\d+(?:\.\d+)?)(m|h|d|w)$/.exec(value.trim())
-  if (!match) throw new Error('invalid interval; use e.g. "15m", "2h", "1d"')
-  const ms = Number(match[1]) * ({ m: 60_000, h: 3_600_000, d: 86_400_000, w: 604_800_000 }[match[2]]!)
+  const ms = parseDuration(value, ["m", "h", "d", "w"])
+  if (ms === undefined) throw new Error('invalid interval; use e.g. "15m", "2h", "1d"')
   if (!Number.isSafeInteger(ms) || ms < 60_000) throw new Error("interval must be at least one minute")
   return ms
 }

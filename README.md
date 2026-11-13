@@ -1,50 +1,155 @@
-# opencode automations (v2 plugin)
+# opencode automations
 
-Run prompts on a schedule inside opencode 2 — cron, fixed intervals, or one-shot — declared in config, created from chat, or managed from a TUI dialog. Or run them on events: channels poll an API (Datadog, Sentry, GitHub…) and hand new items to the automations that listen.
+Let [opencode](https://opencode.ai) work for you while you're away.
 
-Two halves, one package:
+An automation is a prompt that runs on its own: every morning, every 30 minutes, once at a given time, or whenever something happens in a system you watch (a Datadog alert, a new Sentry issue, a GitHub event). Each run is a normal opencode session, with your agents, tools and MCP servers, and it reaches you on your phone or desktop when it finds something worth telling you.
 
-| part | runs in | does |
-|---|---|---|
-| `index.ts` (server plugin) | the opencode background server | owns the ticker, fires runs, polls channels (`channels.ts`), tracks runs to completion, exposes `automation_*` and `channel_*` tools |
-| `tui.tsx` (TUI plugin) | each TUI | `/automations` dialog, sidebar section, toasts + OS notifications when runs finish |
+Some things people use it for:
 
-Both share `jobs.json` / `history.jsonl` on disk. The TUI only writes *intents* (pause, edit, delete, run-now); the server's leader executes them, so there's still exactly one firer and one history.
+- **Morning brief.** At 8:45 on weekdays, read your open merge requests and Jira tickets and send a short plan for the day.
+- **Alert triage.** When a Datadog monitor fires, look at recent deploys and logs, find the likely cause, and notify you only if it needs a human.
+- **Weekly audit.** Every Monday, run the dependency audit and report only what changed since last week.
+- **Reminders with context.** "At 16:00, check whether the release pipeline passed and tell me."
+
+## Requirements
+
+- opencode 2 (the plugin uses the V2 plugin API)
+- Git (opencode installs the plugin straight from the repository)
+
+No build step, no clone, no Bun unless you want to hack on the plugin itself.
 
 ## Install
-
-Requires OpenCode V2 and Git. Local development also needs [Bun](https://bun.sh). No build step is needed.
-
-### Try from this checkout
-
-From this checkout:
-
-```sh
-bun install
-opencode
-```
-
-The included `opencode.jsonc` loads the package from the repository root, with no sample jobs or external notifications enabled. `package.json` exports both `.` (server) and `./tui` (TUI); OpenCode loads both parts from one plugin entry.
-
-### Install globally from Git (all projects)
 
 ```sh
 opencode plugin add github:ArtemisMucaj/opencode-automations
 ```
 
-OpenCode installs the Git package and adds it to your global configuration. No manual clone, permanent checkout, or absolute local path is needed. This single entry loads both server and TUI parts; no separate `cli.json` entry is needed for normal use.
+That adds the plugin to your global opencode configuration, so it's available in every project. Open opencode anywhere and type `/automations`: if a dialog opens, you're set.
 
-**Maintainers:** Git installation requires `package.json`, the plugin sources, and `bun.lock` to be committed and pushed to the repository first. Uncommitted local changes are not installed from Git. After editing `tui.tsx`, run `bun run compile` and commit the regenerated `tui.js`: installs load that precompiled file, because OpenTUI does not compile JSX inside `node_modules`.
-
-For SSH access, use this **instead** of the command above:
+To check from the terminal:
 
 ```sh
-opencode plugin add git+ssh://git@github.com/ArtemisMucaj/opencode-automations.git
+opencode plugin list
 ```
 
-Private repositories use your existing Git credentials. To pin a revision, append `#<tag>` or `#<full-commit-hash>` to the Git specifier. Full commit hashes stay pinned and are skipped by automatic update checks.
+**Updating and removing**
 
-To configure jobs or notifications, edit the entry added to your global `~/.config/opencode/opencode.json(c)` (or `$XDG_CONFIG_HOME/opencode/opencode.json(c)`). Use the object form, preserving other plugins and settings:
+```sh
+opencode plugin update github:ArtemisMucaj/opencode-automations
+opencode plugin remove github:ArtemisMucaj/opencode-automations
+```
+
+Removing the plugin keeps your automations and their history on disk (see [Where things are stored](#where-things-are-stored)).
+
+**Other install forms**
+
+- Over SSH: `opencode plugin add git+ssh://git@github.com/ArtemisMucaj/opencode-automations.git`
+- A specific version: append `#<tag>`, `#<branch>` or `#<commit>` to the package name, e.g. `github:ArtemisMucaj/opencode-automations#v0.1.0`.
+
+## Your first automation
+
+Everything can be done from chat. In any opencode session:
+
+```
+/automation every weekday at 8:45, list the merge requests waiting for my review and send me a summary
+```
+
+The agent creates it and tells you when it will next run. Other things you can ask for:
+
+```
+/automation show my automations
+/automation run the morning brief now
+/automation pause the dependency audit
+/automation change the morning brief to 9:00
+/automation delete the test reminder
+```
+
+Plain language works too; `/automation` just makes sure the agent reaches for the right tools.
+
+Or use the dialog: `/automations` opens a list of your automations over the current screen. From there you can run one now (**r**), create one with a small wizard (**n**), change its model (**m**), open its latest run (**⏎**), or pause and delete. The session sidebar also shows what runs next.
+
+A few things to know when writing the prompt:
+
+- **Runs start from nothing.** Unless you choose otherwise (see [Sessions](#sessions-fresh-sticky-or-current)), a run is a new session with no memory of your chat. Put everything the agent needs in the prompt, as if briefing a colleague who wasn't in the room.
+- **Say when to notify.** The agent decides whether to notify you based on what it finds. Tell it what counts: "notify me only if a pipeline is red", "always send the summary".
+- **Pick the agent and permissions.** Nobody is there to approve a permission prompt, so a run that hits one stalls until its timeout. Point unattended automations at an agent whose rules fit the job.
+
+## Schedules
+
+| You write | It means |
+|---|---|
+| `0 9 * * 1-5` | cron, 9:00 on weekdays. Add a timezone: `0 9 * * 1-5 Europe/Paris` |
+| `@daily`, `@hourly`, `@weekly` | cron shortcuts |
+| `every 30m`, `every 2h` | a fixed interval |
+| `2026-12-01T09:00` | once, at that time |
+
+Cron schedules respect daylight-saving changes in their timezone. If opencode wasn't running when an automation was due (laptop closed), the missed run fires at the next start, unless you turn that off for the job.
+
+## Notifications
+
+Notifications are sent by the server side of the plugin, so they work with no opencode window open. Two destinations, use either or both:
+
+| Destination | Setup | Notes |
+|---|---|---|
+| Desktop | `"native": true` | macOS notification center (optional `{ "sound": "Ping" }`), or `notify-send` on Linux. Shows on the machine running opencode. |
+| Phone | `"pushover": { "token": "…", "user": "…" }` | Through [Pushover](https://pushover.net). Phone and desktop apps. |
+
+Put them under `notify` in the plugin options (see [Configuration](#configuration)).
+
+**What you receive.** The agent running the automation writes the notification itself: a title and a short, plain-text message with the most important thing first, since a lock screen only shows the first lines. It sends at most 5 per run by default. If a run finds nothing worth your attention, it stays quiet.
+
+**What you always receive.** When a run fails or times out, you get a notice automatically, even if the agent never got to say anything. Per automation you can turn notifications off entirely or change which outcomes get the automatic notice.
+
+The dialog also shows a toast when a run finishes, if you happen to have opencode open.
+
+## Sessions: fresh, sticky or current
+
+Each automation picks where its runs happen:
+
+- **`new`** (default): every run is a fresh session. Simple and predictable; runs appear in your session list as `⏰ name · time`.
+- **`sticky`**: runs share one conversation, so the agent builds on what earlier runs found instead of redoing their work, and doesn't repeat what it already told you. Good for "report only what changed" automations and for following an incident over several runs.
+- **`current`**: runs are queued into the chat you created the automation from. Only available when creating from chat.
+
+**How sticky sessions stay cheap.** Re-sending a long conversation to the model on every run would cost a lot, and providers only keep it cached for a few minutes. So each sticky run ends by writing a short memory, the result of this run for the next one, and the plugin picks the cheapest way to continue:
+
+- If the previous run ended recently enough that the model's cache is still warm, the next run continues the conversation as is.
+- Otherwise the conversation is compacted down to that memory first, so the model reads a few hundred characters instead of every earlier run. The session stays one entry in your list, with its whole history still viewable.
+
+You don't have to do anything for this: the agent is told how to keep its memory, and reminded once if it forgets.
+
+## Channels: run on events
+
+A channel is something to watch: an HTTP API the plugin polls every so often, turning new items into events. Automations attached to a channel run when events arrive. Polling means nothing has to reach your machine from outside, so it works on a laptop behind a firewall.
+
+```
+Datadog API ──poll every 1m──▶ new alerts ──▶ "alert-triage"  (runs as alerts arrive, one session per monitor)
+                                          └─▶ "alert-digest"  (18:00: everything that fired today)
+```
+
+**Setting one up from chat**
+
+```
+/channel alert me about Datadog monitors for my-team
+```
+
+The agent walks through it with you: it reuses a channel if one already watches what you need, finds the API endpoint (from docs, an example you paste, or a connected tool), dry-runs the request and shows you the first events as an automation would see them, adjusts until they look right, then saves the channel and asks what you want done with the events. Channels can also be defined in configuration; see the Datadog example in `examples/opencode.jsonc`.
+
+**Your API keys never go in the chat.** Channel definitions reference secrets as `{env:NAME}`, e.g. `"DD-API-KEY": "{env:DD_API_KEY}"`, and the plugin refuses a definition with a written-out credential. Set the variables where opencode runs; the agent tells you which ones are missing.
+
+**Two ways to react**
+
+- **As events arrive.** An automation with a channel and no schedule runs each time something new comes in, with up to 10 events per run. With a sticky session and a per-item key (one per monitor, one per issue), a flapping alert stays in a single conversation with its history and memory.
+- **As a digest.** An automation with a channel *and* a schedule collects events and runs on schedule with everything since the last run (up to 50). Nothing new, no run.
+
+One channel can feed several automations, and one automation can listen to several channels. The first time an automation is attached to a channel it receives everything currently there (what's alerting right now), then only new items. Paused automations keep their events for when they resume.
+
+**Watching channels.** The **c** key in `/automations` shows each channel's status: polling or failing, what it polls and how often, the last poll and error, and which automations it feeds with how many events waiting. If a channel fails three polls in a row (expired key, API down) you get one notification.
+
+**A note on trust.** Whatever is in the polled system ends up in the prompt: an alert's message, an issue's title. The plugin marks it as data, not instructions, but someone who can write into that system can still try to steer the agent. Use an agent whose permissions fit unattended work on untrusted input.
+
+## Configuration
+
+Automations created from chat or the dialog need no configuration at all. The options below let you set defaults, notifications, and automations or channels you'd rather keep in a file. Edit the plugin entry in your global `~/.config/opencode/opencode.json` (or `opencode.jsonc`):
 
 ```jsonc
 {
@@ -53,158 +158,81 @@ To configure jobs or notifications, edit the entry added to your global `~/.conf
     {
       "package": "github:ArtemisMucaj/opencode-automations",
       "options": {
-        "tickSeconds": 30,
-        "defaultTimeoutMinutes": 30
+        "defaultTimeoutMinutes": 30,
+        "defaultModel": "anthropic/claude-sonnet-4-5",
+        "notify": {
+          "native": true,
+          "pushover": { "token": "<app token>", "user": "<user key>" }
+        },
+        "jobs": [
+          {
+            "id": "morning-brief",
+            "prompt": "List open merge requests where I'm a reviewer and summarize what each needs from me. Notify me with the summary.",
+            "cron": "45 8 * * 1-5",
+            "tz": "Europe/Paris",
+            "directory": "/path/to/your/project"
+          }
+        ]
       }
     }
   ]
 }
 ```
 
-Replace the existing entry rather than adding a second copy. See `examples/opencode.jsonc` for opt-in jobs/notification settings.
+Configuration reloads on save; `/reload` if opencode is already open. `examples/opencode.jsonc` has a fuller example with sticky sessions, a Datadog channel and the automations on it.
 
-Open OpenCode in any project and use `/automations` to view automations, or `/automation <request>` to manage them from chat. Configuration hot-reloads; use `/reload` if already open. No service restart is needed. When developing in this plugin's own checkout, avoid loading the Git installation and its local `"package": "./"` entry simultaneously if your OpenCode version reports duplicate plugin IDs.
+**Plugin options**
 
-Verify installation:
-
-```sh
-opencode plugin list
-opencode api get '/api/plugin?location[directory]=/absolute/path/to/your-project'
-```
-
-Look for `automations`, `state.status: "active"`, and both `features.server` and `features.tui`. Also open `/automations` in the TUI to check actual TUI setup; server status alone only confirms export detection.
-
-Update or uninstall using the exact Git specifier you installed:
-
-```sh
-opencode plugin update github:ArtemisMucaj/opencode-automations
-# Or uninstall:
-opencode plugin remove github:ArtemisMucaj/opencode-automations
-```
-
-Use `/reload` afterward. Uninstalling leaves saved automations/history in the data directory described below.
-
-`cli.json` in this repo is an **example for local development**, not project-local CLI configuration or a required part of Git installation. TUI options: `notify` (`"off"`, `"blurred"`, `"always"`) and `dataDir` (must match the server).
-
-Uses `@opencode/plugin@2.2.1`, OpenTUI `0.7.0`, `cron-parser` for timezone/DST-aware cron, and `proper-lockfile` for cross-process locking. Dependencies are locked in `bun.lock`.
-
-## TUI
-
-`/automations` (or the command palette → "Automations") opens a dialog over the current screen; **esc** closes it.
-
-- **⏎** opens the job's latest run session (in a tab if tabs are on).
-- **r** queues a run; the server fires it on its next tick (≤ `tickSeconds`), even if the job is paused, without moving its schedule.
-- **m** picks from the models available at the current location.
-- **n** is a small wizard; schedules accept `0 9 * * 1-5 Europe/Paris`, `@daily`, `every 30m`, or an ISO date. New jobs use the TUI's current directory.
-- Config-defined jobs can be paused and run, not edited — their definition lives in config.
-- **c** switches to the **channels** tab: each channel's status (polling, idle, failing), what it polls and how often, its last poll and error, the environment variables it reads, its event mapping, and the automations it feeds with their waiting events. **p** polls the selected channel on the server's next tick; **d** deletes a channel created from chat that no automation uses. Channels are created and changed from chat (`/channel`).
-
-The session sidebar lists upcoming jobs and marks sessions created by an automation run ("this session: mr-triage ✓"). Finished runs raise a toast (OS/phone notifications come from the server — see below).
-
-## Create automations 
-
-`/automation <request>` or plain language. Tools: `automation_create`, `automation_list`, `automation_update`, `automation_delete`, `automation_run`, `automation_history`, plus `automation_notify`, which only automation runs see (below).
-
-**Code mode.** Every tool goes through opencode's code mode, in two namespaces: `automation` (create, list, update, delete, run, history, and notify inside runs) and `channel` (list, poll, test, create, update, delete). Their schemas don't ride along on every request; the model reaches them through code mode when needed. `automation_notify` is offered only inside automation runs. `/automation` and `/channel` also give the agent a short guide.
-
-## Notifications
-
-Sent by the **server** plugin (`notify` in `opencode.jsonc`), so no TUI needs to be open.
-
-| channel | setup | notes |
+| Option | Default | |
 |---|---|---|
-| `native` | `"native": true` | macOS via `osascript` (optional `{ "sound": "Ping" }`), Linux via `notify-send` (needs `libnotify` and a desktop session). Shows on the server machine. |
-| `pushover` | `"pushover": { "token", "user" }` | Phone and desktop. |
+| `defaultTimeoutMinutes` | 30 | A run longer than this is stopped and reported as a timeout |
+| `defaultModel` | the agent's | `provider/model`, applied when a run's session is created |
+| `defaultAgent` | | Agent for runs that don't name one |
+| `tickSeconds` | 30 | How often the plugin checks schedules and polls channels |
+| `notify` | | `native`, `pushover`, `on` (outcomes that get an automatic notice, default `["failed", "timeout"]`), `maxPerRun` (default 5) |
+| `jobs` | | Automations defined in config (below) |
+| `channels` | | Channels defined in config; see `examples/opencode.jsonc` |
+| `dataDir` | see below | Where automations and history are stored |
 
-**The run's agent decides what to send.** Runs get an `automation_notify` tool (`title`, `message`, optional `priority` and `url`) and are told to write plain text with no markdown, newlines for structure and bare links. Their final reply is not sent. Stray markdown is cleaned up anyway.
+**Automation fields** (`jobs`, and the same names when creating from chat)
 
-**Silent runs are checked once.** A run that may notify, sent nothing, and didn't end its reply with "Nothing worth notifying the user about in this run." gets one follow-up turn in the same session, reminding it that its reply went nowhere. It can then notify or confirm there is nothing. The run's history keeps the original reply.
-
-**Messages must be short-lined.** `automation_notify` refuses a message with a line over 200 characters (links don't count) and asks the agent to put one item per line. The lock screen only shows the title and first lines, so the agent is told to put the most important thing first.
-
-**Limits.** Pushover takes 1024 characters per message: longer ones are split into numbered parts (`Title (1/3)`), up to 4. At most `maxPerRun` notifications per run (default 5).
-
-**Automatic notices** go out only when a run fails or times out (`on`, default `["failed", "timeout"]`). A successful run is notified only if the agent found something worth sending. Per job, `notify: false` turns everything off; an array picks that job's automatic notices.
-
-A failing channel is logged and never affects the run. The TUI's own OS notification is off by default (`notify` in `cli.json`).
-
-## Channels
-
-A channel is an event source: it polls an HTTP API and turns new items into events. Automations run on those events with `on: { channels: [...] }`, from one channel or several. The agent investigates and, if it's worth it, notifies you with `automation_notify`. Polling needs no public URL, so it works on a laptop.
-
-```
-Datadog API ──poll every 1m──▶ new alerts ──▶ automation "alert-triage" ──▶ session ──▶ automation_notify ──▶ phone
-                                          └─▶ automation "alert-digest" (6pm: everything since yesterday)
-```
-
-Create channels from chat with `/channel <what you want>` (below), or define them under `channels` in the plugin options; see the Datadog example in `examples/opencode.jsonc`. Then point automations at them.
-
-### Creating channels from chat
-
-`/channel alert me about Datadog monitors for my-team` (or plain language) starts a guided loop:
-
-1. `channel_list`: the agent reuses a channel that already polls what's needed.
-2. It finds the endpoint (API docs, an example you paste, or a connected tool) and drafts a definition.
-3. `channel_test` dry-runs it: the real request, nothing saved or marked seen. It reports the item count before and after the filter, the fields of the first item, and the first events as an automation would get them. The agent adjusts `items`, `filter` and `event` until those look right.
-4. `channel_create` saves it in `channels.json`, next to the config channels.
-5. With your agreement on what to do with the events, `automation_create` (or `automation_update`) attaches it with `channels: [...]`.
-
-**Keys stay out of chat.** A channel created from chat must reference secrets as `{env:NAME}`. Headers, query parameters and body fields that look like credentials (`Authorization`, `api_key`, `token`, …) with a written-out value are refused. `channel_test` and `channel_list` say which variables aren't set; set them where the opencode server runs and restart it. Channels can't be tested, created or changed from inside an automation run: a run reads event text from outside, and mustn't be steerable into sending the server's variables somewhere. `channel_test` also replaces a key's value with its `{env:NAME}` reference in what it shows.
-
-`channel_update` changes a created channel (changing `event.id` makes current items look new, so they're delivered again). `channel_delete` removes one; if automations use it, pass `detach: true` to remove it from them, which pauses any event-only automation left with no channel. Config channels are edited in config.
-
-**Channel fields**
-
-| field | |
+| Field | |
 |---|---|
-| `id`, `name` | |
-| `every` | poll interval, at least `1m`. Polls happen on the leader's tick, so within `tickSeconds` of it. |
-| `request` | `url`, optional `method`, `headers` and JSON `body`. `{env:NAME}` reads an environment variable, so keys stay out of config. |
-| `items` | dot path to the array of items in the response (`data`, `result.items`). Empty: the response is the array. |
-| `filter` | keep items whose field equals a value or one of several: `{ "overall_state": ["Alert", "Warn"] }` |
-| `event` | templates over each item with `{dot.path}`: `id` (required: what counts as a new event), `sessionKey` (which events share a session for automations with `session: "sticky"`, e.g. `{id}` for one per monitor), `title`, `body`, `url` |
+| `id`, `prompt` | Required |
+| `cron`, `every`, `at`, `tz` | The schedule; one of the first three, or none for an event-only automation |
+| `on` | `{ "channels": ["datadog"] }` to run on a channel's events |
+| `directory` | Working directory for the run. Required in config, since the server isn't in your project |
+| `session` | `new` (default) or `sticky` |
+| `agent`, `model`, `timeoutMinutes` | Per-automation overrides |
+| `maxEvents` | Events per run: default 10 when running as events arrive, 50 for a digest |
+| `runMissed` | `true`: a run that was due while opencode was off fires at the next start |
+| `notify` | `false` for silence; an array of outcomes for that automation's automatic notices |
+| `enabled` | `false` pauses it |
 
-**Automations on channels** take `on: { "channels": ["<id>", …] }` (or `on: { "channel": "<id>" }` for one), from config, or `channels` in `automation_create` and `automation_update`. Events from all of an automation's channels go into one queue and are delivered together, each tagged with its channel:
+Automations from config can be paused and run from the dialog but not edited there; their definition lives in the file.
 
-- **No schedule:** runs as events arrive, at most `maxEvents` (default 10) per run.
-- **With a schedule** (`cron`/`every`/`at`): a digest. Events wait, and each run gets everything that arrived since the last one (up to `maxEvents`, default 50). A scheduled digest with nothing waiting doesn't run.
-- **`session`** picks where runs go:
-  - `new` (default): a fresh session per run.
-  - `sticky`: one session for all runs, accumulating context. If the channel sets `event.sessionKey`, one session per key instead: with `"sessionKey": "{id}"`, each monitor gets its own session, so a flapping alert stays in one conversation. Keys are per channel: monitor `123` and Sentry issue `123` get different sessions.
-  - `current`: the chat that created the automation (chat-created only).
+## Where things are stored
 
-**How events flow.** An automation's first poll of each of its channels gets every item currently there (what's alerting right now), including an automation added later to a channel that's been running. After that, each poll's items are compared with the event IDs already seen (kept in `channels.json`, so restarts don't repeat them), and new events join the queue of every active automation on that channel, so a triage and a digest can share one source. An automation's events wait while its session is busy, then go in as one prompt, queued behind any turn in progress. Put what makes an event new into `id`: `{id}:{overall_state_modified}` delivers a monitor again when it fires again after recovering. A channel no active automation uses isn't polled.
+`~/.local/share/opencode/plugins/automations/` (or under `$XDG_DATA_HOME`):
 
-**Untrusted input.** Event text goes inside `<event>` tags, and the prompt tells the agent it is data, not instructions. Still, anyone who can write into the polled system (an alert message, an issue title) writes into the prompt: run these automations with an agent whose permissions fit unattended work on untrusted input.
+- `jobs.json`: automations created from chat or the dialog, plus the state of config ones (paused, last run, sticky session and memory)
+- `history.jsonl`: every run, with its outcome, output and how many notifications it sent. `automation_history` and the dialog read from it
+- `channels.json`: channels created from chat, which items have been seen, and events waiting for each automation
 
-**Status.** `channel_list` shows each channel's last poll, errors, and the automations on it with their waiting events. `channel_poll` polls now. Pause an automation as usual; its events wait while it is paused (up to 500) and go in when it resumes. An automation disabled in config (`enabled: false`) gets none. A response where the `items` path is missing or null counts as no items. After 3 failed polls in a row (expired key, API down) you get one notification.
+## Under the hood
 
-## Reference
+Two parts ship in one package. A **server** part runs inside opencode's background server: it keeps time, starts runs, polls channels, follows each run to its end and sends notifications. A **TUI** part runs in each opencode window: the `/automations` dialog and the sidebar. Only the server ever starts a run, so with several windows open you still get exactly one run per schedule and one shared history.
 
-**Model** — `"provider/model[:variant]"`, per job or via `defaultModel`. Applied at session creation: every run for `new`, first run only for `sticky`; `current` retains the chat's model.
+Automations are ordinary opencode sessions, so anything your agents can do in chat they can do in a run. The agent gets a handful of extra tools (`automation_*`, `channel_*`) and short guidance on notifying and remembering; the `/automation` and `/channel` commands hand it that guidance up front.
 
-**Output** — in the run's session (`⏰ name · time` in your session list), the last text block in `history.jsonl` (`automation_history`, the TUI, with the number of notifications sent), and a toast/notification from the TUI. Phone/desktop notifications carry what the agent sent with `automation_notify`.
-
-**Working directory** — the session's `location`, the calling session's directory for chat-created jobs, the TUI's directory for TUI-created jobs, `directory` for config jobs.
-
-**Session modes** —
-* `new`: fresh per run
-* `sticky`: one session across runs (formerly `reuse`, still accepted)
-* `current`: queued into the chat that created it
-
-**Reliability** — missed runs fire on restart
-
-## Caveats
-
-- Unattended runs that hit an `ask` permission stall until timeout — point jobs at an agent with explicit rules.
-- Targets the current V2 plugin API (`@opencode/plugin`), not the legacy V1 SDK. Re-run tests and typecheck when upgrading OpenCode or OpenTUI.
-
-## Develop
+## Developing
 
 ```sh
 bun install
-bun test            # cron/DST, persistence/leases, server tools, TUI intents, native/Pushover delivery, headless TUI render
+bun test
 bun run typecheck
 ```
 
-For a manual integration check, open `/automations` in OpenCode. Server plugin status alone only confirms TUI export detection, not successful TUI setup.
+To run opencode against your checkout, open it in this directory: the included `opencode.jsonc` loads the plugin from `./`. Don't keep the Git-installed copy active at the same time; opencode refuses two plugins with the same id, and the global one wins, so your local changes wouldn't load. If you pin the global install to your branch instead (`#my-branch`), push before testing.
+
+After changing `tui.tsx`, run `bun run compile` and commit the regenerated `tui.js`. See `AGENTS.md` for why.

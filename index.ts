@@ -10,7 +10,8 @@
 import { Plugin } from "@opencode/plugin"
 import { randomUUID } from "node:crypto"
 import { describe, nextRun, parseCron, parseInterval, type Schedule } from "./cron.ts"
-import { sessionMode, Store, type Job, type Run, type SessionMode } from "./store.ts"
+import { cacheLifetime } from "./cache.ts"
+import { sessionMode, Store, type Job, type Run, type SessionMode, type Memory } from "./store.ts"
 import { defaultDataDir, isActive, listens, runnable } from "./jobs.ts"
 import {
   canNotify, compose, DEFAULT_MAX_PER_RUN, longLine, MAX_LINE, MAX_PARTS, PUSHOVER, send, shouldNotify, split,
@@ -69,6 +70,8 @@ interface InFlight {
   key?: string
   /** The run ended without notifying and was asked once whether it should have; its reply before that. */
   checked?: { reply?: string }
+  memoryUpdated?: boolean
+  cacheMs?: number
   /** The host reports V2 execution events, so legacy idle events are redundant. */
   v2?: boolean
 }
@@ -114,13 +117,21 @@ const NOTIFY_TOOL = "automation_notify"
 /** What a run ends its reply with when it deliberately sends nothing. */
 const NOTHING_TO_NOTIFY = "Nothing worth notifying the user about in this run."
 const saidNothing = (reply?: string) => !!reply && /nothing worth notifying the user about/i.test(reply)
+const UPDATE_TOOL = "automation_memory_update"
+const MAX_NOTE = 4000
+
+const WARM_SHARE = 0.9
+/** How long a cold run waits for its compaction's end event, for hosts that send none. */
+const COMPACTION_END_MS = 5_000
+/** Events that end an execution: a run's, or a compaction's. */
+const EXECUTION_ENDS = new Set(["session.execution.succeeded", "session.execution.failed", "session.execution.interrupted", "session.idle"])
 /**
  * Every tool goes through opencode's code mode: they're grouped in these namespaces and exposed as
  * `automation_*` / `channel_*`, without their schemas riding along on every request.
  */
 const CODE_MODE = { codemode: true } as const
 const NAMESPACES = [
-  { name: "automation", description: "Run prompts on a schedule or on channel events: create, list, update, delete, run, history; notify (inside runs)." },
+  { name: "automation", description: "Run prompts on a schedule or on channel events: create, list, update, delete, run, history; notify (inside runs); memory_update (inside sticky runs)." },
   { name: "channel", description: "Event sources polled from HTTP APIs (Datadog, Sentry, GitHub…): list, poll, test, create, update, delete." },
 ] as const
 
@@ -129,7 +140,9 @@ const AUTOMATIONS_GUIDE =
   "Automations run a prompt on a schedule (cron, every, or a one-shot at), or on events from channels. " +
   "automation_create/list/update/delete/run/history manage them. Write the prompt self-contained: runs start with no " +
   "conversation context unless session is \"current\". Sessions: \"new\" (default) is a fresh session per run, " +
-  "\"sticky\" keeps one session (with channels that set event.sessionKey: one per key), \"current\" is this chat.\n" +
+  "\"sticky\" carries context across runs (with channels that set event.sessionKey: per key): it continues its session " +
+  "while the model's prompt cache is warm, and otherwise compacts it to the memory each run hands the next " +
+  "through automation_memory_update, so old history isn't re-read at full price. \"current\" is this chat.\n" +
   "On channels: with no schedule an automation runs as events arrive (up to maxEvents, default 10, per run); with a " +
   "schedule it is a digest of everything since the last run (default 50). Its first poll of a channel gets everything " +
   "already there. automation_update channels replaces the list; [] removes them, only if it has a schedule.\n" +
@@ -155,16 +168,44 @@ const CHANNEL_GUIDE =
   "An automation can use several channels, and a channel can feed several automations."
 
 /** Added to the system prompt of automation runs that may notify. */
-const runGuide = (job: Job, max: number) =>
-  `You are running unattended as the automation "${job.name}". Nobody is watching this session: ` +
+const RUN_GUIDE =
+  `You are running unattended as an automation. Nobody is watching this session: ` +
   `your final reply stays here and is not sent anywhere. To reach the user, call ${NOTIFY_TOOL} ` +
   `with what they need to know or act on, once you know it. If nothing is worth their attention, don't notify, ` +
   `and end your final reply with the line "${NOTHING_TO_NOTIFY}" ` +
   `Write it as a notification, not a chat reply: plain text, no markdown (no **, #, backticks, tables or [text](url)). ` +
   `Lead with what matters most: a lock screen shows only the title and the first lines. ` +
   `Short lines, one item per line, a blank line between groups; paste links directly as full URLs. ` +
-  `At most ${max} notifications per run; group related items into one. ` +
+  `Send few notifications, within the limit given below; group related items into one. ` +
   `Failures and timeouts are reported to the user automatically.`
+const RUN_GUIDE_SHORT =
+  `This run is ending and you haven't called ${NOTIFY_TOOL}, so the user has heard nothing: ` +
+  `your reply above is not sent anywhere. If it holds anything the user should know or act on, ` +
+  `send it now with ${NOTIFY_TOOL}. If there is really nothing, reply "${NOTHING_TO_NOTIFY}"`
+
+const MEMORY_GUIDE =
+  `This automation carries its results from run to run, but not through this conversation: once it ` +
+  `goes idle for a while, the next run sees none of it. The only thing that reaches the next run is the memory you ` +
+  `write with ${UPDATE_TOOL}. Build on what the previous runs found (in this conversation, or in their memory): ` +
+  `don't redo their work, and don't tell the user again what they were already told. ` +
+  `End every run with ${UPDATE_TOOL}, before your final reply, with the result of this run for the next one: the current ` +
+  `state, what changed, open items and what to watch for, what you told the user, and anything learned that saves ` +
+  `work (IDs, links, commands). Facts, not a story of the run. It replaces the previous memory, so carry over what ` +
+  `still matters from it. At most ${MAX_NOTE} characters. ` +
+  `Skipping ${UPDATE_TOOL} drops the memory, so the next run may have to redo this one's work.`
+const MEMORY_GUIDE_SHORT =
+  `You haven't called ${UPDATE_TOOL}, so the next run won't know the result of this one: it may not see ` +
+  `this conversation. Call ${UPDATE_TOOL} now with this run's result and what the next run needs to pick up from here.`
+
+// After the constant guides, so they stay one cached prefix. Only values fixed for the whole run.
+const SESSION_MODES: Record<SessionMode, string> = {
+  new: "Each run starts in a new session.",
+  sticky: "Its runs share this session.",
+  current: "It runs in the chat it was created from.",
+}
+const runContext = (job: Job, maxNotifications?: number) =>
+  `This run is for the automation "${job.name}" (id: ${job.id}). ${SESSION_MODES[job.session]}` +
+  (maxNotifications !== undefined ? ` You can send up to ${maxNotifications} notifications in this run.` : "")
 
 export default Plugin.define({
   id: "automations",
@@ -268,6 +309,7 @@ export default Plugin.define({
           ...def,
           createdAt: prev?.createdAt ?? def.createdAt,
           sessionID: prev?.sessionID,
+          memory: prev?.memory,
           lastRunAt: prev?.lastRunAt,
           lastStatus: prev?.lastStatus,
           paused: prev?.paused,
@@ -314,6 +356,32 @@ export default Plugin.define({
       return s.id
     }
 
+    // ---------- sticky memory ----------
+    // A sticky session is continued while its prompt cache is warm. Once cold, the next run compacts it to the
+    // memory the last run saved, so the earlier runs aren't re-read at full price.
+
+    function memoryOf(jobID: string, key: string | undefined, sessionID: string): Memory | undefined {
+      try {
+        if (key === undefined) {
+          const j = find(load(), jobID)
+          return j?.sessionID === sessionID ? j.memory : undefined
+        }
+        const entry = store.loadChannels().queues[jobID]?.sessions[key]
+        return entry?.id === sessionID ? entry : undefined
+      } catch (e) {
+        console.error("[automations] memory:", (e as Error)?.message)
+        return undefined
+      }
+    }
+    const prevNote = (m: Memory | undefined, now = Date.now()) => m?.note && now >= (m.warmUntil ?? 0) ? m.note : undefined
+    async function remember(jobID: string, key: string | undefined, sessionID: string, patch: Memory) {
+      if (key === undefined) {
+        await mutate((jobs) => { const j = find(jobs, jobID); if (j?.sessionID === sessionID) j.memory = { ...j.memory, ...patch } })
+      } else {
+        await store.mutateChannels((s) => { const entry = s.queues[jobID]?.sessions[key]; if (entry?.id === sessionID) Object.assign(entry, patch) })
+      }
+    }
+
     async function resolveSession(job: Job): Promise<string> {
       if (job.session !== "new" && job.sessionID) {
         const id = await alive(job.sessionID)
@@ -321,7 +389,7 @@ export default Plugin.define({
         if (job.session === "current") throw new Error(`session ${job.sessionID} is gone`)
       }
       const id = await createSession(job, `⏰ ${job.name}${job.session === "new" ? ` · ${new Date().toLocaleString()}` : ""}`)
-      if (job.session === "sticky") await mutate((jobs) => { const j = find(jobs, job.id); if (j) j.sessionID = id })
+      if (job.session === "sticky") await mutate((jobs) => { const j = find(jobs, job.id); if (j) { j.sessionID = id; delete j.memory } })
       return id
     }
 
@@ -347,14 +415,25 @@ export default Plugin.define({
       store.appendRun(run)
       // The run is done in memory already (above, synchronously, so a second end event can't finish it twice);
       // what's saved on disk follows (tracked, so shutdown waits for it).
+      const memory: Memory | undefined = f.job.session !== "sticky" ? undefined : {
+        ...(f.cacheMs !== undefined ? { warmUntil: run.endedAt! + f.cacheMs * WARM_SHARE } : {}),
+        ...(f.memoryUpdated ? {} : { note: undefined }),
+      }
       void track((async () => {
-        try { await mutate((jobs) => { const j = find(jobs, run.jobID); if (j) j.lastStatus = status }) }
-        catch (e) { console.error("[automations] job state:", (e as Error)?.message) }
-        // A key's session counts as used when its run ends, so an active key isn't the one evicted.
-        if (f.key !== undefined) {
-          try { await store.mutateChannels((s) => touch(s.queues[f.job.id], f.key!, sessionID)) }
-          catch (e) { console.error("[automations] channel state:", (e as Error)?.message) }
-        }
+        await Promise.all([
+          mutate((jobs) => {
+            const j = find(jobs, run.jobID)
+            if (!j) return
+            j.lastStatus = status
+            if (memory && f.key === undefined && j.sessionID === sessionID) j.memory = { ...j.memory, ...memory }
+          }).catch((e) => console.error("[automations] job state:", (e as Error)?.message)),
+          // A key's session counts as used when its run ends, so an active key isn't the one evicted.
+          f.key !== undefined && store.mutateChannels((s) => {
+            touch(s.queues[f.job.id], f.key!, sessionID)
+            const entry = s.queues[f.job.id]?.sessions[f.key!]
+            if (memory && entry?.id === sessionID) Object.assign(entry, memory)
+          }).catch((e) => console.error("[automations] channel state:", (e as Error)?.message)),
+        ])
         notify(f.job, run)
       })())
     }
@@ -363,16 +442,17 @@ export default Plugin.define({
     function ended(sessionID: string) {
       const f = inflight.get(sessionID)
       if (!f) return
-      if (f.checked || f.sent || !canNotify(opts.notify, f.job) || saidNothing(f.lastText)) {
-        return finish(sessionID, "succeeded")
-      }
+      if (f.checked) return finish(sessionID, "succeeded")
+      const notificationSent = !!f.sent || !canNotify(opts.notify, f.job) || saidNothing(f.lastText)
+      const memoryUpdated = f.job.session !== "sticky" || !!f.memoryUpdated
+      if (notificationSent && memoryUpdated) return finish(sessionID, "succeeded")
       f.checked = { reply: f.lastText }
+      const reminders: string[] = []
+      if (!notificationSent) reminders.push(RUN_GUIDE_SHORT)
+      if (!memoryUpdated) reminders.push(MEMORY_GUIDE_SHORT)
       void ctx.session.prompt({
         sessionID,
-        text:
-          `This run is ending and you haven't called ${NOTIFY_TOOL}, so the user has heard nothing: ` +
-          `your reply above is not sent anywhere. If it holds anything the user should know or act on, ` +
-          `send it now with ${NOTIFY_TOOL}. If there is really nothing, reply "${NOTHING_TO_NOTIFY}"`,
+        text: reminders.join("\n\n"),
         delivery: "queue",
         metadata: { automation: { jobID: f.job.id, runID: f.run.runID, reason: "check" } },
       }).catch((e) => {
@@ -512,6 +592,10 @@ export default Plugin.define({
       return run
     }
 
+    const summaries = new Map<string, string>()
+    /** Sessions being compacted before a run, and what to call once the compaction's end event comes through. */
+    const compacting = new Map<string, () => void>()
+
     /** Start a run: pick the session, record it, send the prompt, and arm the timeout. */
     async function startSession(
       job: Job,
@@ -530,6 +614,22 @@ export default Plugin.define({
       }
       try {
         const sessionID = await how.session()
+        // Compact before tracking the run, so the compaction's events aren't taken for the run's.
+        const note = job.session === "sticky" ? prevNote(memoryOf(job.id, how.key, sessionID)) : undefined
+        if (note) {
+          try {
+            summaries.set(sessionID, note)
+            // Its end event can come through after compact() and wait() return; tracked by then, it would end the run.
+            const ended = new Promise<void>((r) => compacting.set(sessionID, r))
+            await ctx.session.compact({ sessionID, delivery: "queue" })
+            await ctx.session.wait({ sessionID })
+            let timer: ReturnType<typeof setTimeout> | undefined
+            await Promise.race([ended, new Promise((r) => { timer = setTimeout(r, COMPACTION_END_MS) })])
+            clearTimeout(timer)
+          } catch (e) {
+            console.error(`[automations] ${job.id}: couldn't compact session ${sessionID}; the run goes on with its whole history:`, (e as Error)?.message)
+          } finally { summaries.delete(sessionID); compacting.delete(sessionID) }
+        }
         const run: Run = { ...base, sessionID }
         const entry: InFlight = { job, run, sent: 0, key: how.key }
         inflight.set(sessionID, entry)
@@ -739,6 +839,11 @@ export default Plugin.define({
           for await (const ev of ctx.event.subscribe({ signal: abort.signal })) {
             backoff = 1000
             const sid = (ev as any).data?.sessionID as string | undefined
+            if (sid && compacting.has(sid) && EXECUTION_ENDS.has(ev.type)) {
+              compacting.get(sid)!()
+              compacting.delete(sid)
+              continue
+            }
             if (!sid || !inflight.has(sid)) continue
             switch (ev.type) {
               case "session.text.ended":
@@ -784,9 +889,20 @@ export default Plugin.define({
 
     await ctx.session.hook?.("context", (c) => {
       // Offer automation_notify only to runs that may notify, and tell them how to use it.
-      const f = notifiable(c.sessionID)
-      if (f) c.system.push({ type: "text", text: runGuide(f.job, maxPerRun) })
+      const f = inflight.get(c.sessionID)
+      const notifies = !!f && canNotify(opts.notify, f.job)
+      if (notifies) c.system.push({ type: "text", text: RUN_GUIDE })
       else delete c.tools[NOTIFY_TOOL]
+      if (f?.job.session === "sticky") {
+        c.system.push({ type: "text", text: MEMORY_GUIDE })
+        f.cacheMs ??= cacheLifetime(c.options)
+      } else delete c.tools[UPDATE_TOOL]
+      if (f) c.system.push({ type: "text", text: runContext(f.job, notifies ? maxPerRun : undefined) })
+    })
+
+    await ctx.session.hook?.("compaction", (c) => {
+      const summary = summaries.get(c.sessionID)
+      if (summary !== undefined) c.result = { summary }
     })
 
     await ctx.tool.transform((tools) => {
@@ -856,12 +972,43 @@ export default Plugin.define({
       })
 
       tools.add({
+        name: "memory_update",
+        options: { namespace: "automation", ...CODE_MODE },
+        description:
+          "Hand the result of this run to the next run of this sticky automation; it replaces the previous memory. " +
+          "The next run may see only this, not this conversation. Write the current " +
+          "state, what changed, open items, what the user was already told, useful IDs and links. " +
+          `At most ${MAX_NOTE} characters. Call it before your final reply.`,
+        input: {
+          type: "object",
+          properties: { note: { type: "string", description: `The whole memory, at most ${MAX_NOTE} characters.` } },
+          required: ["note"],
+          additionalProperties: false,
+        },
+        execute: async (input: any, tc) => {
+          const f = inflight.get(tc.sessionID)
+          if (f?.job.session !== "sticky") return text("error: memory is only kept for runs of sticky automations.")
+          const note = String(input.note ?? "").trim()
+          if (!note) return text("error: the note is empty.")
+          if (note.length > MAX_NOTE) {
+            return text(`error: the note is ${note.length} characters; the limit is ${MAX_NOTE}. Keep what the next run needs. Nothing was saved.`)
+          }
+          try {
+            await remember(f.job.id, f.key, tc.sessionID, { note })
+          } catch (e) { return text(`error: couldn't save the memory (${(e as Error)?.message}). Try once more.`) }
+          f.memoryUpdated = true
+          return text(`Saved (${note.length} characters). The next run that doesn't see this conversation starts from it.`)
+        },
+      })
+
+      tools.add({
         name: "create",
         options: { namespace: "automation", ...CODE_MODE },
         description:
           "Create an automation: one of cron/every/at, and/or channels. With channels and no schedule it runs as events arrive; " +
           "with a schedule it is a digest of what arrived since the last run. session: new (default, fresh per run), sticky " +
-          "(one session; with channels that set event.sessionKey, one per key), current (this chat). The prompt must be self-contained.",
+          "(context carries across runs: the session while its cache is warm, else compacted to the last run's memory; " +
+          "with channels that set event.sessionKey, per key), current (this chat). The prompt must be self-contained.",
         input: {
           type: "object",
           properties: {

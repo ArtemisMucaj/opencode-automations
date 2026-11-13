@@ -14,6 +14,11 @@ export type SessionMode = "new" | "sticky" | "current"
 
 /** `reuse` is the old name of `sticky`, still accepted in saved jobs and config. */
 export const sessionMode = (mode?: string): SessionMode | undefined => (mode === "reuse" ? "sticky" : (mode as SessionMode | undefined))
+/** A sticky session's memory: the last run's note, and until when the session's prompt cache is warm. */
+export interface Memory {
+  note?: string
+  warmUntil?: number
+}
 export type RunStatus = "running" | "succeeded" | "failed" | "timeout" | "skipped"
 export interface Job {
   id: string
@@ -23,6 +28,7 @@ export interface Job {
   directory: string
   session: SessionMode
   sessionID?: string
+  memory?: Memory
   agent?: string
   model?: string
   timeoutMinutes: number
