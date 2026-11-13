@@ -8,6 +8,7 @@
 //    on the automation's schedule (a digest).
 
 import { parseInterval } from "./cron.ts"
+import type { Memory } from "./store.ts"
 
 export interface ChannelConfig {
   id: string
@@ -75,7 +76,7 @@ export interface QueueState {
   /** Channels this automation has had a first poll from (which delivers everything already there). */
   started?: string[]
   /** Session per session key, with when it was last used (for eviction). */
-  sessions: Record<string, { id: string; at: number }>
+  sessions: Record<string, { id: string; at: number } & Memory>
 }
 
 export interface ChannelsState {
@@ -294,7 +295,7 @@ export function chunks(pending: ChannelEvent[], byKey: boolean, max: number): Ar
  */
 export function assign(queue: QueueState, key: string, sessionID: string, now = Date.now(), keep: Iterable<string> = []) {
   const prev = queue.sessions[key]
-  queue.sessions[key] = { id: sessionID, at: prev?.id === sessionID ? prev.at : now }
+  queue.sessions[key] = prev?.id === sessionID ? prev : { id: sessionID, at: now }
   const keys = Object.keys(queue.sessions)
   if (keys.length <= MAX_SESSIONS) return
   const kept = new Set([...keep, key])
