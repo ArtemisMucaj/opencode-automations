@@ -2,7 +2,7 @@
 
 Let [opencode](https://opencode.ai) work for you while you're away.
 
-An automation is a prompt that runs on its own: every morning, every 30 minutes, once at a given time, or whenever something happens in a system you watch (a Datadog alert, a new Sentry issue, a GitHub event). Each run is a normal opencode session, with your agents, tools and MCP servers, and it reaches you on your phone or desktop when it finds something worth telling you.
+An automation is a prompt that runs on its own. It can run every morning, every 30 minutes, once at a given time, or whenever something happens in a system you watch, such as a Datadog alert, a new Sentry issue, or a GitHub event. Each run is a normal opencode session with your agents, tools and MCP servers. When a run finds something worth knowing, it reaches you on your phone or desktop.
 
 Some things people use it for:
 
@@ -24,7 +24,7 @@ No build step, no clone, no Bun unless you want to hack on the plugin itself.
 opencode plugin add github:ArtemisMucaj/opencode-automations
 ```
 
-That adds the plugin to your global opencode configuration, so it's available in every project. Open opencode anywhere and type `/automations`: if a dialog opens, you're set.
+That adds the plugin to your global opencode configuration, so it's available in every project. Open opencode anywhere and type `/automations`. If a dialog opens, you're set.
 
 To check from the terminal:
 
@@ -64,13 +64,13 @@ The agent creates it and tells you when it will next run. Other things you can a
 /automation delete the test reminder
 ```
 
-Plain language works too; `/automation` just makes sure the agent reaches for the right tools.
+Plain language works too. `/automation` makes sure the agent reaches for the right tools.
 
-Or use the dialog: `/automations` opens a list of your automations over the current screen. From there you can run one now (**r**), create one with a small wizard (**n**), change its model (**m**), open its latest run (**⏎**), or pause and delete. The session sidebar also shows what runs next.
+Or use the dialog. `/automations` opens a list of your automations over the current screen. From there you can run one now (`r`), create one with a small wizard (`n`), change its model (`m`), open its latest run (`⏎`), or pause and delete. The session sidebar also shows what runs next.
 
 A few things to know when writing the prompt:
 
-- **Runs start from nothing.** Unless you choose otherwise (see [Sessions](#sessions-fresh-sticky-or-current)), a run is a new session with no memory of your chat. Put everything the agent needs in the prompt, as if briefing a colleague who wasn't in the room.
+- **Runs start from nothing.** Unless you choose otherwise (see [Sessions](#sessions-fresh-sticky-or-current)), a run is a new session with no memory of your chat. Put everything the agent needs in the prompt, written as a brief for a colleague who wasn't there.
 - **Say when to notify.** The agent decides whether to notify you based on what it finds. Tell it what counts: "notify me only if a pipeline is red", "always send the summary".
 - **Pick the agent and permissions.** Nobody is there to approve a permission prompt, so a run that hits one stalls until its timeout. Point unattended automations at an agent whose rules fit the job.
 
@@ -83,36 +83,36 @@ A few things to know when writing the prompt:
 | `every 30m`, `every 2h` | a fixed interval |
 | `2026-12-01T09:00` | once, at that time |
 
-Cron schedules respect daylight-saving changes in their timezone. If opencode wasn't running when an automation was due (laptop closed), the missed run fires at the next start, unless you turn that off for the job.
+Cron schedules follow daylight-saving changes in their timezone. If opencode wasn't running when an automation was due (laptop closed), the missed run fires at the next start, unless you turn that off for the job.
 
 ## Notifications
 
-Notifications are sent by the server side of the plugin, so they work with no opencode window open. Destinations are set under `notify` in the plugin options (see [Configuration](#configuration)).
+The server side of the plugin sends notifications, so they work with no opencode window open. Destinations are set under `notify` in the plugin options (see [Configuration](#configuration)).
 
 **What you receive.** The agent running the automation writes the notification itself: a title and a short, plain-text message with the most important thing first, since a lock screen only shows the first lines. It sends at most 5 per run by default. If a run finds nothing worth your attention, it stays quiet.
 
-**What you always receive.** When a run fails or times out, you get a notice automatically, even if the agent never got to say anything. Per automation you can turn notifications off entirely or change which outcomes get the automatic notice.
+**What you always receive.** When a run fails or times out, you get a notice automatically, even if the agent never got to say anything. Per automation, you can turn notifications off entirely or change which outcomes get the automatic notice.
 
-The dialog also shows a toast when a run finishes, if you happen to have opencode open.
+The dialog also shows a toast when a run finishes, if opencode is open.
 
 ## Sessions: fresh, sticky or current
 
 Each automation picks where its runs happen:
 
-- **`new`** (default): every run is a fresh session. Simple and predictable; runs appear in your session list as `⏰ name · time`.
-- **`sticky`**: runs share one conversation, so the agent builds on what earlier runs found instead of redoing their work, and doesn't repeat what it already told you. Good for "report only what changed" automations and for following an incident over several runs.
+- **`new`** (default): every run is a fresh session. Simple and predictable. Runs appear in your session list as `⏰ name · time`.
+- **`sticky`**: runs share one conversation. The agent builds on what earlier runs found instead of redoing their work, and it doesn't repeat what it already told you. Good for "report only what changed" automations and for following an incident over several runs.
 - **`current`**: runs are queued into the chat you created the automation from. Only available when creating from chat.
 
-**How sticky sessions stay cheap.** Re-sending a long conversation to the model on every run would cost a lot, and providers only keep it cached for a few minutes. So each sticky run ends by writing a short memory, the result of this run for the next one, and the plugin picks the cheapest way to continue:
+**How sticky sessions stay cheap.** Re-sending a long conversation to the model on every run would cost a lot, and providers keep the cache for only a few minutes. So each sticky run ends by writing a short memory of what it found, for the next run to read. The plugin then picks the cheapest way to continue:
 
 - If the previous run ended recently enough that the model's cache is still warm, the next run continues the conversation as is.
 - Otherwise the conversation is compacted down to that memory first, so the model reads a few hundred characters instead of every earlier run. The session stays one entry in your list, with its whole history still viewable.
 
-You don't have to do anything for this: the agent is told how to keep its memory, and reminded once if it forgets.
+You don't need to do anything for this. The agent is told how to keep its memory and is reminded once if it forgets.
 
 ## Channels: run on events
 
-A channel is something to watch: an HTTP API the plugin polls every so often, turning new items into events. Automations attached to a channel run when events arrive. Polling means nothing has to reach your machine from outside, so it works on a laptop behind a firewall.
+A channel watches an HTTP API. The plugin polls the API on a fixed interval and turns new items into events. Automations attached to a channel run when events arrive. Polling means nothing has to reach your machine from outside, so it works on a laptop behind a firewall.
 
 ```
 Datadog API ──poll every 1m──▶ new alerts ──▶ "alert-triage"  (runs as alerts arrive, one session per monitor)
@@ -125,20 +125,20 @@ Datadog API ──poll every 1m──▶ new alerts ──▶ "alert-triage"  (r
 /channel alert me about Datadog monitors for my-team
 ```
 
-The agent walks through it with you: it reuses a channel if one already watches what you need, finds the API endpoint (from docs, an example you paste, or a connected tool), saves the channel, polls it once to check that the request and mapping work, fixes it if they don't, and asks what you want done with the events. Channels can also be defined in configuration; see the Datadog example in `examples/opencode.jsonc`.
+The agent walks you through it. It reuses a channel if one already watches what you need. It finds the API endpoint from docs, an example you paste, or a connected tool, and saves the channel. It polls once to check that the request and mapping work, fixes them if they don't, and asks what you want done with the events. Channels can also be defined in configuration. See the Datadog example in `examples/opencode.jsonc`.
 
-**Your API keys never go in the chat.** Channel definitions reference secrets as `{env:NAME}`, e.g. `"DD-API-KEY": "{env:DD_API_KEY}"`, and the plugin refuses a definition with a written-out credential. Set the variables where opencode runs; the agent tells you which ones are missing.
+**Your API keys never go in the chat.** Channel definitions reference secrets as `{env:NAME}`, e.g. `"DD-API-KEY": "{env:DD_API_KEY}"`. The plugin refuses a definition with a written-out credential. Set the variables where opencode runs. The agent tells you which ones are missing.
 
 **Two ways to react**
 
 - **As events arrive.** An automation with a channel and no schedule runs each time something new comes in, with up to 10 events per run. With a sticky session and a per-item key (one per monitor, one per issue), a flapping alert stays in a single conversation with its history and memory.
-- **As a digest.** An automation with a channel *and* a schedule collects events and runs on schedule with everything since the last run (up to 50). Nothing new, no run.
+- **As a digest.** An automation with a channel *and* a schedule collects events and runs on schedule with everything since the last run (up to 50). If nothing is new, nothing runs.
 
-One channel can feed several automations, and one automation can listen to several channels. The first time an automation is attached to a channel it receives everything currently there (what's alerting right now), then only new items. Paused automations keep their events for when they resume.
+One channel can feed several automations, and one automation can listen to several channels. The first time an automation is attached to a channel, it receives everything currently there (what's alerting right now). After that it receives only new items. Paused automations keep their events for when they resume.
 
-**Watching channels.** The **c** key in `/automations` shows each channel's status: polling or failing, what it polls and how often, the last poll and error, and which automations it feeds with how many events waiting. If a channel fails three polls in a row (expired key, API down) you get one notification.
+**Watching channels.** The `c` key in `/automations` shows each channel's status: polling or failing, what it polls and how often, the last poll and error, and which automations it feeds with how many events waiting. If a channel fails three polls in a row (expired key, API down), you get one notification.
 
-**A note on trust.** Whatever is in the polled system ends up in the prompt: an alert's message, an issue's title. The plugin marks it as data, not instructions, but someone who can write into that system can still try to steer the agent. Use an agent whose permissions fit unattended work on untrusted input.
+**A note on trust.** Whatever is in the polled system ends up in the prompt, such as an alert's message or an issue's title. The plugin marks that text as data, not instructions. Someone who can write into that system can still try to steer the agent, though. Use an agent whose permissions suit unattended work on untrusted input.
 
 ## Configuration
 
@@ -172,7 +172,7 @@ Automations created from chat or the dialog need no configuration at all. The op
 }
 ```
 
-Configuration reloads on save; `/reload` if opencode is already open. `examples/opencode.jsonc` has a fuller example with sticky sessions, a Datadog channel and the automations on it.
+Configuration reloads on save. Run `/reload` if opencode is already open. `examples/opencode.jsonc` has a fuller example with sticky sessions, a Datadog channel and the automations on it.
 
 **Plugin options**
 
@@ -192,7 +192,7 @@ Configuration reloads on save; `/reload` if opencode is already open. `examples/
 | Field | |
 |---|---|
 | `id`, `prompt` | Required |
-| `cron`, `every`, `at`, `tz` | The schedule; one of the first three, or none for an event-only automation |
+| `cron`, `every`, `at`, `tz` | The schedule. Use one of the first three, or none for an event-only automation |
 | `on` | `{ "channels": ["datadog"] }` to run on a channel's events |
 | `directory` | Working directory for the run. Required in config, since the server isn't in your project |
 | `session` | `new` (default) or `sticky` |
@@ -202,7 +202,7 @@ Configuration reloads on save; `/reload` if opencode is already open. `examples/
 | `notify` | `false` for silence; an array of outcomes for that automation's automatic notices |
 | `enabled` | `false` pauses it |
 
-Automations from config can be paused and run from the dialog but not edited there; their definition lives in the file.
+Automations from config can be paused and run from the dialog but not edited there. Their definition lives in the file.
 
 ## Where things are stored
 
@@ -212,13 +212,13 @@ Automations from config can be paused and run from the dialog but not edited the
 - `history.jsonl`: every run, with its outcome, session and how many notifications it sent. What a run said stays in its session. `automation_history` and the dialog read from it
 - `channels.json`: channels created from chat, which items have been seen, and events waiting for each automation
 
-Problems the server part runs into (a poll that fails, state it can't save, a notification that isn't delivered) are logged to opencode's stderr as JSON lines, one per problem, with the automation or channel they concern. Set `AUTOMATIONS_LOG_LEVEL` where the opencode server runs to change what is logged (`warn`, `error`, `silent`; default `info`).
+The server part logs problems to opencode's stderr as JSON lines, one per problem, with the automation or channel it concerns. Problems include a poll that fails, state it can't save, and a notification that isn't delivered. Set `AUTOMATIONS_LOG_LEVEL` where the opencode server runs to change what is logged (`warn`, `error`, `silent`; default `info`).
 
 ## Under the hood
 
-Two parts ship in one package. A **server** part runs inside opencode's background server: it keeps time, starts runs, polls channels, follows each run to its end and sends notifications. A **TUI** part runs in each opencode window: the `/automations` dialog and the sidebar. Only the server ever starts a run, so with several windows open you still get exactly one run per schedule and one shared history.
+Two parts ship in one package. A **server** part runs inside opencode's background server: it keeps time, starts runs, polls channels, follows each run to its end and sends notifications. A **TUI** part runs in each opencode window: the `/automations` dialog and the sidebar. Only the server starts a run, so with several windows open you still get exactly one run per schedule and one shared history.
 
-Automations are ordinary opencode sessions, so anything your agents can do in chat they can do in a run. The agent gets a handful of extra tools (`automation_*`, `channel_*`) and short guidance on notifying and remembering; the `/automation` and `/channel` commands hand it that guidance up front.
+Automations are ordinary opencode sessions, so anything your agents can do in chat, they can do in a run. The agent gets a few extra tools (`automation_*`, `channel_*`) and short guidance on notifying and remembering. The `/automation` and `/channel` commands hand it that guidance up front.
 
 ## Developing
 
@@ -228,6 +228,6 @@ bun test
 bun run typecheck
 ```
 
-To run opencode against your checkout, open it in this directory: the included `opencode.jsonc` loads the plugin from `./`. Don't keep the Git-installed copy active at the same time; opencode refuses two plugins with the same id, and the global one wins, so your local changes wouldn't load. If you pin the global install to your branch instead (`#my-branch`), push before testing.
+To run opencode against your checkout, open it in this directory. The included `opencode.jsonc` loads the plugin from `./`. Don't keep the Git-installed copy active at the same time. opencode refuses two plugins with the same id, and the global one wins, so your local changes wouldn't load. If you pin the global install to your branch instead (`#my-branch`), push before testing.
 
 After changing `tui.tsx`, run `bun run compile` and commit the regenerated `tui.js`. See `AGENTS.md` for why.
