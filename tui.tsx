@@ -1,22 +1,17 @@
 // opencode v2 TUI plugin for automations.
-//
 // Reads the same jobs.json / history.jsonl the server plugin writes, and writes *intents*
 // back (pause, edit, delete, run-now). The server leader executes them on its next tick,
 // so there is still exactly one firer and one run history.
-//
-//  - /automations (or the palette) opens a large dialog over the current screen: job list, full config, recent runs, actions.
-//    `c` switches to the channels tab: each channel's poll status, mapping, and the automations it feeds.
-//  - The session sidebar shows upcoming jobs, and flags sessions created by an automation run.
-//  - Finished runs raise a toast, plus an OS notification when the terminal isn't focused.
 
 import type { Renderable, RGBA } from "@opentui/core"
 import { Plugin } from "@opencode/plugin/tui"
 import { watch, type FSWatcher } from "node:fs"
 import { createMemo, createSignal, For, Index, Show, type JSX } from "solid-js"
 import { describe, nextRun } from "./cron.ts"
-import { defaultDataDir, isActive, listens, mutateRaw, parseScheduleText, relative, runnable, uniqueID } from "./jobs.ts"
+import { DEFAULT_TIMEOUT_MINUTES, defaultDataDir, isActive, listens, newJob, parseScheduleText, runnable, runningJobs, stateOf } from "./jobs.ts"
+import { clock, elapsed, errorMessage, plural, relative } from "./util.ts"
 import { Store, type Job, type Run, type RunStatus, type SessionMode } from "./store.ts"
-import { emptyChannels, removeChannel, requestPoll, summarize, type ChannelEvent, type ChannelsState, type ChannelSummary } from "./channels.ts"
+import { channelRows, emptyChannels, removeChannel, requestPoll, type ChannelEvent, type ChannelRow, type ChannelsState } from "./channels.ts"
 
 type Context = Plugin.Context
 
@@ -37,9 +32,7 @@ function look(ctx: Context, surface?: "dialog") {
     warn: t.text.feedback.warning.base,
     bad: t.text.feedback.error.base,
     info: t.text.feedback.info.base,
-    /** Neutral raised block (list, sidebar). */
     panel: t.background.raised.base,
-    /** Slightly higher block, for key caps. */
     cap: t.background.raised.high,
     /** Softly tinted block background for section i. */
     tint: (i: number) => hue(i)[dark ? 900 : 100],
@@ -69,28 +62,8 @@ const channelHints: [string, string][] = [
   ["esc", "close"],
 ]
 
-export interface ChannelRow extends ChannelSummary {
-  id: string
-  source: "config" | "created"
-}
-
-/** Config channels (as the server published them) and channels created from chat, by ID. */
-export function channelRows(s: ChannelsState): ChannelRow[] {
-  const rows: ChannelRow[] = Object.entries(s.config).map(([id, sum]) => ({ id, source: "config", ...sum }))
-  for (const [id, def] of Object.entries(s.defs)) {
-    if (!s.config[id]) rows.push({ id, source: "created", ...summarize({ ...def, id }) })
-  }
-  return rows.sort((a, b) => a.id.localeCompare(b.id))
-}
-
 /** The TUI waits only briefly for the channels lock (the server may hold it), so the screen never freezes for long. */
 const LOCK_WAIT_MS = 200
-const stateOf = (j: Job) => (j.done ? "done" : j.paused ? "paused" : !j.enabled ? "disabled" : "active")
-const firstLine = (s?: string) => (s ?? "").split("\n").find((l) => l.trim()) ?? ""
-const duration = (r: Run) => (r.endedAt ? `${Math.max(1, Math.round((r.endedAt - r.startedAt) / 1000))}s` : "")
-const clock = (t?: number) =>
-  t ? new Date(t).toLocaleString(undefined, { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }) : "—"
-
 export function createState(ctx: Context, dataDir: string) {
   const store = new Store(dataDir)
   const [jobs, setJobs] = createSignal<Job[]>(store.loadJobs())
@@ -107,9 +80,13 @@ export function createState(ctx: Context, dataDir: string) {
   const seen = new Set(runs().filter((r) => r.status !== "running").map((r) => r.runID))
 
   function refresh() {
-    setJobs(store.loadJobs())
+    let next: Run[]
+    // Runs from a timer and the file watcher: a file that can't be read now keeps what is shown.
+    try {
+      setJobs(store.loadJobs())
+      next = store.history(undefined, 300)
+    } catch { return }
     setChannels(loadChannels())
-    const next = store.history(undefined, 300)
     setRuns(next)
     setNow(Date.now())
     for (const r of next) {
@@ -118,7 +95,7 @@ export function createState(ctx: Context, dataDir: string) {
       if (r.status === "skipped") continue
       const job = jobs().find((j) => j.id === r.jobID)
       const title = `⏰ ${job?.name ?? r.jobID} ${r.status}`
-      const message = r.error ?? (firstLine(r.output).slice(0, 140) || duration(r))
+      const message = r.error ?? elapsed(r)
       ctx.ui.toast.show({ title, message, variant: r.status === "succeeded" ? "success" : "error", duration: 6000 })
       if (notifyMode !== "off") {
         void ctx.attention
@@ -128,25 +105,17 @@ export function createState(ctx: Context, dataDir: string) {
     }
   }
 
-  /** Write an intent and re-read. Resolves to an error message instead of throwing (callers toast it). */
-  async function act(fn: (jobs: Job[]) => void | Promise<void>): Promise<string | undefined> {
+  /** Do a write and re-read. Resolves to an error message instead of throwing (callers toast it). */
+  async function attempt(write: () => Promise<unknown>): Promise<string | undefined> {
     try {
-      await mutateRaw(store, fn)
+      await write()
       refresh()
     } catch (e) {
-      return (e as Error).message
+      return errorMessage(e)
     }
   }
-
-  /** Write channel state (a poll intent, a delete) and re-read. Resolves to an error message instead of throwing. */
-  async function actChannels(fn: (s: ChannelsState) => void): Promise<string | undefined> {
-    try {
-      await store.mutateChannels(fn, LOCK_WAIT_MS)
-      refresh()
-    } catch (e) {
-      return (e as Error).message
-    }
-  }
+  const act = (fn: (jobs: Job[]) => void | Promise<void>) => attempt(() => store.mutate(fn))
+  const actChannels = (fn: (s: ChannelsState) => void) => attempt(() => store.mutateChannels(fn, LOCK_WAIT_MS))
 
   return { store, jobs, runs, now, refresh, act, selectedID, setSelectedID, channels, actChannels, selectedChannel, setSelectedChannel, tab, setTab }
 }
@@ -185,7 +154,7 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
     const next = chRows()[Math.max(0, Math.min(chRows().length - 1, chIndex() + d))]
     if (next) state.setSelectedChannel(next.id)
   }
-  const running = createMemo(() => new Set(state.runs().filter((r) => r.status === "running").map((r) => r.jobID)))
+  const running = createMemo(() => runningJobs(state.jobs(), state.runs(), state.now()))
 
   /** Toast an error message; also takes the promise act() returns, and resolves once it has settled. */
   const toastErr = async (msg?: string | Promise<string | undefined>) => {
@@ -251,7 +220,6 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
       }))
     }),
   }
-  /** Keys that only mean something on one tab. */
   const jobsOnly = (fn: () => unknown) => () => (onChannels() ? undefined : fn())
   const channelsOnly = (fn: () => unknown) => () => (onChannels() ? fn() : undefined)
   const step = (d: number) => (onChannels() ? moveChannel(d) : move(d))
@@ -339,7 +307,7 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
       try {
         schedule = parseScheduleText(when)
       } catch (e) {
-        return toastErr((e as Error).message)
+        return toastErr(errorMessage(e))
       }
       const session = await ctx.ui.dialog.select<SessionMode>({
         title: "Session",
@@ -352,21 +320,7 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
       const directory = ctx.location?.directory ?? process.cwd()
       await toastErr(
         state.act((jobs) => {
-          const now = Date.now()
-          jobs.push({
-            id: uniqueID(jobs, name),
-            name: name.trim(),
-            prompt: prompt.trim(),
-            schedule,
-            directory,
-            session,
-            timeoutMinutes: 30,
-            runMissed: true,
-            enabled: true,
-            source: "tool",
-            createdAt: now,
-            nextRunAt: nextRun(schedule, now, now),
-          })
+          jobs.push(newJob(jobs, { name: name.trim(), prompt: prompt.trim(), schedule, directory, session, timeoutMinutes: DEFAULT_TIMEOUT_MINUTES }))
         }),
       )
     }),
@@ -440,6 +394,27 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
       {p.children}
     </box>
   )
+  /** One line of the jobs or channels list: status dot, name, and when it next happens. */
+  const Row = (p: { selected: boolean; dot: string; dotFg: RGBA; name: string; when: string }) => {
+    const fg = () => (p.selected ? t.text.action.primary.focused : undefined)
+    return (
+      <box
+        flexDirection="row"
+        justifyContent="space-between"
+        paddingLeft={2}
+        paddingRight={2}
+        backgroundColor={p.selected ? t.background.action.primary.focused : undefined}
+      >
+        {/* The dot is its own <text>: opencode doesn't repaint a <span> whose color changes but whose
+            text doesn't, which left the green dot on the previously selected row. */}
+        <box flexDirection="row" gap={1}>
+          <text fg={p.dotFg}>{p.dot}</text>
+          <text fg={fg() ?? L().text}>{p.name.slice(0, 22)}</text>
+        </box>
+        <text fg={fg() ?? L().muted}>{p.when}</text>
+      </box>
+    )
+  }
   const Field = (p: { label: string; value: string; fg?: RGBA }) => (
     <text>
       <span style={{ fg: L().muted }}>{p.label.padEnd(11)}</span>
@@ -477,13 +452,13 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
                 when={onChannels()}
                 fallback={
                   <text fg={L().muted}>
-                    {state.jobs().length} {state.jobs().length === 1 ? "job" : "jobs"} · {activeCount()} active ·{" "}
+                    {plural(state.jobs().length, "job")} · {activeCount()} active ·{" "}
                     <span style={{ fg: running().size ? L().warn : L().muted }}>{running().size} running</span>
                   </text>
                 }
               >
                 <text fg={L().muted}>
-                  {chRows().length} {chRows().length === 1 ? "channel" : "channels"} ·{" "}
+                  {plural(chRows().length, "channel")} ·{" "}
                   {chRows().filter((c) => chStatus(c) !== "idle").length} polled ·{" "}
                   <span style={{ fg: chRows().some((c) => chStatus(c) === "failing") ? L().bad : L().muted }}>
                     {chRows().filter((c) => chStatus(c) === "failing").length} failing
@@ -516,22 +491,7 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
                         const status = () => chStatus(c())
                         const src = () => state.channels().sources[c().id]
                         const when = () => (status() === "idle" ? "idle" : src()?.lastPollAt ? relative(src()!.lastPollAt, state.now()) : "soon")
-                        const fg = () => (isSel() ? t.text.action.primary.focused : undefined)
-                        return (
-                          <box
-                            flexDirection="row"
-                            justifyContent="space-between"
-                            paddingLeft={2}
-                            paddingRight={2}
-                            backgroundColor={isSel() ? t.background.action.primary.focused : undefined}
-                          >
-                            <box flexDirection="row" gap={1}>
-                              <text fg={statusLook(status()).fg}>{statusLook(status()).dot}</text>
-                              <text fg={fg() ?? L().text}>{c().name.slice(0, 22)}</text>
-                            </box>
-                            <text fg={fg() ?? L().muted}>{when()}</text>
-                          </box>
-                        )
+                        return <Row selected={isSel()} dot={statusLook(status()).dot} dotFg={statusLook(status()).fg} name={c().name} when={when()} />
                       }}
                     </Index>
                   </box>
@@ -540,7 +500,6 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
                     {(c) => {
                       const src = () => state.channels().sources[c().id]
                       const users = () => listeners(c().id)
-                      // Each listener's waiting events from this channel, filtered once per refresh.
                       const waiting = createMemo(() => {
                         const out = new Map<string, ChannelEvent[]>()
                         for (const j of users()) out.set(j.id, state.channels().queues[j.id]?.pending.filter((e) => e.channel === c().id) ?? [])
@@ -634,7 +593,6 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
             >
               {/* flexBasis/minHeight 0: a tall detail pane scrolls instead of squeezing the header and hints. */}
               <box flexDirection="row" flexGrow={1} flexShrink={1} flexBasis={0} minHeight={0} gap={2}>
-                {/* list */}
                 <box flexDirection="column" width={38} backgroundColor={L().panel} paddingTop={1} paddingBottom={1}>
                   <box paddingLeft={2} paddingBottom={1}>
                     <text fg={L().muted}>
@@ -646,29 +604,12 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
                       const isSel = () => i() === index()
                       const dot = () => (running().has(j.id) ? "◐" : isActive(j) ? "●" : "○")
                       const when = () => (running().has(j.id) ? "running" : isActive(j) ? relative(j.nextRunAt, state.now()) : stateOf(j))
-                      const fg = () => (isSel() ? t.text.action.primary.focused : undefined)
-                      return (
-                        <box
-                          flexDirection="row"
-                          justifyContent="space-between"
-                          paddingLeft={2}
-                          paddingRight={2}
-                          backgroundColor={isSel() ? t.background.action.primary.focused : undefined}
-                        >
-                          {/* The dot is its own <text>: opencode doesn't repaint a <span> whose color changes but whose
-                              text doesn't, which left the green dot on the previously selected row. */}
-                          <box flexDirection="row" gap={1}>
-                            <text fg={isSel() ? L().ok : running().has(j.id) ? L().warn : L().muted}>{dot()}</text>
-                            <text fg={fg() ?? L().text}>{j.name.slice(0, 22)}</text>
-                          </box>
-                          <text fg={fg() ?? L().muted}>{when()}</text>
-                        </box>
-                      )
+                      const dotFg = () => (isSel() ? L().ok : running().has(j.id) ? L().warn : L().muted)
+                      return <Row selected={isSel()} dot={dot()} dotFg={dotFg()} name={j.name} when={when()} />
                     }}
                   </For>
                 </box>
 
-                {/* detail */}
                 <Show when={selected()}>
                   {(j) => (
                     <scrollbox flexGrow={1} minHeight={0}>
@@ -717,11 +658,11 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
                                       <span style={{ fg: statusColor(r.status) }}>{glyph[r.status]}</span> {clock(r.startedAt)}
                                       <span style={{ fg: L().muted }}>
                                         {"  "}
-                                        {r.status} {duration(r)}
+                                        {r.status} {elapsed(r)}
                                       </span>
                                     </text>
-                                    <Show when={r.error ?? firstLine(r.output)}>
-                                      {(line) => <text fg={r.error ? L().bad : L().muted}>{"  " + line().slice(0, 100)}</text>}
+                                    <Show when={r.error}>
+                                      {(error) => <text fg={L().bad}>{"  " + error().slice(0, 100)}</text>}
                                     </Show>
                                   </box>
                                 )}

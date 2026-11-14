@@ -1,13 +1,13 @@
 // Notifications, sent from the server plugin so they work with no TUI open.
 // Channels: native desktop notifications (macOS/Linux) and Pushover.
-//
 // During a run, the agent decides what to send with the automation_notify tool.
 // The plugin itself only sends a notice when a run fails or times out (`on`);
 // a successful run is never notified automatically.
-// Failures are logged and never affect the run.
 
 import { spawn } from "node:child_process"
 import type { Job, Run, RunStatus } from "./store.ts"
+import { log } from "./log.ts"
+import { elapsed, httpError, type Fetch } from "./util.ts"
 
 export interface NotifyConfig {
   /** Run outcomes that get an automatic notice. Default: failed, timeout. Successful runs never do. */
@@ -34,7 +34,7 @@ export interface Message {
 }
 
 export interface Deps {
-  fetch: (input: string, init?: RequestInit) => Promise<Response>
+  fetch: Fetch
   exec: (command: string, args: string[]) => Promise<void>
   platform: NodeJS.Platform
 }
@@ -59,7 +59,6 @@ export function canNotify(cfg: NotifyConfig | undefined, job: Job): cfg is Notif
   return !!cfg && job.notify !== false && !!(cfg.native || cfg.pushover)
 }
 
-/** Whether a finished run gets an automatic notice. */
 export function shouldNotify(cfg: NotifyConfig | undefined, job: Job, status: RunStatus) {
   // On success the agent notifies if something needs it; silence means nothing did.
   if (status === "succeeded" || !canNotify(cfg, job)) return false
@@ -67,21 +66,16 @@ export function shouldNotify(cfg: NotifyConfig | undefined, job: Job, status: Ru
   return on.includes(status)
 }
 
-const duration = (run: Run) => {
-  const secs = run.endedAt ? Math.max(1, Math.round((run.endedAt - run.startedAt) / 1000)) : 0
-  return secs >= 60 ? `${Math.round(secs / 60)}m` : `${secs}s`
-}
-
 /** The automatic end-of-run notice. Agent output is not included: the agent notifies itself. */
 export function compose(job: Job, run: Run): Message {
   const error = run.error?.trim()
   switch (run.status) {
     case "failed":
-      return { title: `${job.name} failed`, body: error || `Failed after ${duration(run)}.`, priority: "high" }
+      return { title: `${job.name} failed`, body: error || `Failed after ${elapsed(run)}.`, priority: "high" }
     case "timeout":
-      return { title: `${job.name} timed out`, body: error ? `Stopped: ${error}.` : `Stopped after ${duration(run)}.`, priority: "high" }
+      return { title: `${job.name} timed out`, body: error ? `Stopped: ${error}.` : `Stopped after ${elapsed(run)}.`, priority: "high" }
     default:
-      return { title: `${job.name} ${run.status}`, body: error || `After ${duration(run)}.`, priority: "normal" }
+      return { title: `${job.name} ${run.status}`, body: error || `After ${elapsed(run)}.`, priority: "normal" }
   }
 }
 
@@ -109,14 +103,11 @@ function line(src: string, style: Style): string {
   if (heading) s = bold(heading[1].replace(/\*\*/g, ""))
   // Bullets: the lock screen has no list rendering.
   s = s.replace(/^(\s*)[-*+]\s+/, (_, indent: string) => `${indent.length >= 2 ? "  " : ""}• `)
-  // Quote markers.
   s = s.replace(/^\s*(&gt;|>)\s?/, "")
-  // Links.
   s = s.replace(/\[([^\]]+)\]\((\S+?)\)/g, (_, t: string, u: string) => (html ? `<a href="${u.replace(/"/g, "&quot;")}">${t}</a>` : `${t} (${u})`))
   // **bold** / __bold__ (not snake_case or lone asterisks).
   s = s.replace(/\*\*(?=\S)(.+?)(?<=\S)\*\*/g, (_, t: string) => bold(t))
   s = s.replace(/(^|[^\w])__(?=\S)(.+?)(?<=\S)__(?!\w)/g, (_, p: string, t: string) => p + bold(t))
-  // Inline code: just the text.
   s = s.replace(/`([^`]+)`/g, "$1")
   // Leftover unpaired markers (e.g. a bold phrase split across parts).
   return s.replace(/\*\*/g, "")
@@ -143,7 +134,6 @@ export function format(text: string, style: Style): string {
 /** Longest a line may run, links aside, before it reads as a wall of text on a phone. */
 export const MAX_LINE = 200
 
-/** The first line too long to read at a glance (links don't count), or undefined. */
 export function longLine(text: string): string | undefined {
   return format(text, "plain").split("\n").find((l) => l.replace(/\bhttps?:\/\/\S+/g, "").trim().length > MAX_LINE)
 }
@@ -227,14 +217,13 @@ export function pushoverParts(m: Message): Array<Record<string, string | number>
 // ---------- delivery ----------
 
 const ok = async (r: Response) => {
-  if (!r.ok) throw new Error(`HTTP ${r.status}${await r.text().then((t) => (t ? `: ${t.slice(0, 200)}` : ""), () => "")}`)
+  if (!r.ok) throw httpError(r.status, await r.text().catch(() => ""))
 }
 const timeout = () => AbortSignal.timeout(10_000)
 
 export interface Delivery {
   /** Channels that delivered, e.g. "pushover (2 messages)". */
   sent: string[]
-  /** Channels that failed. */
   failed: string[]
 }
 
@@ -299,7 +288,7 @@ export async function send(cfg: NotifyConfig, m: Message, deps: Deps = defaultDe
     if (r.status === "fulfilled") out.sent.push(r.value ? `${name} (${r.value})` : name)
     else {
       out.failed.push(name)
-      console.error(`[automations] notify via ${name} failed:`, (r.reason as Error)?.message ?? r.reason)
+      log.error({ via: name, err: r.reason }, "notification failed")
     }
   })
   return out

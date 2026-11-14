@@ -20,6 +20,7 @@
   "dependencies": {
     "@opencode/plugin": "2.2.1",
     "cron-parser": "5.10.2",
+    "pino": "10.4.0",
     "proper-lockfile": "4.1.2"
   },
   "peerDependencies": {

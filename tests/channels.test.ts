@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test"
 import {
-  arrayPaths, envNames, fieldPaths, literalSecrets, requeue,
+  envNames, literalSecrets, requeue,
   assign, chunks, composeEvents, emptyQueue, emptySource, enqueue, extract, get, ingest, MAX_QUEUE, parseChannel, poll,
   render, touch, withEnv,
   type ChannelConfig,
@@ -120,7 +120,6 @@ test("eviction goes by age even for numeric keys, which objects sort first", () 
 })
 
 test("trimming seen IDs never forgets one still in the response", () => {
-  const ch = parseChannel(base)
   const source = emptySource()
   const ev = (id: string) => ({ channel: "dd", id, title: id })
   ingest(source, [ev("still-alerting")])
@@ -173,18 +172,6 @@ test("secrets must be {env:NAME} references in headers, query parameters and bod
 
 test("env references are listed with the ones not set", () => {
   expect(envNames({ url: "https://x.test/?k={env:A}", headers: { h: "{env:B}" } }, { A: "1" })).toEqual({ names: ["A", "B"], missing: ["B"] })
-})
-
-test("field paths and array paths help write templates", () => {
-  const item = { id: 1, tags: ["a", "b"], state: { name: "Alert", since: "2026-11-09" }, message: "x".repeat(100) }
-  const paths = fieldPaths(item)
-  expect(paths).toContain("id: 1")
-  expect(paths).toContain('state.name: "Alert"')
-  expect(paths).toContain("tags: [2 items]")
-  expect(paths).toContain('tags.0: "a"')
-  expect(paths.find((p) => p.startsWith("message"))!.endsWith("…")).toBe(true)
-  expect(arrayPaths({ meta: {}, data: { items: [] }, list: [1] })).toEqual(["data.items", "list"])
-  expect(arrayPaths([1])).toEqual(["(response)"])
 })
 
 test("putting events back into a full queue drops the oldest, like adding does", () => {

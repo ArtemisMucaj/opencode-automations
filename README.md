@@ -132,7 +132,7 @@ Datadog API ──poll every 1m──▶ new alerts ──▶ "alert-triage"  (r
 /channel alert me about Datadog monitors for my-team
 ```
 
-The agent walks through it with you: it reuses a channel if one already watches what you need, finds the API endpoint (from docs, an example you paste, or a connected tool), dry-runs the request and shows you the first events as an automation would see them, adjusts until they look right, then saves the channel and asks what you want done with the events. Channels can also be defined in configuration; see the Datadog example in `examples/opencode.jsonc`.
+The agent walks through it with you: it reuses a channel if one already watches what you need, finds the API endpoint (from docs, an example you paste, or a connected tool), saves the channel, polls it once to check that the request and mapping work, fixes it if they don't, and asks what you want done with the events. Channels can also be defined in configuration; see the Datadog example in `examples/opencode.jsonc`.
 
 **Your API keys never go in the chat.** Channel definitions reference secrets as `{env:NAME}`, e.g. `"DD-API-KEY": "{env:DD_API_KEY}"`, and the plugin refuses a definition with a written-out credential. Set the variables where opencode runs; the agent tells you which ones are missing.
 
@@ -216,8 +216,10 @@ Automations from config can be paused and run from the dialog but not edited the
 `~/.local/share/opencode/plugins/automations/` (or under `$XDG_DATA_HOME`):
 
 - `jobs.json`: automations created from chat or the dialog, plus the state of config ones (paused, last run, sticky session and memory)
-- `history.jsonl`: every run, with its outcome, output and how many notifications it sent. `automation_history` and the dialog read from it
+- `history.jsonl`: every run, with its outcome, session and how many notifications it sent. What a run said stays in its session. `automation_history` and the dialog read from it
 - `channels.json`: channels created from chat, which items have been seen, and events waiting for each automation
+
+Problems the server part runs into (a poll that fails, state it can't save, a notification that isn't delivered) are logged to opencode's stderr as JSON lines, one per problem, with the automation or channel they concern. Set `AUTOMATIONS_LOG_LEVEL` where the opencode server runs to change what is logged (`warn`, `error`, `silent`; default `info`).
 
 ## Under the hood
 
