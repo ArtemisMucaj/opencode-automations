@@ -5,6 +5,7 @@ import { join } from "node:path"
 import { render } from "@opentui/solid"
 import { createTestRenderer } from "@opentui/core/testing"
 import plugin from "../tui.tsx"
+import { runningJobs } from "../jobs.ts"
 import { Store, type Job } from "../store.ts"
 
 test("TUI renders automations page and persists pause/run-now actions", async () => {
@@ -205,4 +206,12 @@ test("TUI channels tab shows status, mapping and listeners, and queues a poll", 
     await testRenderer.dispose()
     rmSync(dataDir, { recursive: true, force: true })
   }
+})
+
+test("a run left running by a crash stops counting as running once its timeout has passed", () => {
+  const jobs = [{ id: "a", timeoutMinutes: 10 }] as Job[]
+  const run = { jobID: "a", runID: "r", startedAt: 0, status: "running" as const }
+  expect([...runningJobs(jobs, [run], 5 * 60_000)]).toEqual(["a"])
+  expect([...runningJobs(jobs, [run], 12 * 60_000)]).toEqual([])
+  expect([...runningJobs(jobs, [{ ...run, status: "succeeded" }], 60_000)]).toEqual([])
 })

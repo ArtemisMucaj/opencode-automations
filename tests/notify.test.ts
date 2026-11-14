@@ -1,4 +1,5 @@
 import { expect, spyOn, test } from "bun:test"
+import { log } from "../log.ts"
 import { compose, format, longLine, pushoverParts, send, shouldNotify, split, MAX_LINE, PUSHOVER, type Deps, type Message } from "../notify.ts"
 import type { Job, Run } from "../store.ts"
 
@@ -12,6 +13,9 @@ const message: Message = { title: "Morning", body: "All clear", priority: "norma
 
 const noNetwork = async (): Promise<Response> => { throw new Error("unexpected network request") }
 const noExec = async () => { throw new Error("unexpected native notification") }
+
+/** The message of the error given to the first log call. */
+const failure = (spy: { mock: { calls: any[][] } }) => String(spy.mock.calls[0][0].err?.message)
 
 test("removed notification channels never send requests", async () => {
   let requests = 0
@@ -71,7 +75,7 @@ test("native macOS sound options are preserved", async () => {
 })
 
 test("missing Linux backend is reported without blocking Pushover", async () => {
-  const errors = spyOn(console, "error").mockImplementation(() => {})
+  const errors = spyOn(log, "error").mockImplementation(() => {})
   const requests: string[] = []
   try {
     const result = await send({ native: true, pushover: { token: "test-token", user: "test-user" } }, message, {
@@ -81,19 +85,19 @@ test("missing Linux backend is reported without blocking Pushover", async () => 
     })
     expect(result).toEqual({ sent: ["pushover"], failed: ["native"] })
     expect(requests).toEqual(["https://api.pushover.net/1/messages.json"])
-    expect(errors.mock.calls[0][0]).toContain("notify via native failed")
-    expect(errors.mock.calls[0][1]).toContain("ENOENT")
+    expect(errors.mock.calls[0]).toMatchObject([{ via: "native" }, "notification failed"])
+    expect(failure(errors)).toContain("ENOENT")
   } finally { errors.mockRestore() }
 })
 
 test("unsupported native platform reports failure without spawning a process", async () => {
-  const errors = spyOn(console, "error").mockImplementation(() => {})
+  const errors = spyOn(log, "error").mockImplementation(() => {})
   let calls = 0
   try {
     const result = await send({ native: true }, message, { platform: "win32", fetch: noNetwork, exec: async () => { calls++ } })
     expect(result.failed).toEqual(["native"])
     expect(calls).toBe(0)
-    expect(errors.mock.calls[0][1]).toContain("win32")
+    expect(failure(errors)).toContain("win32")
   } finally { errors.mockRestore() }
 })
 
@@ -113,13 +117,13 @@ test("Pushover sends credentials, HTML message, priority and link", async () => 
 })
 
 test("Pushover failures include the response body in the log", async () => {
-  const errors = spyOn(console, "error").mockImplementation(() => {})
+  const errors = spyOn(log, "error").mockImplementation(() => {})
   try {
     const result = await send({ pushover: { token: "t", user: "u" } }, message, {
       platform: "linux", fetch: async () => new Response('{"errors":["user key is invalid"]}', { status: 400 }), exec: noExec,
     })
     expect(result.failed).toEqual(["pushover"])
-    expect(errors.mock.calls[0][1]).toContain("user key is invalid")
+    expect(failure(errors)).toContain("user key is invalid")
   } finally { errors.mockRestore() }
 })
 
@@ -186,8 +190,8 @@ test("automatic notices: failures by default, never for success", () => {
   expect(shouldNotify({}, job, "failed")).toBe(false)
 })
 
-test("compose writes a short notice and never includes the agent's output", () => {
-  expect(compose(job, { ...run, status: "failed", output: "y".repeat(3000) }).body).toBe("Failed after 2s.")
+test("compose writes a short notice", () => {
+  expect(compose(job, { ...run, status: "failed" }).body).toBe("Failed after 2s.")
   expect(compose(job, { ...run, status: "failed", error: "boom" })).toEqual({ title: "Morning failed", body: "boom", priority: "high" })
   expect(compose(job, { ...run, status: "timeout", error: "exceeded 30m" }).body).toBe("Stopped: exceeded 30m.")
 })

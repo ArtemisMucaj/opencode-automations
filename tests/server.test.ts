@@ -1,6 +1,6 @@
 import { afterEach, expect, spyOn, test } from "bun:test"
 import { EventEmitter, on } from "node:events"
-import { mkdtempSync, rmSync } from "node:fs"
+import { mkdtempSync, rmSync, statSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import plugin from "../index.ts"
@@ -83,7 +83,13 @@ async function start(options: Record<string, unknown> = {}, jobs: Job[] = [], se
     hooks.get("context")!(c)
     return { system: c.system.map((p) => p.text).join("\n"), tools: Object.keys(c.tools) }
   }
-  return { store, tools, namespaces, commands, prompts, sessions, compactions, compactMode, removed, events, call, context, dataDir, stop, ctx }
+  /** The summary the plugin's compaction hook would give a compaction of this session now. */
+  const compactionSummary = (sessionID: string) => {
+    const c: any = { sessionID }
+    hooks.get("compaction")?.(c)
+    return c.result?.summary as string | undefined
+  }
+  return { store, tools, namespaces, commands, prompts, sessions, compactions, compactMode, removed, events, call, context, compactionSummary, dataDir, stop, ctx }
 }
 
 function job(overrides: Partial<Job> = {}): Job {
@@ -96,7 +102,7 @@ function job(overrides: Partial<Job> = {}): Job {
 
 test("server loads with current command API and exposes working CRUD tools", async () => {
   const app = await start()
-  expect(app.tools.size).toBe(14)
+  expect(app.tools.size).toBe(13)
   const created = await app.call("automation_create", { name: "Audit", prompt: "Check dependencies", every: "1h" })
   expect(created.content).toContain("Audit")
   expect(app.store.loadJobs()[0].directory).toBe(app.dataDir)
@@ -111,7 +117,7 @@ test("server loads with current command API and exposes working CRUD tools", asy
   expect(app.prompts[0].text).toContain("list")
   expect(app.commands.has("channel")).toBe(true)
   await app.commands.get("channel").execute({ sessionID: "caller", prompt: { text: "datadog alerts" }, delivery: "queue" })
-  expect(app.prompts.at(-1).text).toContain("channel_test")
+  expect(app.prompts.at(-1).text).toContain("channel_create")
   expect(app.prompts.at(-1).text).toContain("Request: datadog alerts")
 })
 
@@ -137,14 +143,14 @@ test("config jobs preserve TUI pause and manual run intent", async () => {
   expect(app.store.loadJobs()[0].paused).toBe(true)
 })
 
-test("one-shot completion survives reload and run output reaches history", async () => {
+test("one-shot completion survives reload; the history keeps the outcome, not what the run said", async () => {
   const app = await start({}, [job({ schedule: { kind: "at", time: Date.now() - 1000 }, nextRunAt: Date.now() - 1000 })])
   expect(app.prompts).toHaveLength(1)
   app.events.emit("event", { type: "session.text.ended", data: { sessionID: "session-1", text: "All clear" } })
   app.events.emit("event", { type: "session.idle", data: { sessionID: "session-1" } })
   await flush()
   expect(app.store.history()[0].status).toBe("succeeded")
-  expect(app.store.history()[0].output).toBe("All clear")
+  expect(app.store.history()[0]).not.toHaveProperty("output")
   expect(app.store.loadJobs()[0].done).toBe(true)
 })
 
@@ -160,7 +166,7 @@ test("V2 execution success completes the run without waiting for legacy idle", a
       location: { directory: app.dataDir }, data: { sessionID: "session-1" },
     })
     await flush()
-    expect(app.store.history()[0]).toMatchObject({ status: "succeeded", output: "Ok\nNothing worth notifying the user about in this run." })
+    expect(app.store.history()[0]).toMatchObject({ status: "succeeded" })
     expect(app.store.loadJobs()[0].lastStatus).toBe("succeeded")
     // A compatibility idle event must not finish the run again.
     app.events.emit("event", { type: "session.idle", data: { sessionID: "session-1" } })
@@ -226,7 +232,7 @@ test("the run's agent sends notifications itself; a successful run then sends no
     app.events.emit("event", { type: "session.idle", data: { sessionID: "session-1" } })
     await new Promise((resolve) => setTimeout(resolve, 80))
     expect(fetch.mock.calls).toHaveLength(1) // the final reply is not sent
-    expect(app.store.history()[0]).toMatchObject({ status: "succeeded", output: "Done, notified.", notifications: 1 })
+    expect(app.store.history()[0]).toMatchObject({ status: "succeeded", notifications: 1 })
     expect((await app.call("automation_history")).content).toContain("1 notified")
   } finally { fetch.mockRestore() }
 })
@@ -277,7 +283,7 @@ test("a run that ends silently without saying why is asked once whether to notif
   app.events.emit("event", { type: "session.execution.succeeded", data: { sessionID: "session-1" } })
   await flush()
   expect(app.prompts).toHaveLength(2)
-  expect(app.store.history()[0]).toMatchObject({ status: "succeeded", output: "MR !12 is blocked." })
+  expect(app.store.history()[0]).toMatchObject({ status: "succeeded" })
 })
 
 test("runs that can't notify are never asked", async () => {
@@ -713,7 +719,7 @@ test("a sticky run that saves no note is asked once, with the notify check in th
   expect(app.prompts[1].text).toContain("automation_memory_update")
   await end(app, "session-1")
   expect(app.prompts).toHaveLength(2)
-  expect(app.store.history()[0]).toMatchObject({ status: "succeeded", output: "MR !12 is blocked." })
+  expect(app.store.history()[0]).toMatchObject({ status: "succeeded" })
 
   // No note was saved, so even a cold session is continued: nothing to start a fresh one from.
   await chill(app.store, "morning")
@@ -833,34 +839,15 @@ const draftChannel = (overrides: Record<string, unknown> = {}) => ({
   ...overrides,
 })
 
-test("channel_test dry-runs a definition: fields, sample events, and nothing saved", async () => {
-  process.env.TEST_DD_KEY = "k"
-  const fetch = api(() => [monitor(1), monitor(2, "t1", "OK")])
-  try {
-    const app = await start()
-    const out = (await app.call("channel_test", draftChannel())).content
-    expect(out).toContain("OK: 2 items, 1 after the filter")
-    expect(out).toContain("Uses TEST_DD_KEY")
-    expect(out).toContain("overall_state_modified: \"t1\"")
-    expect(out).toContain("- id=1:t1 sessionKey=1\n  title: Monitor 1")
-    expect(fetch.mock.calls[0][1]?.headers).toMatchObject({ "DD-API-KEY": "k" })
-    expect(app.store.loadChannels()).toEqual({ sources: {}, queues: {}, defs: {}, config: {} })
-
-    // A wrong items path lists the arrays it could have meant.
-    fetch.mockImplementation((async () => new Response(JSON.stringify({ data: { monitors: [monitor(1)] } }))) as any)
-    expect((await app.call("channel_test", draftChannel())).content).toContain("Arrays in the response: data.monitors")
-  } finally { fetch.mockRestore(); delete process.env.TEST_DD_KEY }
-})
-
-test("channel_test and channel_create refuse secrets written out and say what env is missing", async () => {
+test("channel_create refuses secrets written out and says what env is missing", async () => {
   const fetch = api(() => [])
   try {
     const app = await start()
     const literal = draftChannel({ request: { url: "https://api.dd.test/m?api_key=abc123", headers: { Authorization: "Bearer xyz" } } })
     const refused = (await app.call("channel_create", { id: "dd", ...literal })).content
     expect(refused).toContain("header Authorization, query parameter api_key look like a secret")
-    expect((await app.call("channel_test", literal)).content).toContain("{env:NAME}")
-    expect((await app.call("channel_test", draftChannel())).content).toContain("TEST_DD_KEY is not set")
+    expect(refused).toContain("{env:NAME}")
+    expect((await app.call("channel_create", { id: "dd", ...draftChannel() })).content).toContain("Not set yet in the server's environment: TEST_DD_KEY")
     expect(fetch.mock.calls).toHaveLength(0)
     expect((await app.call("channel_create", { id: "Bad Id", ...draftChannel() })).content).toContain("lowercase")
   } finally { fetch.mockRestore() }
@@ -1056,7 +1043,7 @@ test("every tool goes through code mode, in two namespaces", async () => {
     expect(`${tool.options.namespace}_${tool.name}`).toBe(name) // exposed names stay automation_* / channel_* 
   }
   expect([...app.tools.keys()]).toContain("automation_notify")
-  expect([...app.tools.keys()]).toContain("channel_test")
+  expect([...app.tools.keys()]).not.toContain("channel_test")
 })
 
 // ---------- review fixes: update ordering, pause, sessions, saves ----------
@@ -1185,23 +1172,19 @@ test("runs on events set the last run time; a digest with nothing waiting doesn'
   } finally { fetch.mockRestore() }
 })
 
-test("an automation run can't test, create or change channels, and channel_test hides key values", async () => {
+test("an automation run can't create or change channels", async () => {
   process.env.TEST_DD_KEY = "s3cret-value"
   // An API that echoes the key back.
   const fetch = spyOn(globalThis, "fetch").mockImplementation((async (_: any, init: any) =>
     new Response(JSON.stringify([{ ...monitor(1), echoed: init.headers["DD-API-KEY"] }]))) as any)
   try {
     const app = await start({}, [job()])
-    const out = (await app.call("channel_test", draftChannel({ event: { id: "{id}", title: "{echoed}" } }))).content
-    expect(out).toContain("OK: 1 item")
-    expect(out).not.toContain("s3cret-value")
-    expect(out).toContain("{env:TEST_DD_KEY}")
     expect((await app.call("channel_create", { id: "dd", ...draftChannel() })).content).toContain("Created channel dd")
 
     await app.call("automation_run", { id: "morning" })
     const run = app.prompts[0].sessionID
     const calls = fetch.mock.calls.length
-    for (const [tool, input] of [["channel_test", draftChannel()], ["channel_create", { id: "x", ...draftChannel() }], ["channel_update", { id: "dd", every: "2m" }]] as const) {
+    for (const [tool, input] of [["channel_create", { id: "x", ...draftChannel() }], ["channel_update", { id: "dd", every: "2m" }]] as const) {
       expect((await app.call(tool, input, run)).content).toContain("from inside an automation run")
     }
     expect(fetch.mock.calls.length).toBe(calls)
@@ -1232,4 +1215,124 @@ test("an API that leaves the items out when there is nothing is an empty poll, n
     body = { data: { issues: "nope" } }
     expect((await app.call("channel_poll", { id: "dd" })).content).toContain("is not an array")
   } finally { fetch.mockRestore() }
+})
+
+test("a run the user interrupts ends at once, as failed, instead of waiting for its timeout", async () => {
+  const app = await start({}, [job()])
+  await app.call("automation_run", { id: "morning" })
+  app.events.emit("event", { type: "session.execution.interrupted", data: { sessionID: "session-1" } })
+  await flush()
+  expect(app.store.history()[0]).toMatchObject({ status: "failed", error: "interrupted" })
+  // The job is free again.
+  expect((await app.call("automation_run", { id: "morning" })).content).toContain("running")
+})
+
+test("a config one-shot whose time has passed doesn't stop the plugin from loading, and is done", async () => {
+  const app = await start({ jobs: [{ id: "once", prompt: "Ship it", at: "2020-01-01T09:00:00Z", directory: process.cwd() }] })
+  expect(app.prompts).toEqual([])
+  expect(app.store.loadJobs()[0]).toMatchObject({ id: "once", done: true })
+  // From chat, a past time is still refused.
+  expect((await app.call("automation_create", { name: "Late", prompt: "x", at: "2020-01-01T09:00:00Z" })).content).toContain("in the past")
+})
+
+test("resuming from chat after a long pause doesn't fire a missed run right away", async () => {
+  const app = await start({}, [job({ paused: true, nextRunAt: Date.now() - 3_600_000 })])
+  await app.call("automation_update", { id: "morning", enabled: true })
+  const saved = app.store.loadJobs()[0]
+  expect(saved.paused).toBe(false)
+  expect(saved.nextRunAt).toBeGreaterThan(Date.now())
+})
+
+test("timeouts a timer can't hold are refused", async () => {
+  const app = await start({}, [job()])
+  expect((await app.call("automation_create", { name: "Bad", prompt: "x", every: "1h", timeoutMinutes: -5 })).content).toContain("timeoutMinutes")
+  expect((await app.call("automation_update", { id: "morning", timeoutMinutes: 1e9 })).content).toContain("timeoutMinutes")
+  expect((await app.call("automation_update", { id: "morning", timeoutMinutes: 0 })).content).toContain("timeoutMinutes")
+  expect(app.store.loadJobs()).toHaveLength(1)
+  expect(app.store.loadJobs()[0].timeoutMinutes).toBe(30)
+  await expect(start({ jobs: [{ id: "c", prompt: "x", every: "1h", directory: process.cwd(), timeoutMinutes: 0 }] })).rejects.toThrow("timeoutMinutes")
+  await expect(start({ defaultTimeoutMinutes: -1 })).rejects.toThrow("timeoutMinutes")
+})
+
+test("two starts of one automation at once make one run, not two in the same session", async () => {
+  const app = await start({}, [job({ session: "sticky" })])
+  const create = app.ctx.session.create
+  app.ctx.session.create = async (input: any) => { await flush(); return create(input) }
+  const [a, b] = await Promise.all([app.call("automation_run", { id: "morning" }), app.call("automation_run", { id: "morning" })])
+  expect([a.content, b.content].filter((c: string) => c.includes("skipped"))).toHaveLength(1)
+  expect(app.prompts).toHaveLength(1)
+  expect(app.sessions).toHaveLength(1)
+})
+
+test("runs still in progress when the plugin stops are closed in the history", async () => {
+  const app = await start({}, [job()])
+  await app.call("automation_run", { id: "morning" })
+  expect(app.store.history()[0].status).toBe("running")
+  await app.stop()
+  expect(app.store.history()[0]).toMatchObject({ status: "failed", error: "opencode stopped before the run ended" })
+  expect(app.store.loadJobs()[0].lastStatus).toBe("failed")
+})
+
+test("a compaction that never finishes doesn't hold the run when the plugin stops", async () => {
+  const app = await start({}, [job({ session: "sticky", sessionID: "session-9", memory: { note: "state" } })])
+  app.ctx.session.wait = () => new Promise(() => {})
+  const run = app.call("automation_run", { id: "morning" })
+  await flush()
+  await app.stop()
+  expect((await run).content).toContain("skipped")
+  expect(app.prompts).toEqual([])
+})
+
+test("a compaction given up on still gets its summary, and its late end doesn't end the run", async () => {
+  // The 30 s the plugin gives a compaction, cut short.
+  const real = globalThis.setTimeout
+  const timers = spyOn(globalThis, "setTimeout").mockImplementation(((fn: any, ms?: number, ...args: any[]) => real(fn, ms === 30_000 ? 10 : ms, ...args)) as any)
+  try {
+    const app = await start({}, [job({ session: "sticky", sessionID: "session-9", memory: { note: "state" } })])
+    // The compaction is accepted but only happens later (the session is busy).
+    app.ctx.session.compact = async ({ sessionID }: any) => ({ id: "msg_compaction", sessionID, type: "compaction" })
+    app.ctx.session.wait = () => new Promise<void>(() => {})
+    expect((await app.call("automation_run", { id: "morning" })).content).toContain("running")
+    expect(app.prompts).toHaveLength(1)
+    // The compaction happens now: it finds its summary, and its end event is not the run's.
+    expect(app.compactionSummary("session-9")).toBe("state")
+    await end(app, "session-9")
+    expect(app.store.history()[0].status).toBe("running")
+    expect(app.compactionSummary("session-9")).toBeUndefined()
+    // The run's own end still ends it.
+    await app.call("automation_memory_update", { note: "state 2" }, "session-9")
+    await end(app, "session-9")
+    expect(app.store.history()[0].status).toBe("succeeded")
+  } finally { timers.mockRestore() }
+})
+
+test("a poll error never carries a key the API echoed back", async () => {
+  process.env.TEST_DD_KEY = "s3cret-value"
+  const fetch = spyOn(globalThis, "fetch").mockImplementation((async (_: any, init: any) =>
+    new Response(`forbidden for key ${init.headers["DD-API-KEY"]}`, { status: 403 })) as any)
+  try {
+    const app = await start()
+    await app.call("channel_create", { id: "dd", ...draftChannel() })
+    const out = (await app.call("channel_poll", { id: "dd" })).content
+    expect(out).toContain("HTTP 403: forbidden for key {env:TEST_DD_KEY}")
+    expect(JSON.stringify(app.store.loadChannels())).not.toContain("s3cret-value")
+  } finally { fetch.mockRestore(); delete process.env.TEST_DD_KEY }
+})
+
+test("automation_history takes an automation's name as well as its id", async () => {
+  const app = await start({}, [job()])
+  await app.call("automation_run", { id: "morning" })
+  expect((await app.call("automation_history", { id: "Morning" })).content).toContain("morning running")
+  expect((await app.call("automation_history", { id: "nope" })).content).toBe("No runs yet.")
+})
+
+test("a tick that changes nothing doesn't rewrite jobs.json", async () => {
+  const app = await start({ tickSeconds: 5 }, [job()])
+  const path = join(app.dataDir, "jobs.json")
+  const before = statSync(path).mtimeMs
+  await new Promise((r) => setTimeout(r, 30))
+  await app.call("automation_update", { id: "morning" }) // goes through the same locked save as a tick
+  expect(statSync(path).mtimeMs).toBe(before)
+  await app.call("automation_update", { id: "morning", prompt: "Changed" })
+  expect(statSync(path).mtimeMs).toBeGreaterThan(before)
 })

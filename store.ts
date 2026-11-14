@@ -1,4 +1,4 @@
-import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync, unlinkSync } from "node:fs"
+import { appendFileSync, closeSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, writeFileSync, unlinkSync } from "node:fs"
 import { join } from "node:path"
 import { randomUUID } from "node:crypto"
 import lockfile from "proper-lockfile"
@@ -55,7 +55,7 @@ export interface Run {
   startedAt: number
   endedAt?: number
   status: RunStatus
-  output?: string
+  /** Why it failed, timed out or was skipped. What the run said isn't kept here: it is in its session. */
   error?: string
   /** automation_notify calls the agent made. */
   notifications?: number
@@ -67,6 +67,35 @@ function read(path: string): string | undefined {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined
     throw error
   }
+}
+
+/**
+ * A file's lines, last first, read from its end a block at a time: the caller stops when it has enough,
+ * so reading the latest runs doesn't mean reading the whole history.
+ */
+function* linesFromEnd(path: string, block = 64 * 1024): Generator<string> {
+  let fd: number
+  try { fd = openSync(path, "r") } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return
+    throw error
+  }
+  try {
+    let pos = fstatSync(fd).size
+    let rest = Buffer.alloc(0) // the start of a line whose beginning is in the block before
+    while (pos > 0) {
+      const size = Math.min(block, pos)
+      pos -= size
+      const chunk = Buffer.alloc(size)
+      readSync(fd, chunk, 0, size, pos)
+      // Cut on the newline byte, which never falls inside a UTF-8 character.
+      const buf = Buffer.concat([chunk, rest])
+      const first = pos > 0 ? buf.indexOf(10) : -1
+      if (pos > 0 && first < 0) { rest = buf; continue }
+      rest = buf.subarray(0, first + 1)
+      const lines = buf.subarray(first + 1).toString("utf8").split("\n")
+      for (let i = lines.length - 1; i >= 0; i--) if (lines[i].trim()) yield lines[i]
+    }
+  } finally { closeSync(fd) }
 }
 
 /**
@@ -83,7 +112,9 @@ async function lock(path: string, waitMs = 2000): Promise<() => Promise<void>> {
   }
 }
 
+/** An unchanged file isn't rewritten, so a tick that changes nothing doesn't wake what watches the directory (the TUI). */
 function writeAtomic(path: string, content: string): void {
+  if (read(path) === content) return
   const temp = `${path}.${randomUUID()}.tmp`
   try {
     writeFileSync(temp, content, { mode: 0o600 })
@@ -143,7 +174,6 @@ export class Store {
     return { sources: state.sources ?? {}, queues: state.queues ?? {}, defs: state.defs ?? {}, config: state.config ?? {} }
   }
 
-  /** Change channel state (poll state, automation queues) under the lock. */
   /** `waitMs`: how long to wait for another holder of the lock (the TUI waits less, so it never feels stuck). */
   async mutateChannels<T>(fn: (state: ChannelsState) => T, waitMs = 2000): Promise<T> {
     // No file is created before locking: the lock doesn't need it, and loadChannels() treats it as empty.
@@ -163,22 +193,18 @@ export class Store {
 
   history(jobID?: string, limit = 10): Run[] {
     if (!Number.isFinite(limit) || limit <= 0) return []
-    const raw = read(this.historyPath)
-    if (!raw) return []
+    const max = Math.floor(limit)
     const latest = new Map<string, Run>()
-    const lines = raw.split("\n")
-    for (let i = 0; i < lines.length; i++) {
-      if (!lines[i].trim()) continue
-      try {
-        const run = JSON.parse(lines[i]) as Run
-        latest.set(run.runID, run)
-      } catch (error) {
-        // A concurrent append may expose only the last, incomplete line.
-        if (i !== lines.length - 1) throw error
-      }
+    // Last line first, so the first record met for a run is its latest, and reading stops at `limit` runs.
+    for (const line of linesFromEnd(this.historyPath)) {
+      let run: Run
+      // A line cut short (an append in progress, or a crash in the middle of one) is skipped, not fatal.
+      try { run = JSON.parse(line) as Run } catch { continue }
+      if (latest.has(run.runID) || (jobID && run.jobID !== jobID)) continue
+      latest.set(run.runID, run)
+      if (latest.size >= max) break
     }
-    return [...latest.values()].filter((run) => !jobID || run.jobID === jobID)
-      .sort((a, b) => b.startedAt - a.startedAt).slice(0, Math.floor(limit))
+    return [...latest.values()].sort((a, b) => b.startedAt - a.startedAt)
   }
 
   lease(ttl: number): boolean {

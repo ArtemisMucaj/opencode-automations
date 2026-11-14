@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test"
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -34,7 +34,8 @@ test("intervals stay anchored and one-shots finish", async () => {
 })
 
 test("TUI timing parser accepts cron, intervals, dates and rejects bad timezones", async () => {
-  const { parseScheduleText, isActive, uniqueID, relative } = await import("../jobs.ts")
+  const { parseScheduleText, isActive, uniqueID } = await import("../jobs.ts")
+  const { relative } = await import("../util.ts")
   expect(parseScheduleText("every 30m")).toEqual({ kind: "every", ms: 1_800_000 })
   expect(parseScheduleText("45 8 * * 1-5 Europe/Paris")).toEqual({ kind: "cron", expr: "45 8 * * 1-5", tz: "Europe/Paris" })
   expect(parseScheduleText("@daily")).toEqual({ kind: "cron", expr: "@daily" })
@@ -54,21 +55,24 @@ test("TUI timing parser accepts cron, intervals, dates and rejects bad timezones
 
 test("store persists edits and keeps latest status per run", async () => {
   const { Store } = await import("../store.ts")
-  const { mutateRaw } = await import("../jobs.ts")
   const dir = temp()
   const a = new Store(dir)
   const b = new Store(dir)
   expect(a.loadJobs()).toEqual([])
   a.saveJobs([{ id: "one", enabled: true }] as any)
-  await mutateRaw(b, (jobs) => { jobs[0].paused = true })
+  await b.mutate((jobs) => { jobs[0].paused = true })
   expect(a.loadJobs()[0].paused).toBe(true)
   a.appendRun({ runID: "r1", jobID: "one", startedAt: 1, status: "running" })
-  a.appendRun({ runID: "r1", jobID: "one", startedAt: 1, endedAt: 2, status: "succeeded", output: "done" })
+  a.appendRun({ runID: "r1", jobID: "one", startedAt: 1, endedAt: 2, status: "succeeded" })
   a.appendRun({ runID: "r2", jobID: "two", startedAt: 3, status: "running" })
   expect(b.history("one", 10)).toHaveLength(1)
-  expect(b.history("one", 10)[0].output).toBe("done")
+  expect(b.history("one", 10)[0].status).toBe("succeeded")
   expect(b.history(undefined, 1)[0].runID).toBe("r2")
   expect(b.history(undefined, 0)).toEqual([])
+  // A line cut short by a crash is skipped; the runs around it still load.
+  appendFileSync(join(dir, "history.jsonl"), '{"runID":"r3","jobID"\n')
+  a.appendRun({ runID: "r4", jobID: "two", startedAt: 4, status: "succeeded" })
+  expect(b.history().map((r) => r.runID)).toEqual(["r4", "r2", "r1"])
   writeFileSync(join(dir, "jobs.json"), "broken")
   expect(() => a.loadJobs()).toThrow()
 })
@@ -132,4 +136,51 @@ test("waiting for a busy lock doesn't block the event loop", async () => {
   await write
   expect(Date.now() - started).toBeGreaterThanOrEqual(200)
   await holder.exited
+})
+
+test("within waits at most its time, or until its signal aborts", async () => {
+  const { within } = await import("../util.ts")
+  const never = new Promise(() => {})
+  expect(await within(Promise.resolve(), 1000)).toBe(true)
+  expect(await within(never, 5)).toBe(false)
+  const abort = new AbortController()
+  setTimeout(() => abort.abort(), 5)
+  expect(await within(never, 60_000, abort.signal)).toBe(false)
+  await expect(within(Promise.reject(new Error("boom")), 1000)).rejects.toThrow("boom")
+})
+
+test("history reads from the end of the file, across blocks, and stops when it has enough", async () => {
+  const { Store } = await import("../store.ts")
+  const s = new Store(temp())
+  // Over 64 KB of records, with multi-byte text, so lines straddle block boundaries.
+  for (let i = 0; i < 1500; i++) {
+    s.appendRun({ runID: `r${i}`, jobID: i % 2 ? "odd" : "even", startedAt: i, status: "running" })
+    s.appendRun({ runID: `r${i}`, jobID: i % 2 ? "odd" : "even", startedAt: i, endedAt: i + 1, status: "failed", error: "délai dépassé ⧗" })
+  }
+  expect(s.history(undefined, 3).map((r) => r.runID)).toEqual(["r1499", "r1498", "r1497"])
+  expect(s.history("even", 2).map((r) => r.runID)).toEqual(["r1498", "r1496"])
+  const all = s.history(undefined, 5000)
+  expect(all).toHaveLength(1500)
+  expect(all.every((r) => r.status === "failed" && r.error === "délai dépassé ⧗")).toBe(true)
+})
+
+test("the small helpers format counts, durations and errors", async () => {
+  const { elapsed, httpError, orError, plural } = await import("../util.ts")
+  expect([plural(1, "run"), plural(0, "run"), plural(3, "new event")]).toEqual(["1 run", "0 runs", "3 new events"])
+  expect([elapsed({ startedAt: 0 }), elapsed({ startedAt: 0, endedAt: 200 }), elapsed({ startedAt: 0, endedAt: 45_000 }), elapsed({ startedAt: 0, endedAt: 150_000 }), elapsed({ startedAt: 0, endedAt: 180_000 })])
+    .toEqual(["", "1s", "45s", "2m 30s", "3m"])
+  expect(httpError(403, "bad key").message).toBe("HTTP 403: bad key")
+  expect(httpError(500, "").message).toBe("HTTP 500")
+  expect(await orError(async () => ({ content: "ok" }))).toEqual({ content: "ok" })
+  expect(await orError(async () => { throw new Error("no job") })).toEqual({ content: "error: no job" })
+})
+
+test("a schedule typed in the TUI goes through the same checks as one from chat", async () => {
+  const { parseScheduleText } = await import("../jobs.ts")
+  expect(parseScheduleText("every 30m")).toEqual({ kind: "every", ms: 1_800_000 })
+  expect(parseScheduleText("0 9 * * 1-5 Europe/Paris")).toEqual({ kind: "cron", expr: "0 9 * * 1-5", tz: "Europe/Paris" })
+  expect(parseScheduleText("@daily")).toEqual({ kind: "cron", expr: "@daily" })
+  expect(() => parseScheduleText("0 9 * * 1-5 Mars/Olympus")).toThrow()
+  expect(() => parseScheduleText("2020-01-01T09:00:00Z")).toThrow("in the past")
+  expect(() => parseScheduleText("tomorrow")).toThrow("use cron")
 })
