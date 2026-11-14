@@ -87,14 +87,7 @@ Cron schedules respect daylight-saving changes in their timezone. If opencode wa
 
 ## Notifications
 
-Notifications are sent by the server side of the plugin, so they work with no opencode window open. Two destinations, use either or both:
-
-| Destination | Setup | Notes |
-|---|---|---|
-| Desktop | `"native": true` | macOS notification center (optional `{ "sound": "Ping" }`), or `notify-send` on Linux. Shows on the machine running opencode. |
-| Phone | `"pushover": { "token": "…", "user": "…" }` | Through [Pushover](https://pushover.net). Phone and desktop apps. |
-
-Put them under `notify` in the plugin options (see [Configuration](#configuration)).
+Notifications are sent by the server side of the plugin, so they work with no opencode window open. Destinations are set under `notify` in the plugin options (see [Configuration](#configuration)).
 
 **What you receive.** The agent running the automation writes the notification itself: a title and a short, plain-text message with the most important thing first, since a lock screen only shows the first lines. It sends at most 5 per run by default. If a run finds nothing worth your attention, it stays quiet.
 
