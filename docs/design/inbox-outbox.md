@@ -76,7 +76,9 @@ interface InboxEvent {
   - The scheduler: when a schedule is due, it appends `{ source: "timer", to: jobID }` and advances `nextRunAt` in the
     same pass, as today. A timer never starts a run itself.
   - Manual runs (`automation_run`, `r` in the TUI): append `{ source: "manual", to: jobID }`. This replaces
-    `runRequestedAt`.
+    `runRequestedAt`. The caller gets an acknowledgement right away (`Queued: dep-audit starts on the next tick,
+    within 30 s.`), and the TUI shows the run as queued until it starts. When the caller is the leader, the run starts
+    at once.
 - **Retention.** The leader deletes, on a tick, events older than `inbox.retention` (default 7 days) whose item was
   absent from the channel's latest poll. Each poll updates `seen_at` on the items it returns, so an alert that stays
   open for two weeks is never deleted and delivered again.
@@ -94,7 +96,7 @@ An automation no longer receives a private copy of events. It declares a **selec
   "listen": {
     "channels": ["datadog"],        // which channels' events it takes
     "match": { "title": "*P1*" },   // optional: a glob per field (title, body, key, url)
-    "from": "now"                   // what it takes when it is created: "now" (default), or "24h", "7d"
+    "from": "latest"                // what it takes when it is created: "latest" (default), "now", or "24h", "7d"
   },
   "prompt": "…"
 }
@@ -125,16 +127,17 @@ What goes away: `QueueState.pending`, `started`, `MAX_QUEUE` per automation, `en
 special case, `forget` on queues, and `seen`. A paused automation simply takes nothing, so its events wait in the
 table, within retention. Detaching a channel just changes the selector.
 
-**First attach.** Today a newly attached automation receives everything a channel currently returns. With a shared
-inbox, the equivalent is `from`. `"now"` starts clean. `"24h"` replays the last day's events from the log. The current
-behaviour ("whatever is alerting right now") is the rows whose `seen_at` is the channel's latest poll, which `seen_at`
-makes cheap: see open question 2.
+**First attach starts from the channel's latest poll**, as today: a new automation (or a channel added to one)
+gets what the channel currently returns, which for Datadog means what is alerting right now. With `seen_at`, that is
+the inbox rows whose `seen_at` equals the channel's `last_ok_at`, so it needs no extra state. If the channel hasn't
+been polled yet, it gets the first poll. `from: "now"` starts clean instead, and `"24h"` replays the last day from
+the inbox.
 
 ### Worker: one, the leader
 
 Following "an inbox should only have one active worker at a time", **only the leader starts runs**. The leader is the
-process holding the existing lease. Other processes only write to the inbox, and nudge the leader by touching
-`pollRequestedAt` or an `inbox.wake` file. When the caller is the leader, it processes the inbox at once.
+process holding the lease. Other processes only write to the inbox, and the leader picks it up on its next tick.
+That is a short wait, acknowledged to the caller. When the caller is the leader, it processes the inbox at once.
 
 That removes the cross-process start races: `pendingStarts` becomes an in-process set only, and there is no more
 "another process already took these events" path. A run's tools and hooks still work from any instance, through the
@@ -172,9 +175,9 @@ times out (`compose`), and "channel X can't poll" (`index.ts` `pollChannels`).
 **Dispatcher.** It runs in the leader, on every tick, and right away when the leader writes a message. For each
 pending (message, sender) pair, it:
 
-1. **Routes.** It checks whether the sender takes this message: the automation's `outbox.to` (in config) and the
-   sender's own rules (`minPriority`, `automations`, `quiet`). Routing is configuration only. The agent never picks a
-   sender.
+1. **Routes.** Senders are global: every message goes to every sender, subject only to that sender's own
+   `minPriority` and `quiet` hours. There is no per-automation routing for now, and the agent never picks a sender.
+   Per-automation routing can be added later as a sender rule without touching the agent or the outbox.
 2. **Paces.** `maxPerHour` per sender. Low-priority messages during quiet hours are held and folded into one digest
    message when quiet hours end. This is where "start quiet and earn attention" gets a knob.
 3. **Delivers** with the sender's adapter (today's `send` split into one function per sender type). The adapter fits
@@ -193,7 +196,7 @@ pending (message, sender) pair, it:
     { "id": "desktop", "type": "native", "sound": "Glass" },
     { "id": "phone", "type": "pushover", "token": "{env:PUSHOVER_TOKEN}", "user": "{env:PUSHOVER_USER}",
       "minPriority": "normal", "maxPerHour": 10, "quiet": { "from": "22:00", "to": "07:30", "tz": "Europe/Paris" } },
-    { "id": "team", "type": "webhook", "url": "{env:TEAM_HOOK}", "automations": ["alert-triage"] }
+    { "id": "hook", "type": "webhook", "url": "{env:NOTIFY_HOOK}" }
   ]
 }
 ```
@@ -217,9 +220,10 @@ Changes:
 
 - **Its own table.** `memory (job, key, note, warm_until, updated_at)`. Memory moves out of the job record and out of
   `queues[].sessions`.
-- **Optional: offered to every automation**, not only sticky ones. A `new` session run that ends with a note gives the
-  next run a starting point. The run guide shows the previous note at the top. The warm and cold compaction stays
-  sticky only. See open question 3.
+- **Offered to every automation**, not only sticky ones. Every run gets the previous note at the top of its
+  context and is asked to replace it before it ends (the existing one-time reminder). A `new` session run can then
+  "report only what changed" without a sticky session. The warm and cold compaction stays sticky only, since only
+  sticky runs continue a conversation.
 - Not now: notes, progress files, an index and "dreaming". The prompt already plays the "user instructions" file,
   and the outbox keeps the record of what was sent.
 
@@ -228,8 +232,8 @@ Changes:
 | Tool | Change |
 |---|---|
 | `automation_notify` | Writes to the outbox and returns `Queued.` Input: title, message, priority, url, url_title. No sender, no sink-specific limits |
-| `automation_memory_update` | Unchanged. Possibly offered to every run (open question 3) |
-| `automation_create/update` | `listen` replaces `channels`. Routing (`outbox.to`) is config only |
+| `automation_memory_update` | Offered to every run, not only sticky ones |
+| `automation_create/update` | `listen` replaces `channels`. Nothing about senders: they are global config |
 | `channel_*` | Unchanged for the agent. `channel_poll` reports events written to the inbox and the runs it woke |
 
 There are no new agent tools. `guides.ts`: `RUN_GUIDE` stops mentioning phones and Pushover (the user is notified),
@@ -311,18 +315,18 @@ them.
 Each PR keeps `bun test` and `bun run typecheck` green. Since there is no migration, each one may change the schema
 freely until the release.
 
+## Decisions
+
+1. **Storage**: `bun:sqlite`, one `state.db`.
+2. **First attach**: from the channel's latest poll (`from: "latest"`, default).
+3. **Memory**: one note per automation (per key with sticky keys), for every automation.
+4. **Manual runs**: queued in the inbox and started by the leader on its next tick. The caller is told it's queued.
+5. **Senders**: global config only. Each sender has its own `minPriority`, `maxPerHour` and `quiet` hours, and there
+   is no per-automation routing.
+6. **Compatibility**: a clean break, with no migration.
+
 ## Open questions
 
-1. ~~Storage~~: decided, `bun:sqlite`.
-2. **First attach.** Should `from` default to `"now"`, or to "the channel's last poll" (closest to today: you see
-   what is alerting right now)? With `seen_at`, the latter is a query, not extra state.
-3. **Memory for every automation, or sticky only?** Offering a note to `new` runs makes "report only what changed"
-   possible without sticky sessions. It is also one more thing the agent is asked to do every run.
-4. **Should manual runs from a non-leader wait for the leader's tick** (≤ `tickSeconds`), or may any process start a
-   run when the leader is idle? This draft says wait, for a single worker. The leader could also check for new
-   `manual` rows every second (a cheap query on `seq`), so that the wait is short.
-5. **Routing granularity.** Is "sender rules + automation `outbox.to`" too much? A smaller start is sender
-   `minPriority` only.
-6. **Agent-set follow-ups.** The article's other timer kind: `automation_followup({ in: "2h", note })` would append a
+1. **Agent-set follow-ups.** The article's other timer kind: `automation_followup({ in: "2h", note })` would append a
    timer event to the same automation (and key) later, for example "check whether the rollback fixed it". It fits
-   the inbox naturally. Should it go in this update or the next?
+   the inbox naturally. Proposed: next update, once the inbox is in.
