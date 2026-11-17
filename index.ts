@@ -21,7 +21,7 @@ import { checkTimeout, DEFAULT_TIMEOUT_MINUTES, defaultDataDir, find, isActive, 
 import { canNotify, compose, DEFAULT_MAX_PER_RUN, send, shouldNotify } from "./notify.ts"
 import { sessionMode, Store, type Job, type Memory, type Run } from "./store.ts"
 import type { InFlight, Loaded, Options, PollResult, Reason, Runtime } from "./types.ts"
-import { errorMessage, within } from "./util.ts"
+import { errorMessage, Owned, within } from "./util.ts"
 
 const MISSED_GRACE_MS = 2 * 60_000
 const CHANNEL_FAILURE_NOTICE = 3
@@ -34,6 +34,16 @@ const COMPACTION_END_MS = 5_000
  * Short, since the summary is the saved memory: no model is called.
  */
 const COMPACTION_MAX_MS = 30_000
+/** A compaction before a run: the summary to give it (the saved memory), and what to call when it ends. */
+type Compaction = { summary: string; ended: () => void }
+/**
+ * Runs and compactions in progress in this process, by session, across every instance of the plugin. opencode
+ * sets the plugin up once per directory it serves, and a session's tool calls and hooks can go through an
+ * instance other than the one that started its run. That one owns the run (its events, its end); the others
+ * only look it up, so a run's tools and guidance work whichever instance serves its session.
+ */
+const shared: { runs: Map<string, InFlight>; compactions: Map<string, Compaction> } =
+  ((globalThis as any)[Symbol.for("opencode-automations.inflight")] ??= { runs: new Map(), compactions: new Map() })
 const EXECUTION_ENDS = new Set(["session.execution.succeeded", "session.execution.failed", "session.execution.interrupted", "session.idle"])
 
 export default Plugin.define({
@@ -44,7 +54,7 @@ export default Plugin.define({
     const defaultTimeout = checkTimeout(opts.defaultTimeoutMinutes) ?? DEFAULT_TIMEOUT_MINUTES
     const dataDir = opts.dataDir ?? defaultDataDir()
     const store = new Store(dataDir)
-    const inflight = new Map<string, InFlight>() // sessionID -> run
+    const inflight = new Owned<InFlight>(shared.runs) // sessionID -> run started here
     const abort = new AbortController()
     let leader = false
 
@@ -411,7 +421,7 @@ export default Plugin.define({
      * Sessions being compacted before a run: the summary its compaction takes (the saved memory), and
      * what to call once the compaction's end event comes through.
      */
-    const compactions = new Map<string, { summary: string; ended: () => void }>()
+    const compactions = new Owned<Compaction>(shared.compactions)
 
     /**
      * Start a run: pick the session, record it, send the prompt, and arm the timeout.
@@ -714,25 +724,27 @@ export default Plugin.define({
     const maxPerRun = opts.notify?.maxPerRun ?? DEFAULT_MAX_PER_RUN
 
     await ctx.session.hook?.("context", (c) => {
-      const f = inflight.get(c.sessionID)
+      const f = inflight.find(c.sessionID)
       const notifies = !!f && canNotify(opts.notify, f.job)
-      if (notifies) c.system.push({ type: "text", text: RUN_GUIDE })
+      // Every instance's hook may see the session: add each text once.
+      const add = (text: string) => { if (!c.system.some((p: any) => p.text === text)) c.system.push({ type: "text", text }) }
+      if (notifies) add(RUN_GUIDE)
       else delete c.tools[NOTIFY_TOOL]
       if (f?.job.session === "sticky") {
-        c.system.push({ type: "text", text: MEMORY_GUIDE })
+        add(MEMORY_GUIDE)
         f.cacheMs ??= cacheLifetime(c.options)
       } else delete c.tools[UPDATE_TOOL]
-      if (f) c.system.push({ type: "text", text: runContext(f.job, notifies ? maxPerRun : undefined) })
+      if (f) add(runContext(f.job, notifies ? maxPerRun : undefined))
     })
 
     await ctx.session.hook?.("compaction", (c) => {
-      const summary = compactions.get(c.sessionID)?.summary
+      const summary = compactions.find(c.sessionID)?.summary
       if (summary !== undefined) c.result = { summary }
     })
 
     const rt: Runtime = {
       ctx, opts, store, tickMs, defaultTimeout, maxPerRun, configChannels,
-      runOf: (sessionID) => inflight.get(sessionID),
+      runOf: (sessionID) => inflight.find(sessionID),
       runningJobs: () => [...inflight.values()].map((f) => f.run.jobID),
       isPolling: (channelID) => polling.has(channelID),
       leader: () => leader,
