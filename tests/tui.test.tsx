@@ -8,6 +8,62 @@ import plugin from "../tui.tsx"
 import { runningJobs } from "../jobs.ts"
 import { Store, type Job } from "../store.ts"
 
+type TuiContext = Parameters<typeof plugin.setup>[0]
+type Layer = ReturnType<Parameters<TuiContext["keymap"]["layer"]>[0]>
+type Command = NonNullable<Layer["commands"]>[number]
+type Render = Parameters<TuiContext["ui"]["dialog"]["show"]>[0]
+type ToastOptions = Parameters<TuiContext["ui"]["toast"]["show"]>[0]
+
+/** A stand-in for the opencode TUI: what tui.tsx uses of it, and what the plugin did with it. */
+function fakeHost(dataDir: string, renderer: unknown) {
+  const layers: Layer[] = []
+  const toasts: string[] = []
+  const host = { dialog: undefined as Render | undefined, toasts, ctx: {} as TuiContext, command }
+  // Minimal stand-in for @opencode/theme's ResolvedTheme (only the tokens tui.tsx reads).
+  const color = "#aaaaaa"
+  const feedback = Object.fromEntries(["success", "error", "warning", "info"].map((name) => [name, { base: color, muted: color }]))
+  const scale = Object.fromEntries([100, 200, 300, 400, 500, 600, 700, 800, 900].map((step) => [step, color]))
+  const theme = {
+    hue: { accent: scale },
+    categorical: [scale, scale, scale],
+    text: { base: color, muted: color, faint: color, action: { primary: { base: color, focused: color } }, feedback },
+    background: {
+      base: "#111111",
+      raised: { base: "#1a1a1a", high: "#222222", max: "#2a2a2a" },
+      action: { primary: { base: "#333333", focused: "#333333" } },
+      feedback,
+    },
+    border: { base: color },
+    surface: (): unknown => theme,
+  }
+  const ctx = {
+    renderer,
+    options: { dataDir, notify: "off" },
+    location: { directory: dataDir },
+    themeMode: "dark",
+    theme,
+    keymap: { layer: (factory: () => Layer) => { layers.push(factory()) } },
+    ui: {
+      toast: { show: (t: ToastOptions) => { toasts.push(t.message) } },
+      router: { navigate: () => {} },
+      dialog: {
+        show: (render: Render) => { host.dialog = render }, set: () => {}, clear: () => { host.dialog = undefined }, confirm: async () => true,
+      },
+      slot: () => () => {},
+      format: { path: (path: string) => path },
+    },
+  }
+  // Only the parts tui.tsx reads: the rest of the TUI's context isn't there.
+  host.ctx = ctx as unknown as TuiContext
+  /** The first registered command that matches. */
+  function command(match: (command: Command) => boolean): Command {
+    const found = layers.flatMap((layer) => layer.commands ?? []).find(match)
+    if (!found) throw new Error("no such command")
+    return found
+  }
+  return host
+}
+
 test("TUI renders automations page and persists pause/run-now actions", async () => {
   const dataDir = mkdtempSync(join(tmpdir(), "automations-tui-"))
   const store = new Store(dataDir)
@@ -17,53 +73,21 @@ test("TUI renders automations page and persists pause/run-now actions", async ()
     source: "tool", createdAt: Date.now(), nextRunAt: Date.now() + 60_000,
   } satisfies Job])
   const testRenderer = await createTestRenderer({ width: 120, height: 45 })
-  const layers: any[] = []
-  let dialog: any
-  // Minimal stand-in for @opencode/theme's ResolvedTheme (only the tokens tui.tsx reads).
-  const color = "#aaaaaa"
-  const feedback = Object.fromEntries(["success", "error", "warning", "info"].map((name) => [name, { base: color, muted: color }]))
-  const scale = Object.fromEntries([100, 200, 300, 400, 500, 600, 700, 800, 900].map((step) => [step, color]))
-  const ctx: any = {
-    renderer: testRenderer.renderer,
-    options: { dataDir, notify: "off" },
-    location: { directory: dataDir },
-    themeMode: "dark",
-    theme: {
-      hue: { accent: scale },
-      categorical: [scale, scale, scale],
-      text: { base: color, muted: color, faint: color, action: { primary: { base: color, focused: color } }, feedback },
-      background: {
-        base: "#111111",
-        raised: { base: "#1a1a1a", high: "#222222", max: "#2a2a2a" },
-        action: { primary: { base: "#333333", focused: "#333333" } },
-        feedback,
-      },
-      border: { base: color },
-      surface: () => ctx.theme,
-    },
-    keymap: { layer: (fn: any) => { layers.push(fn()) } },
-    ui: {
-      toast: { show: () => {} },
-      router: { navigate: () => {} },
-      dialog: { show: (render: any) => { dialog = render }, set: () => {}, clear: () => { dialog = undefined } },
-      slot: () => () => {},
-      format: { path: (path: string) => path },
-    },
-  }
-  let stop: any
+  const host = fakeHost(dataDir, testRenderer.renderer)
+  let stop: Awaited<ReturnType<typeof plugin.setup>> | undefined
   try {
-    stop = await plugin.setup(ctx as any)
-    const open = layers.flatMap((layer) => layer.commands).find((command) => command.id === "automations.open")
-    expect(open.slash.name).toBe("automations")
-    expect(open.slash.aliases ?? []).toEqual([])
+    stop = await plugin.setup(host.ctx)
+    const open = host.command((command) => command.id === "automations.open")
+    expect(open.slash?.name).toBe("automations")
+    expect(open.slash?.aliases ?? []).toEqual([])
     await open.run()
-    expect(dialog).toBeFunction()
+    expect(host.dialog).toBeFunction()
     // Stand-in for opencode's dialog container: full screen, centered, fixed 116-column box.
     await render(
       () => (
         <box position="absolute" left={0} top={0} width={120} height={45} alignItems="center" justifyContent="center">
           <box width={116} paddingTop={1}>
-            {dialog()}
+            {host.dialog!()}
           </box>
         </box>
       ),
@@ -79,16 +103,15 @@ test("TUI renders automations page and persists pause/run-now actions", async ()
     expect(frame).toContain("Automations")
     expect(frame).toContain("Morning triage")
     expect(frame).toContain("Check merge requests")
-    const commands = layers.flatMap((layer) => layer.commands)
-    await commands.find((command) => command.title === "pause/resume").run()
+    await host.command((command) => command.title === "pause/resume").run()
     expect(store.loadJobs()[0].paused).toBe(true)
-    await commands.find((command) => command.title === "run now").run()
+    await host.command((command) => command.title === "run now").run()
     expect(store.loadJobs()[0].runRequestedAt).toBeNumber()
     expect(store.loadJobs()[0].paused).toBe(true)
     await testRenderer.renderOnce()
     expect(testRenderer.captureCharFrame()).toContain("paused")
   } finally {
-    stop?.()
+    if (typeof stop === "function") stop()
     await testRenderer.dispose()
     rmSync(dataDir, { recursive: true, force: true })
   }
@@ -113,49 +136,16 @@ test("TUI channels tab shows status, mapping and listeners, and queues a poll", 
     s.queues.triage = { pending: [{ channel: "datadog", id: "1:t", title: "CPU high on web-1" }], sessions: {} }
   })
   const testRenderer = await createTestRenderer({ width: 140, height: 50 })
-  const layers: any[] = []
-  let dialog: any
-  const toasts: string[] = []
-  const color = "#aaaaaa"
-  const feedback = Object.fromEntries(["success", "error", "warning", "info"].map((name) => [name, { base: color, muted: color }]))
-  const scale = Object.fromEntries([100, 200, 300, 400, 500, 600, 700, 800, 900].map((step) => [step, color]))
-  const ctx: any = {
-    renderer: testRenderer.renderer,
-    options: { dataDir, notify: "off" },
-    location: { directory: dataDir },
-    themeMode: "dark",
-    theme: {
-      hue: { accent: scale },
-      categorical: [scale, scale, scale],
-      text: { base: color, muted: color, faint: color, action: { primary: { base: color, focused: color } }, feedback },
-      background: {
-        base: "#111111",
-        raised: { base: "#1a1a1a", high: "#222222", max: "#2a2a2a" },
-        action: { primary: { base: "#333333", focused: "#333333" } },
-        feedback,
-      },
-      border: { base: color },
-      surface: () => ctx.theme,
-    },
-    keymap: { layer: (fn: any) => { layers.push(fn()) } },
-    ui: {
-      toast: { show: (t: any) => { toasts.push(t.message) } },
-      router: { navigate: () => {} },
-      dialog: { show: (render: any) => { dialog = render }, set: () => {}, clear: () => { dialog = undefined }, confirm: async () => true },
-      slot: () => () => {},
-      format: { path: (path: string) => path },
-    },
-  }
-  let stop: any
+  const host = fakeHost(dataDir, testRenderer.renderer)
+  let stop: Awaited<ReturnType<typeof plugin.setup>> | undefined
   try {
-    stop = await plugin.setup(ctx as any)
-    const commands = () => layers.flatMap((layer) => layer.commands)
-    await commands().find((command) => command.id === "automations.open").run()
+    stop = await plugin.setup(host.ctx)
+    await host.command((command) => command.id === "automations.open").run()
     await render(
       () => (
         <box position="absolute" left={0} top={0} width={140} height={50} alignItems="center" justifyContent="center">
           <box width={116} paddingTop={1}>
-            {dialog()}
+            {host.dialog!()}
           </box>
         </box>
       ),
@@ -166,7 +156,7 @@ test("TUI channels tab shows status, mapping and listeners, and queues a poll", 
     // Automations tab: the job lists its channels.
     expect(testRenderer.captureCharFrame()).toContain("datadog, sentry")
 
-    await commands().find((command) => command.bind === "c").run()
+    await host.command((command) => command.bind === "c").run()
     await testRenderer.renderOnce()
     let frame = testRenderer.captureCharFrame()
     expect(frame).toContain("[channels]")
@@ -184,7 +174,7 @@ test("TUI channels tab shows status, mapping and listeners, and queues a poll", 
     expect(frame).toContain("p  poll now")
 
     // Next channel: the created one, failing, with no query string (and so no token) shown.
-    await commands().find((command) => command.title === "down").run()
+    await host.command((command) => command.title === "down").run()
     await testRenderer.renderOnce()
     frame = testRenderer.captureCharFrame()
     expect(frame).toContain("created from chat")
@@ -192,24 +182,27 @@ test("TUI channels tab shows status, mapping and listeners, and queues a poll", 
     expect(frame).toContain("https://sentry.example.test/issues")
     expect(frame).not.toContain("token={env:T}")
 
-    await commands().find((command) => command.title === "poll now").run()
+    await host.command((command) => command.title === "poll now").run()
     expect(store.loadChannels().sources.sentry.pollRequestedAt).toBeNumber()
     // In use by an automation: delete refuses and says how to detach.
-    await commands().find((command) => command.title === "delete").run()
+    await host.command((command) => command.title === "delete").run()
     expect(store.loadChannels().defs.sentry).toBeDefined()
-    expect(toasts.some((m) => m.includes("channel_delete with detach"))).toBe(true)
+    expect(host.toasts.some((m) => m.includes("channel_delete with detach"))).toBe(true)
     // Automation keys do nothing on this tab.
-    await commands().find((command) => command.title === "pause/resume").run()
+    await host.command((command) => command.title === "pause/resume").run()
     expect(store.loadJobs()[0].paused).toBeUndefined()
   } finally {
-    stop?.()
+    if (typeof stop === "function") stop()
     await testRenderer.dispose()
     rmSync(dataDir, { recursive: true, force: true })
   }
 })
 
 test("a run left running by a crash stops counting as running once its timeout has passed", () => {
-  const jobs = [{ id: "a", timeoutMinutes: 10 }] as Job[]
+  const jobs: Job[] = [{
+    id: "a", name: "A", prompt: "p", schedule: { kind: "every", ms: 60_000 }, directory: "/project", session: "new",
+    timeoutMinutes: 10, runMissed: true, enabled: true, source: "tool", createdAt: 0,
+  }]
   const run = { jobID: "a", runID: "r", startedAt: 0, status: "running" as const }
   expect([...runningJobs(jobs, [run], 5 * 60_000)]).toEqual(["a"])
   expect([...runningJobs(jobs, [run], 12 * 60_000)]).toEqual([])

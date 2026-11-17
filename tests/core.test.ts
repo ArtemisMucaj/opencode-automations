@@ -2,6 +2,13 @@ import { afterEach, expect, test } from "bun:test"
 import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import type { Job } from "../store.ts"
+
+const job = (overrides: Partial<Job>): Job => ({
+  id: "job", name: "Job", prompt: "Check things", schedule: { kind: "every", ms: 60_000 },
+  directory: "/project", session: "new", timeoutMinutes: 30, runMissed: true, enabled: true,
+  source: "tool", createdAt: 1, ...overrides,
+})
 
 const dirs: string[] = []
 const temp = () => {
@@ -42,14 +49,13 @@ test("TUI timing parser accepts cron, intervals, dates and rejects bad timezones
   expect(parseScheduleText("2099-11-02T09:00:00Z")).toEqual({ kind: "at", time: Date.parse("2099-11-02T09:00:00Z") })
   expect(() => parseScheduleText("@daily Not/AZone")).toThrow()
   expect(() => parseScheduleText("2000-01-01T00:00:00Z")).toThrow()
-  const every = { kind: "every", ms: 60_000 }
-  expect(isActive({ enabled: true, paused: true, schedule: every } as any)).toBe(false)
-  expect(isActive({ enabled: true, done: true, schedule: every } as any)).toBe(false)
-  expect(isActive({ enabled: true, schedule: every } as any)).toBe(true)
+  expect(isActive(job({ paused: true }))).toBe(false)
+  expect(isActive(job({ done: true }))).toBe(false)
+  expect(isActive(job({}))).toBe(true)
   // Runs only on events but has no channel: it can never run, so it isn't active.
-  expect(isActive({ enabled: true, schedule: { kind: "event" } } as any)).toBe(false)
-  expect(isActive({ enabled: true, schedule: { kind: "event" }, on: { channels: ["dd"] } } as any)).toBe(true)
-  expect(uniqueID([{ id: "morning" }] as any, "Morning")).toBe("morning-2")
+  expect(isActive(job({ schedule: { kind: "event" } }))).toBe(false)
+  expect(isActive(job({ schedule: { kind: "event" }, on: { channels: ["dd"] } }))).toBe(true)
+  expect(uniqueID([job({ id: "morning" })], "Morning")).toBe("morning-2")
   expect(relative(120_000, 0)).toBe("in 2m")
 })
 
@@ -59,7 +65,7 @@ test("store persists edits and keeps latest status per run", async () => {
   const a = new Store(dir)
   const b = new Store(dir)
   expect(a.loadJobs()).toEqual([])
-  a.saveJobs([{ id: "one", enabled: true }] as any)
+  a.saveJobs([job({ id: "one" })])
   await b.mutate((jobs) => { jobs[0].paused = true })
   expect(a.loadJobs()[0].paused).toBe(true)
   a.appendRun({ runID: "r1", jobID: "one", startedAt: 1, status: "running" })

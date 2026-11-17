@@ -23,8 +23,10 @@ test("config is validated and defaulted", () => {
   const ch = parseChannel(base)
   expect(ch).toMatchObject({ name: "dd", everyMs: 60_000, items: "" })
   expect(() => parseChannel({ ...base, every: "0.5m" })).toThrow("minute")
-  expect(() => parseChannel({ ...base, event: {} as any })).toThrow("event.id")
-  expect(() => parseChannel({ ...base, request: {} as any })).toThrow("request.url")
+  // Written by hand in opencode.json(c), so fields can be missing whatever the type says.
+  const missing = (field: "event" | "request") => JSON.parse(JSON.stringify({ ...base, [field]: {} })) as ChannelConfig
+  expect(() => parseChannel(missing("event"))).toThrow("event.id")
+  expect(() => parseChannel(missing("request"))).toThrow("request.url")
 })
 
 test("templates read dot paths, including array indexes; missing fields are empty", () => {
@@ -145,16 +147,16 @@ test("poll sends headers with env values, parses JSON and reports HTTP errors", 
   process.env.TEST_CHANNEL_KEY = "k-123"
   try {
     const ch = parseChannel({ ...base, request: { url: "https://api.test/m", headers: { "DD-API-KEY": "{env:TEST_CHANNEL_KEY}" } } })
-    const calls: any[] = []
+    const calls: Array<[string, RequestInit | undefined]> = []
     const ok = async (url: string, init?: RequestInit) => { calls.push([url, init]); return new Response(JSON.stringify(monitors)) }
     expect((await poll(ch, ok)).length).toBe(2)
-    expect(calls[0][1].method).toBe("GET")
-    expect(calls[0][1].headers["DD-API-KEY"]).toBe("k-123")
+    expect(calls[0][1]?.method).toBe("GET")
+    expect(new Headers(calls[0][1]?.headers).get("DD-API-KEY")).toBe("k-123")
 
     const post = parseChannel({ ...base, request: { url: "https://api.test/m", body: { q: "x" } } })
     await poll(post, ok)
     expect(calls[1][1]).toMatchObject({ method: "POST", body: '{"q":"x"}' })
-    expect(calls[1][1].headers["content-type"]).toBe("application/json")
+    expect(new Headers(calls[1][1]?.headers).get("content-type")).toBe("application/json")
 
     await expect(poll(ch, async () => new Response("forbidden", { status: 403 }))).rejects.toThrow("HTTP 403: forbidden")
     await expect(poll(ch, async () => new Response("<html>"))).rejects.toThrow("not JSON")

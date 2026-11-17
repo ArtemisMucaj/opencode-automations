@@ -6,13 +6,29 @@ import {
 } from "./channels.ts"
 import { CODE_MODE } from "./guides.ts"
 import { isActive, listens, runnable } from "./jobs.ts"
+import { tool } from "./schema.ts"
 import type { Runtime, ToolEditor } from "./types.ts"
 import { fmt, leaderLine, orError, plural, text } from "./util.ts"
+
+/** What a channel is made from: channel_create's input, or a saved channel with channel_update's changes. */
+type Draft = Omit<ChannelConfig, "id" | "every" | "filter"> & { every?: string; filter?: Record<string, unknown> }
+
+const isScalar = (v: unknown): v is string | number | boolean => ["string", "number", "boolean"].includes(typeof v)
+
+/** A filter as given to a tool: each value a string, number or boolean, or a list of them. */
+function filterOf(filter: Record<string, unknown>): NonNullable<ChannelConfig["filter"]> {
+  const out: NonNullable<ChannelConfig["filter"]> = {}
+  for (const [path, value] of Object.entries(filter)) {
+    if (isScalar(value) || (Array.isArray(value) && value.every(isScalar))) out[path] = value
+    else throw new Error(`filter.${path} must be a string, number, boolean or a list of them`)
+  }
+  return out
+}
 
 export function channelTools(tools: ToolEditor, rt: Runtime) {
   const { store, tickMs, configChannels, load, mutate, allChannels, pollChannels, processArrivals, track } = rt
 
-  tools.add({
+  tools.add(tool({
     name: "list",
     options: { namespace: "channel", ...CODE_MODE },
     description: "List channels, their status and the automations on them. Reuse one before creating another.",
@@ -39,14 +55,14 @@ export function channelTools(tools: ToolEditor, rt: Runtime) {
       })
       return text(lines.join("\n") + `\n${leaderLine(rt.leader())}`)
     },
-  })
+  }))
 
-  tools.add({
+  tools.add(tool({
     name: "poll",
     options: { namespace: "channel", ...CODE_MODE },
     description: "Poll a channel now; automations that run as events arrive start at once, digests get the events on schedule.",
     input: { type: "object", properties: { id: { type: "string" } }, required: ["id"], additionalProperties: false },
-    execute: async (input: any) => {
+    execute: async (input) => {
       const channels = allChannels()
       const ch = channels.get(input.id) ?? [...channels.values()].find((c) => c.name === input.id)
       if (!ch) return text(`error: no channel "${input.id}"`)
@@ -61,7 +77,7 @@ export function channelTools(tools: ToolEditor, rt: Runtime) {
       const started = await track(processArrivals(load(), ch.id, polled.state))
       return text(`Polled ${ch.id}: ${plural(r.fresh, "new event")}, ${plural(started, "run")} started.`)
     },
-  })
+  }))
 
   const channelProps = {
     name: { type: "string" },
@@ -89,7 +105,7 @@ export function channelTools(tools: ToolEditor, rt: Runtime) {
     },
   } as const
 
-  function draft(input: any, id: string, sessionID: string): { config: ChannelConfig; channel: Channel } {
+  function draft(input: Draft, id: string, sessionID: string): { config: ChannelConfig; channel: Channel } {
     // A run reads event text from outside, which may try to steer it: it can't define requests,
     // or it could be made to send any variable of the server's environment to any URL.
     if (rt.runOf(sessionID)) throw new Error("channels can't be created or changed from inside an automation run; the user does that in chat")
@@ -97,7 +113,7 @@ export function channelTools(tools: ToolEditor, rt: Runtime) {
       id, every: input.every ?? "5m", request: input.request, event: input.event,
       ...(input.name ? { name: input.name } : {}),
       ...(input.items !== undefined ? { items: input.items } : {}),
-      ...(input.filter ? { filter: input.filter } : {}),
+      ...(input.filter ? { filter: filterOf(input.filter) } : {}),
     }
     const channel = parseChannel(config)
     const secrets = literalSecrets(config.request)
@@ -110,7 +126,7 @@ export function channelTools(tools: ToolEditor, rt: Runtime) {
     return { config, channel }
   }
 
-  tools.add({
+  tools.add(tool({
     name: "create",
     options: { namespace: "channel", ...CODE_MODE },
     description:
@@ -122,8 +138,8 @@ export function channelTools(tools: ToolEditor, rt: Runtime) {
       required: ["id", "request", "event"],
       additionalProperties: false,
     },
-    execute: (input: any, tc) => orError(async () => {
-      if (!CHANNEL_ID.test(input.id ?? "")) throw new Error('id must be lowercase letters, digits, - and _ (e.g. "datadog-alerts")')
+    execute: (input, tc) => orError(async () => {
+      if (!CHANNEL_ID.test(input.id)) throw new Error('id must be lowercase letters, digits, - and _ (e.g. "datadog-alerts")')
       if (configChannels.has(input.id)) throw new Error(`"${input.id}" is a config channel; pick another id`)
       const { config } = draft(input, input.id, tc.sessionID)
       await store.mutateChannels((s) => {
@@ -136,9 +152,9 @@ export function channelTools(tools: ToolEditor, rt: Runtime) {
         (missing.length ? ` Not set yet in the server's environment: ${missing.join(", ")}.` : names.length ? ` Reads ${names.join(", ")} from the environment.` : ""),
       )
     }),
-  })
+  }))
 
-  tools.add({
+  tools.add(tool({
     name: "update",
     options: { namespace: "channel", ...CODE_MODE },
     description: "Change a channel created from chat; given fields replace the current ones. Changing event.id re-delivers items already seen.",
@@ -148,22 +164,22 @@ export function channelTools(tools: ToolEditor, rt: Runtime) {
       required: ["id"],
       additionalProperties: false,
     },
-    execute: (input: any, tc) => orError(async () => {
+    execute: (input, tc) => orError(async () => {
       if (configChannels.has(input.id)) throw new Error(`"${input.id}" is defined in opencode.json(c); edit it there`)
       const updated = await store.mutateChannels((s) => {
         const prev = s.defs[input.id]
         if (!prev) throw new Error(`no channel "${input.id}" created with channel_create`)
-        const merged = { ...prev, ...Object.fromEntries(Object.entries(input).filter(([k, v]) => k !== "id" && v !== undefined)) }
-        const { config } = draft(merged, input.id, tc.sessionID)
+        const { id: _, ...changes } = input
+        const { config } = draft({ ...prev, ...changes }, input.id, tc.sessionID)
         s.defs[input.id] = config
         return config
       })
       const { missing } = envNames(updated.request)
       return text(`Updated channel ${input.id}.${missing.length ? ` Not set yet in the server's environment: ${missing.join(", ")}.` : ""}`)
     }),
-  })
+  }))
 
-  tools.add({
+  tools.add(tool({
     name: "delete",
     options: { namespace: "channel", ...CODE_MODE },
     description:
@@ -175,8 +191,8 @@ export function channelTools(tools: ToolEditor, rt: Runtime) {
       required: ["id"],
       additionalProperties: false,
     },
-    execute: (input: any) => orError(async () => {
-      const id = input.id as string
+    execute: (input) => orError(async () => {
+      const { id } = input
       if (configChannels.has(id)) throw new Error(`"${id}" is defined in opencode.json(c); remove it there`)
       if (!store.loadChannels().defs[id]) throw new Error(`no channel "${id}" created with channel_create`)
       // Under the jobs lock, so an automation can't attach the channel between the check and the delete.
@@ -205,5 +221,5 @@ export function channelTools(tools: ToolEditor, rt: Runtime) {
         (paused.length ? ` Paused (no channels or schedule left): ${paused.join(", ")}.` : ""),
       )
     }),
-  })
+  }))
 }

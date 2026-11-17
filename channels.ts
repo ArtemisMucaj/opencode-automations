@@ -162,10 +162,10 @@ export function parseChannel(c: ChannelConfig): Channel {
 /** Value at a dot path ("a.b.0.c"). Empty path: the value itself. */
 export function get(value: unknown, path: string): unknown {
   if (!path) return value
-  let cur: any = value
+  let cur: unknown = value
   for (const part of path.split(".")) {
     if (cur === null || cur === undefined) return undefined
-    cur = cur[part]
+    cur = (cur as Record<string, unknown>)[part]
   }
   return cur
 }

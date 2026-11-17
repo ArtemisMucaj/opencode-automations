@@ -44,8 +44,8 @@ type Compaction = { summary: string; ended: () => void }
  */
 type Shared = { running: Map<string, Running>; compactions: Map<string, Compaction> }
 const SHARED: unique symbol = Symbol.for("OpencodeAutomations-Running")
-const global: typeof globalThis & { [SHARED]?: Shared } = globalThis
-const shared = (global[SHARED] ??= { running: new Map(), compactions: new Map() })
+const globals: typeof globalThis & { [SHARED]?: Shared } = globalThis
+const shared = (globals[SHARED] ??= { running: new Map(), compactions: new Map() })
 const EXECUTION_ENDS = new Set(["session.execution.succeeded", "session.execution.failed", "session.execution.interrupted", "session.idle"])
 
 export default Plugin.define({
