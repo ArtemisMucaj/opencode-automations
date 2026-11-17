@@ -90,13 +90,16 @@ export class Outbox {
     return (Array.isArray(job.notify) ? job.notify : this.on).includes(status)
   }
 
-  /** Write a message to the outbox for every sender that takes its priority, and start sending it. */
+  /**
+   * Write a message to the outbox for every sender that takes its priority, and start sending it. Returns how
+   * many senders take it: none when every one is set to a higher minPriority.
+   */
   add(m: Message, from: { job?: string; run?: string } = {}): number {
     const priority = m.priority ?? "normal"
     const to = this.senders.filter((s) => RANK[priority] >= RANK[s.minPriority ?? "low"]).map((s) => s.id)
-    const id = this.store.enqueue({ ...from, title: m.title, body: m.body, priority, url: m.url, urlTitle: m.urlTitle }, to)
-    this.kick()
-    return id
+    this.store.enqueue({ ...from, title: m.title, body: m.body, priority, url: m.url, urlTitle: m.urlTitle }, to)
+    if (to.length) this.kick()
+    return to.length
   }
 
   /** Start sending what is due, without waiting for it (retries come due on the leader's ticks). */

@@ -85,13 +85,50 @@ test("events taken by a run wait no more; given back, they wait again, and faile
   expect(store.db.query("SELECT COUNT(*) AS n FROM deliveries WHERE job = 'b'").get()).toEqual({ n: 0 })
 })
 
-test("trimming drops old events whose item is gone, but never one the channel still returns", () => {
+test("trimming drops old events whose item is gone, but never one the channel still returns or someone still has to take", () => {
   const store = open()
   const day = 24 * 60 * 60_000
-  poll(store, 0, ev("gone"), ev("stays"))
+  subscribe(store, [job("monthly", ["dd"])])
+  poll(store, 0, ev("taken"), ev("untaken"), ev("stays"))
+  const [taken] = store.waiting("monthly")
+  store.take("monthly", [taken.seq])
   poll(store, 10 * day, ev("stays"))
   store.trim(latest, 10 * day)
-  expect(store.db.query("SELECT id FROM inbox").all()).toEqual([{ id: "stays" }])
+  expect(store.db.query("SELECT id FROM inbox ORDER BY seq").all()).toEqual([{ id: "untaken" }, { id: "stays" }])
+})
+
+test("events are taken once: a second take of the same ones gets none", () => {
+  const store = open()
+  subscribe(store, [job("a", ["dd"])])
+  poll(store, 10, ev("1"))
+  const [one] = store.waiting("a")
+  expect([...store.take("a", [one.seq])]).toEqual([one.seq])
+  expect([...store.take("a", [one.seq])]).toEqual([])
+  // Given back for a retry, it can be taken again.
+  store.giveBack("a", [one.seq], true)
+  expect([...store.take("a", [one.seq])]).toEqual([one.seq])
+})
+
+test("a deleted job's state goes with it, and jobs keep their order when saved", async () => {
+  const store = open()
+  store.saveJobs([job("a", ["dd"]), job("b", [])])
+  store.setNote("a", "", "old note")
+  store.setSession("a", "", "s1")
+  await store.mutate((jobs) => { jobs[0].paused = true })
+  expect(store.loadJobs().map((j) => j.id)).toEqual(["a", "b"])
+  await store.mutate((jobs) => { jobs.splice(0, 1) })
+  expect([store.note("a"), store.session("a")]).toEqual([undefined, undefined])
+})
+
+test("detaching a channel drops the sticky sessions and memory of its keys", () => {
+  const store = open()
+  subscribe(store, [job("a", ["dd", "other"])])
+  store.setSession("a", "dd:1", "s1")
+  store.setNote("a", "dd:1", "n")
+  store.setSession("a", "other:1", "s2")
+  subscribe(store, [job("a", ["other"])])
+  expect([store.session("a", "dd:1"), store.note("a", "dd:1")]).toEqual([undefined, undefined])
+  expect(store.session("a", "other:1")?.id).toBe("s2")
 })
 
 test("sticky sessions are capped per automation, dropping the least recently used with their memory", () => {

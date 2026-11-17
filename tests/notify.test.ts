@@ -53,10 +53,13 @@ test("native gets plain text with markdown cleaned up and the link appended", as
   expect(calls[0].at(-1)).toBe("Summary\n• two MRs (https://x.test/mr)\n• ci red\nhttps://x.test")
 })
 
-test("native macOS sound option is used", async () => {
+test("native macOS sound option is used, and an empty one is silent", async () => {
   const calls: string[][] = []
-  await deliver({ ...native, sound: "Ping" }, message, { platform: "darwin", fetch: noNetwork, exec: async (_command, args) => { calls.push(args) } })
+  const deps: Deps = { platform: "darwin", fetch: noNetwork, exec: async (_command, args) => { calls.push(args) } }
+  await deliver({ ...native, sound: "Ping" }, message, deps)
+  await deliver({ ...native, sound: "" }, message, deps)
   expect(calls[0][3]).toContain('sound name "Ping"')
+  expect(calls[1][3]).not.toContain("sound name")
 })
 
 test("unsupported native platform fails without spawning a process", async () => {

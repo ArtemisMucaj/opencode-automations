@@ -168,7 +168,7 @@ export class Store {
   // ---------- documents ----------
 
   private docs<T>(table: string): Map<string, T> {
-    return new Map(this.all<{ id: string; data: string }>(`SELECT id, data FROM ${table}`).map((r) => [r.id, JSON.parse(r.data) as T]))
+    return new Map(this.all<{ id: string; data: string }>(`SELECT id, data FROM ${table} ORDER BY rowid`).map((r) => [r.id, JSON.parse(r.data) as T]))
   }
 
   /** Make a table hold exactly these documents. Unchanged ones aren't written, so a no-op write wakes nobody. */
@@ -176,7 +176,8 @@ export class Store {
     const saved = new Map(this.all<{ id: string; data: string }>(`SELECT id, data FROM ${table}`).map((r) => [r.id, r.data]))
     for (const [id, doc] of docs) {
       const data = JSON.stringify(doc)
-      if (saved.get(id) !== data) this.run(`INSERT OR REPLACE INTO ${table} (id, data) VALUES (?, ?)`, id, data)
+      // An upsert keeps the row (and its place in the order); INSERT OR REPLACE would move it to the end.
+      if (saved.get(id) !== data) this.run(`INSERT INTO ${table} (id, data) VALUES (?, ?) ON CONFLICT (id) DO UPDATE SET data = excluded.data`, id, data)
     }
     for (const id of saved.keys()) if (!docs.has(id)) this.run(`DELETE FROM ${table} WHERE id = ?`, id)
   }
@@ -189,14 +190,24 @@ export class Store {
     this.tx(() => this.sync("jobs", new Map(jobs.map((j) => [j.id, j]))))
   }
 
-  /** Change jobs in one transaction. `fn` must be synchronous (see tx). */
+  /**
+   * Change jobs in one transaction. `fn` must be synchronous (see tx). What a deleted job took from the
+   * inbox, its sessions and its memory go with it: a new job with the same id starts clean.
+   */
   async mutate<T>(fn: (jobs: Job[]) => T): Promise<T> {
     return this.tx(() => {
       const jobs = this.loadJobs()
+      const before = jobs.map((j) => j.id)
       const result = fn(jobs)
       this.saveJobs(jobs)
+      const kept = new Set(jobs.map((j) => j.id))
+      for (const id of before) if (!kept.has(id)) this.forget(id)
       return result
     })
+  }
+
+  private forget(jobID: string): void {
+    for (const table of PER_JOB) this.run(`DELETE FROM ${table} WHERE job = ?`, jobID)
   }
 
   loadChannels(): ChannelsState {
@@ -288,7 +299,12 @@ export class Store {
         }
       }
       for (const s of this.all<{ job: string; channel: string }>("SELECT job, channel FROM subscriptions")) {
-        if (!wanted.has(`${s.job}\u0000${s.channel}`)) this.run("DELETE FROM subscriptions WHERE job = ? AND channel = ?", s.job, s.channel)
+        if (wanted.has(`${s.job}\u0000${s.channel}`)) continue
+        this.run("DELETE FROM subscriptions WHERE job = ? AND channel = ?", s.job, s.channel)
+        // The sticky sessions and memory of that channel's keys ("channel:key") go with it.
+        for (const table of ["sessions", "memory"]) {
+          this.run(`DELETE FROM ${table} WHERE job = ? AND substr(key, 1, length(?) + 1) = ? || ':'`, s.job, s.channel, s.channel)
+        }
       }
     })
   }
@@ -327,12 +343,13 @@ export class Store {
     return out
   }
 
-  /** Mark events as handed to a run. */
-  take(jobID: string, seqs: number[]): void {
+  /** Mark events as handed to a run, and return the ones it got: those not taken meanwhile by someone else. */
+  take(jobID: string, seqs: number[]): Set<number> {
     // `WHERE true`: SQLite needs it to tell an upsert's ON CONFLICT from a join's ON after a SELECT.
-    this.run(
+    const rows = this.all<{ seq: number }>(
       "INSERT INTO deliveries (job, seq, status) SELECT ?, value, 'taken' FROM json_each(?) WHERE true " +
-      "ON CONFLICT (job, seq) DO UPDATE SET status = 'taken'", jobID, JSON.stringify(seqs))
+      "ON CONFLICT (job, seq) DO UPDATE SET status = 'taken' WHERE deliveries.status = 'retry' RETURNING seq", jobID, JSON.stringify(seqs))
+    return new Set(rows.map((r) => r.seq))
   }
 
   /**
@@ -350,13 +367,19 @@ export class Store {
   }
 
   /**
-   * Housekeeping: drop old events whose item is gone from its channel (`lastOkAt`: each channel's latest poll),
-   * old outbox messages, and what automations that are gone left behind.
+   * Housekeeping: drop old events whose item is gone from its channel (`lastOkAt`: each channel's latest poll)
+   * and that every automation on it has taken, old outbox messages, and what automations that are gone left
+   * behind (one removed from config, say).
    */
   trim(lastOkAt: Record<string, number | undefined>, now = Date.now()): void {
     this.tx(() => {
+      // Never one an automation on the channel still has to take: a paused one, or a digest that runs monthly.
       for (const c of this.all<{ channel: string }>("SELECT DISTINCT channel FROM inbox")) {
-        this.run("DELETE FROM inbox WHERE channel = ? AND at < ? AND seen_at < ?", c.channel, now - INBOX_RETENTION_MS, lastOkAt[c.channel] ?? now)
+        this.run(
+          "DELETE FROM inbox WHERE channel = ? AND at < ? AND seen_at < ? AND NOT EXISTS (" +
+          "SELECT 1 FROM subscriptions s LEFT JOIN deliveries d ON d.job = s.job AND d.seq = inbox.seq " +
+          "WHERE s.channel = inbox.channel AND (inbox.seq > s.since_seq OR inbox.seen_at >= s.since_poll) AND (d.status IS NULL OR d.status = 'retry'))",
+          c.channel, now - INBOX_RETENTION_MS, lastOkAt[c.channel] ?? now)
       }
       this.run("DELETE FROM outbox WHERE at < ?", now - OUTBOX_RETENTION_MS)
       for (const table of PER_JOB) this.run(`DELETE FROM ${table} WHERE job NOT IN (SELECT id FROM jobs)`)

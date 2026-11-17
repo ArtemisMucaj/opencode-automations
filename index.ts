@@ -345,11 +345,15 @@ export default Plugin.define({
      * back: always when skipped, up to MAX_START_ATTEMPTS when the start failed.
      */
     async function startChunk(job: Job, reason: Reason, key: string | undefined, events: InboxEvent[], names: Record<string, string>): Promise<Run | string> {
-      const seqs = events.map((e) => e.seq)
-      try { store.take(job.id, seqs) } catch (e) {
+      let got: Set<number>
+      try { got = store.take(job.id, events.map((e) => e.seq)) } catch (e) {
         log.warn({ job: job.id, err: e }, "couldn't hand over events, will retry")
         return "the events couldn't be handed over; they're retried on the next tick"
       }
+      // Only the leader starts runs, but a leader that lost its lease mid-tick may have taken some.
+      events = events.filter((e) => got.has(e.seq))
+      if (!events.length) return "another process already took these events"
+      const seqs = events.map((e) => e.seq)
       const run = await startSession(job, reason, {
         text: composeEvents(job.prompt, events, names),
         key,
@@ -510,6 +514,8 @@ export default Plugin.define({
         try { await runAutomation(job, reason, channels) } catch (e) { log.error({ job: job.id, err: e }, "run couldn't be started") }
       }
       if (state && channels) {
+        // Also catches changes that didn't go through mutate() here (the TUI's, another process's).
+        try { store.subscribe(load(), lastOkAt(state.sources)) } catch (e) { log.error({ err: e }, "couldn't update the inbox subscriptions") }
         try { await tickChannels(now, state.sources, channels) } catch (e) { log.error({ err: e }, "channel state can't be read or saved") }
       }
       if (now - trimmedAt >= TRIM_EVERY_MS) {

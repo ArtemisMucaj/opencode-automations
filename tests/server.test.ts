@@ -1485,3 +1485,20 @@ test("the old notify option is refused, naming what replaced it", async () => {
   await expect(start({ notify: { native: true } })).rejects.toThrow("replaced by outbox")
   await expect(start({ outbox: { senders: [{ id: "x", type: "sms" }] } })).rejects.toThrow("type must be one of")
 })
+
+test("a notification no sender takes is recorded, and the run is told it isn't delivered", async () => {
+  const app = await start({ outbox: { senders: [{ ...pushover.senders[0], minPriority: "high" }] } }, [job()])
+  await app.call("automation_run", { id: "morning" })
+  expect((await app.call("automation_notify", { title: "FYI", message: "low stakes" }, "session-1")).content).toContain("not delivered")
+  expect(app.store.sent("morning")[0]).toMatchObject({ title: "FYI", sends: [] })
+})
+
+test("a current automation keeps no memory: its chat is its memory", async () => {
+  const app = await start()
+  await app.call("automation_create", { name: "Here", prompt: "Check", every: "1h", session: "current" })
+  await app.call("automation_run", { id: "here" })
+  expect(app.context("caller").tools).not.toContain("automation_memory_update")
+  await end(app, "caller")
+  expect(app.prompts).toHaveLength(1)
+  expect(app.store.history("here")[0].status).toBe("succeeded")
+})

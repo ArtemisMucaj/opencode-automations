@@ -151,7 +151,7 @@ The agent walks you through it. It reuses a channel if one already watches what 
 - **As events arrive.** An automation with a channel and no schedule runs each time something new comes in, with up to 10 events per run. With a sticky session and a per-item key (one per monitor, one per issue), a flapping alert stays in a single conversation with its history and memory.
 - **As a digest.** An automation with a channel *and* a schedule collects events and runs on schedule with everything since the last run (up to 50). If nothing is new, nothing runs.
 
-One channel can feed several automations, and one automation can listen to several channels. When an automation is attached to a channel, it receives what the channel's latest poll returned (what's alerting right now). After that it receives only new items. Paused automations keep their events for when they resume (events are kept 7 days once their item is gone from the API).
+One channel can feed several automations, and one automation can listen to several channels. When an automation is attached to a channel, it receives what the channel's latest poll returned (what's alerting right now). After that it receives only new items. Paused automations keep their events for when they resume. An event is dropped once every automation on its channel has taken it and its item has been gone from the API for 7 days.
 
 **Watching channels.** The `c` key in `/automations` shows each channel's status: polling or failing, what it polls and how often, the last poll and error, and which automations it feeds with how many events waiting. If a channel fails three polls in a row (expired key, API down), you get one notification.
 

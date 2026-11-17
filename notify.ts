@@ -196,10 +196,11 @@ export async function deliver(sender: Sender, m: Message, deps: Deps = defaultDe
     case "native": {
       const body = m.url ? `${plain}\n${m.url}` : plain
       if (deps.platform === "darwin") {
+        // No sound setting: one by priority. An empty one: silent.
         const sound = sender.sound ?? (high ? "Basso" : "Glass")
         return deps.exec("osascript", [
           "-e", "on run argv",
-          "-e", `display notification (item 2 of argv) with title (item 1 of argv) subtitle (item 3 of argv) sound name "${sound.replace(/"/g, "")}"`,
+          "-e", `display notification (item 2 of argv) with title (item 1 of argv) subtitle (item 3 of argv)${sound ? ` sound name "${sound.replace(/"/g, "")}"` : ""}`,
           "-e", "end run",
           m.title, body.slice(0, 240), "opencode automations",
         ])
