@@ -42,8 +42,10 @@ type Compaction = { summary: string; ended: () => void }
  * instance other than the one that started its run. That one owns the run (its events, its end); the others
  * only look it up, so a run's tools and guidance work whichever instance serves its session.
  */
-const shared: { running: Map<string, Running>; compactions: Map<string, Compaction> } =
-  ((globalThis as any)[Symbol.for("OpencodeAutomations-Running")] ??= { running: new Map(), compactions: new Map() })
+type Shared = { running: Map<string, Running>; compactions: Map<string, Compaction> }
+const SHARED: unique symbol = Symbol.for("OpencodeAutomations-Running")
+const global: typeof globalThis & { [SHARED]?: Shared } = globalThis
+const shared = (global[SHARED] ??= { running: new Map(), compactions: new Map() })
 const EXECUTION_ENDS = new Set(["session.execution.succeeded", "session.execution.failed", "session.execution.interrupted", "session.idle"])
 
 export default Plugin.define({
@@ -682,7 +684,7 @@ export default Plugin.define({
         try {
           for await (const ev of ctx.event.subscribe({ signal: abort.signal })) {
             backoff = 1000
-            const sid = (ev as any).data?.sessionID as string | undefined
+            const sid = "sessionID" in ev.data && typeof ev.data.sessionID === "string" ? ev.data.sessionID : undefined
             const compaction = sid ? compactions.get(sid) : undefined
             if (compaction && EXECUTION_ENDS.has(ev.type)) {
               compaction.ended()
@@ -692,10 +694,10 @@ export default Plugin.define({
             if (!sid || !running.has(sid)) continue
             switch (ev.type) {
               case "session.text.ended":
-                running.get(sid)!.lastText = (ev as any).data.text
+                running.get(sid)!.lastText = ev.data.text
                 break
               case "session.execution.failed":
-                finish(sid, "failed", JSON.stringify((ev as any).data.error))
+                finish(sid, "failed", JSON.stringify(ev.data.error))
                 break
               case "session.execution.interrupted": // stopped by the user; a timeout finishes the run before it interrupts
                 finish(sid, "failed", "interrupted")
@@ -727,7 +729,7 @@ export default Plugin.define({
       const f = running.find(c.sessionID)
       const notifies = !!f && canNotify(opts.notify, f.job)
       // Every instance's hook may see the session: add each text once.
-      const add = (text: string) => { if (!c.system.some((p: any) => p.text === text)) c.system.push({ type: "text", text }) }
+      const add = (text: string) => { if (!c.system.some((p) => p.text === text)) c.system.push({ type: "text", text }) }
       if (notifies) add(RUN_GUIDE)
       else delete c.tools[NOTIFY_TOOL]
       if (f?.job.session === "sticky") {
