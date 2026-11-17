@@ -117,12 +117,12 @@ How events reach a run:
   doesn't match.
 - **As a digest** (a schedule and a `listen`): the timer event wakes it, and the run gets every matching event since
   the cursor, up to `maxEvents`.
-- **Scheduled with no `listen`**: the timer event wakes it, and the prompt is run as today. Through the new
-  `inbox_list` tool, the run can still look at the inbox and decide for itself what is relevant: "check the inbox for
-  anything from Datadog or GitHub since my last run".
+- **Scheduled with no `listen`**: the timer event wakes it, and the prompt is run as today. A morning brief that
+  should mention overnight alerts declares `listen: { channels: ["datadog"] }` and becomes a digest.
 
-This is how "each run decides what it is interested in" works at two levels. The selector covers what wakes the
-automation and what goes in its prompt. The tool covers what the agent chooses to read during the run.
+The selector is the only place where an automation says what it wants. The agent gets no tool to browse the inbox:
+the plugin decides from the declaration and hands the matching events in the prompt. That keeps the untrusted text
+the agent sees to the events meant for it, and keeps the per-run context small.
 
 What goes away: `QueueState.pending`, `started`, `MAX_QUEUE` per automation, `enqueue`, `requeue`, the first-poll
 special case and `forget` on queues. A paused automation simply doesn't move its cursor, so its events wait in the
@@ -148,8 +148,10 @@ interrupt).
 
 ### Outbox
 
-`automation_notify` stops sending. It validates the message as it does today (line length, part count, the
-per-run limit), so the agent still gets immediate feedback, and then **appends to the outbox** and returns.
+`automation_notify` stops sending. The agent only says what to tell the user and how urgent it is. It knows nothing
+about sinks. The tool checks what holds for any sink (title and message present, short lines, an overall length cap,
+the limit per run), so the agent still gets immediate feedback. Then it **appends to the outbox** and returns
+`Queued.`
 
 ```ts
 interface OutboxMessage {
@@ -161,7 +163,6 @@ interface OutboxMessage {
   priority: "low" | "normal" | "high"
   url?: string
   urlTitle?: string
-  to?: string[]               // sender ids; default: every sender whose rules accept it
 }
 // Status records are appended to outbox.jsonl, latest wins (like history.jsonl):
 interface OutboxStatus { id: string; sender: string; status: "sent" | "failed" | "dropped"; at: number; error?: string; attempts: number }
@@ -173,16 +174,16 @@ times out (`compose`), and "channel X can't poll" (`index.ts` `pollChannels`).
 **Dispatcher.** It runs in the leader, on every tick, and right away when the leader writes a message. For each
 pending (message, sender) pair, it:
 
-1. **Routes.** It checks whether the sender takes this message: the message's `to`, the automation's `outbox.to`, and
-   the sender's own rules (`minPriority`, `automations`, `quiet`).
+1. **Routes.** It checks whether the sender takes this message: the automation's `outbox.to` (in config) and the
+   sender's own rules (`minPriority`, `automations`, `quiet`). Routing is configuration only. The agent never picks a
+   sender.
 2. **Paces.** `maxPerHour` per sender. Low-priority messages during quiet hours are held and folded into one digest
    message when quiet hours end. This is where "start quiet and earn attention" gets a knob.
-3. **Delivers** with the sender's adapter (today's `send` split into one function per sender type).
-4. **Records** a status. A failure is retried with backoff (1m, 5m, 30m), then marked `failed` and logged.
-
-The tool's reply becomes `Queued for pushover, native (message 41). 4 notifications left for this run.` When the
-caller is the leader, the dispatcher runs before the tool returns, so the reply can still say `Sent via …` in the
-common case.
+3. **Delivers** with the sender's adapter (today's `send` split into one function per sender type). The adapter fits
+   the message to its sink: Pushover splits it into numbered parts (at most `MAX_PARTS`, then truncates), native
+   clips it, and a webhook sends it whole. Each adapter maps `priority` to its sink's urgency.
+4. **Records** a status. A failure is retried with backoff (1m, 5m, 30m), then marked `failed` and logged. The run
+   is never told: delivery is the dispatcher's problem, not the agent's.
 
 **Senders** replace the `native` and `pushover` keys:
 
@@ -204,9 +205,10 @@ common case.
   `webhook` (a POST of the JSON message). `ntfy`, Slack and email are easy additions later.
 - `canNotify(job)` becomes "there is at least one sender this job could reach".
 
-**The outbox is also the record of what the user was told.** That is the article's "past messages" memory, for free.
-A new tool, `outbox_list`, gives a run the messages its automation sent recently. Sticky runs then no longer have to
-remember "what I already told the user" in their note.
+**The outbox is also the record of what the user was told**: the article's "past messages". It is for the TUI and
+for the dispatcher (pacing, digests), not a tool for the agent. What a run needs to avoid repeating itself goes in
+its memory note, as today. If that turns out not to be enough, the plugin can add the automation's last few sent
+titles to the run's context, with no new tool.
 
 ### Memory: simple
 
@@ -222,21 +224,19 @@ Changes:
   next run a starting point. The run guide shows the previous note at the top. The warm and cold compaction stays
   sticky only. See open question 3.
 - Not now: notes, progress files, an index and "dreaming". The prompt already plays the "user instructions" file,
-  and the outbox plays "reported".
+  and the outbox keeps the record of what was sent.
 
 ## What the agent sees
 
 | Tool | Change |
 |---|---|
-| `automation_notify` | Writes to the outbox and returns whether it is queued or sent. Same input, plus an optional `to` (sender ids) |
+| `automation_notify` | Writes to the outbox and returns `Queued.` Input: title, message, priority, url, url_title. No sender, no sink-specific limits |
 | `automation_memory_update` | Unchanged. Possibly offered to every run (open question 3) |
-| `inbox_list` *(new)* | `{ channels?, since?: "last-run" \| "24h" \| seq, key?, text?, limit? }`. Events in `<event>` tags, marked as untrusted, as in `composeEvents` |
-| `outbox_list` *(new)* | `{ since?, limit? }`. What this automation (by default) told the user, with delivery status |
-| `automation_create/update` | `listen` replaces `channels` (still accepted), plus `outbox.to` |
+| `automation_create/update` | `listen` replaces `channels` (still accepted). Routing (`outbox.to`) is config only |
 | `channel_*` | Unchanged for the agent. `channel_poll` reports events written to the inbox and the runs it woke |
 
-`guides.ts`: `RUN_GUIDE` names the outbox, `MEMORY_GUIDE` drops "what you told the user" (now `outbox_list`), and
-`CHANNEL_GUIDE` step 6 talks about `listen`.
+There are no new agent tools. `guides.ts`: `RUN_GUIDE` stops mentioning phones and Pushover (the user is notified),
+and `CHANNEL_GUIDE` step 6 talks about `listen`.
 
 ## TUI
 
@@ -285,7 +285,8 @@ the TUI reads the new ones. Old plugin versions can't read the new state.
 2. **Inbox + consumers.** Channels write to `inbox.jsonl`, `consumers.json` replaces the queues, and timers and manual
    runs become inbox events. This is where `index.ts` gets simpler: the per-automation queues, `requeue`,
    `pendingStarts` across processes, and the first-poll code go.
-3. **Agent tools**: `inbox_list`, `outbox_list`, `listen` in `automation_create/update`, and the guides.
+3. **Agent-facing changes**: `listen` in `automation_create/update`, a sink-agnostic `automation_notify`, and the
+   guides.
 4. **Memory file** (+ optionally memory for every automation).
 5. **TUI** inbox and outbox views.
 
@@ -303,8 +304,8 @@ Each PR keeps `bun test` and `bun run typecheck` green and ships its migration.
    possible without sticky sessions. It is also one more thing the agent is asked to do every run.
 4. **Should manual runs from a non-leader wait for the leader's tick** (≤ `tickSeconds`), or may any process start a
    run when the leader is idle? This draft says wait, for a single worker.
-5. **Routing granularity.** Is "sender rules + automation `outbox.to` + message `to`" too much? A smaller start is
-   sender `minPriority` only.
+5. **Routing granularity.** Is "sender rules + automation `outbox.to`" too much? A smaller start is sender
+   `minPriority` only.
 6. **Agent-set follow-ups.** The article's other timer kind: `automation_followup({ in: "2h", note })` would append a
    timer event to the same automation (and key) later, for example "check whether the rollback fixed it". It fits
    the inbox naturally. Should it go in this update or the next?
