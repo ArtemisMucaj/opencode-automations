@@ -1144,7 +1144,15 @@ test("tool input is checked against the tool's schema before the tool runs", asy
   // Nested fields are checked too.
   expect((await app.call("channel_create", { id: "dd", request: { url: 1 }, event: { id: "{id}" } })).content).toContain("input.request.url must be a string")
   expect((await app.call("channel_create", { id: "dd", request: { url: "https://x.test" }, event: { id: "{id}" }, filter: { state: { a: 1 } } })).content)
-    .toContain("filter.state must be a string, number, boolean or a list of them")
+    .toContain("filter.state must be a string, number, boolean, null or a list of them")
+  // A null in a filter is a value to match (field null or missing), not a field left out.
+  await app.call("channel_create", { id: "unassigned", request: { url: "https://x.test" }, event: { id: "{id}" }, filter: { assignee: null } })
+  expect(app.store.loadChannels().defs.unassigned.filter).toEqual({ assignee: null })
+  // One wrong value, one error.
+  expect((await app.call("automation_create", { name: "A", prompt: "p", every: "1h", session: 3 })).content)
+    .toBe("error: input.session must be a string. Nothing was done.")
+  // A tool with no arguments may get no input at all.
+  expect((await app.call("automation_list", null)).content).toContain("- audit [on]")
 })
 
 test("every tool goes through code mode, in two namespaces", async () => {

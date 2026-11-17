@@ -2,7 +2,7 @@
 
 import { describe } from "./cron.ts"
 import {
-  CHANNEL_ID, envNames, literalSecrets, parseChannel, removeChannel, requestPoll, type Channel, type ChannelConfig,
+  CHANNEL_ID, envNames, literalSecrets, parseChannel, removeChannel, requestPoll, type Channel, type ChannelConfig, type Scalar,
 } from "./channels.ts"
 import { CODE_MODE } from "./guides.ts"
 import { isActive, listens, runnable } from "./jobs.ts"
@@ -11,16 +11,16 @@ import type { Runtime, ToolEditor } from "./types.ts"
 import { fmt, leaderLine, orError, plural, text } from "./util.ts"
 
 /** What a channel is made from: channel_create's input, or a saved channel with channel_update's changes. */
-type Draft = Omit<ChannelConfig, "id" | "every" | "filter"> & { every?: string; filter?: Record<string, unknown> }
+type Draft = Omit<ChannelConfig, "id" | "every"> & { every?: string }
 
-const isScalar = (v: unknown): v is string | number | boolean => ["string", "number", "boolean"].includes(typeof v)
+const isScalar = (v: unknown): v is Scalar => v === null || ["string", "number", "boolean"].includes(typeof v)
 
-/** A filter as given to a tool: each value a string, number or boolean, or a list of them. */
+/** A filter as given to a tool: each value a string, number, boolean or null, or a list of them. */
 function filterOf(filter: Record<string, unknown>): NonNullable<ChannelConfig["filter"]> {
   const out: NonNullable<ChannelConfig["filter"]> = {}
   for (const [path, value] of Object.entries(filter)) {
     if (isScalar(value) || (Array.isArray(value) && value.every(isScalar))) out[path] = value
-    else throw new Error(`filter.${path} must be a string, number, boolean or a list of them`)
+    else throw new Error(`filter.${path} must be a string, number, boolean, null or a list of them`)
   }
   return out
 }
@@ -113,7 +113,7 @@ export function channelTools(tools: ToolEditor, rt: Runtime) {
       id, every: input.every ?? "5m", request: input.request, event: input.event,
       ...(input.name ? { name: input.name } : {}),
       ...(input.items !== undefined ? { items: input.items } : {}),
-      ...(input.filter ? { filter: filterOf(input.filter) } : {}),
+      ...(input.filter ? { filter: input.filter } : {}),
     }
     const channel = parseChannel(config)
     const secrets = literalSecrets(config.request)
@@ -141,7 +141,7 @@ export function channelTools(tools: ToolEditor, rt: Runtime) {
     execute: (input, tc) => orError(async () => {
       if (!CHANNEL_ID.test(input.id)) throw new Error('id must be lowercase letters, digits, - and _ (e.g. "datadog-alerts")')
       if (configChannels.has(input.id)) throw new Error(`"${input.id}" is a config channel; pick another id`)
-      const { config } = draft(input, input.id, tc.sessionID)
+      const { config } = draft({ ...input, filter: input.filter && filterOf(input.filter) }, input.id, tc.sessionID)
       await store.mutateChannels((s) => {
         if (s.defs[input.id]) throw new Error(`channel "${input.id}" exists; change it with channel_update`)
         s.defs[input.id] = config
@@ -170,7 +170,9 @@ export function channelTools(tools: ToolEditor, rt: Runtime) {
         const prev = s.defs[input.id]
         if (!prev) throw new Error(`no channel "${input.id}" created with channel_create`)
         const { id: _, ...changes } = input
-        const { config } = draft({ ...prev, ...changes }, input.id, tc.sessionID)
+        // Only the filter given now is checked: a saved one stays as it was.
+        const filter = changes.filter ? filterOf(changes.filter) : prev.filter
+        const { config } = draft({ ...prev, ...changes, filter }, input.id, tc.sessionID)
         s.defs[input.id] = config
         return config
       })

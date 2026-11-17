@@ -1,5 +1,5 @@
 // The tools' input schemas: the TypeScript type each one describes, and a check that an input matches it.
-// opencode hands a tool defined with a JSON schema its input unchecked, so `typed` checks it before the tool runs.
+// opencode hands a tool defined with a JSON schema its input unchecked, so `tool` checks it before the tool runs.
 
 import type { ToolEditor } from "./types.ts"
 import { text } from "./util.ts"
@@ -36,11 +36,12 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 
 /**
  * Whether `value` matches `schema`; what doesn't goes in `errors`. A null optional field is taken as left out
- * (and removed), since models often send one.
+ * (and removed), since models often send one; a null value in a free-form map (no declared field) is kept.
  */
 function valid<S extends JsonSchema>(schema: S, value: unknown, errors: string[], path = "input"): value is Infer<S> {
   const before = errors.length
-  if (schema.enum && !(typeof value === "string" && schema.enum.includes(value))) {
+  // A string, checked by its type below, else one of the values: one error for one wrong value.
+  if (schema.enum && typeof value === "string" && !schema.enum.includes(value)) {
     errors.push(`${path} must be one of ${schema.enum.join(", ")}`)
   }
   switch (schema.type) {
@@ -67,7 +68,7 @@ function valid<S extends JsonSchema>(schema: S, value: unknown, errors: string[]
       const props = schema.properties ?? {}
       const required = new Set(schema.required ?? [])
       for (const [key, v] of Object.entries(value)) {
-        if (v === null && !required.has(key)) { delete value[key]; continue }
+        if (v === null && key in props && !required.has(key)) { delete value[key]; continue }
         const prop = props[key] ?? (typeof schema.additionalProperties === "object" ? schema.additionalProperties : undefined)
         if (prop) valid(prop, v, errors, `${path}.${key}`)
         else if (schema.additionalProperties === false) errors.push(`${path}.${key} is not a field`)
@@ -96,7 +97,9 @@ export function tool<const S extends JsonSchema>(
     ...def,
     execute: async (value: unknown, tc: ToolContext) => {
       const errors: string[] = []
-      return valid(def.input, value, errors) ? def.execute(value, tc) : text(`error: ${errors.join("; ")}. Nothing was done.`)
+      // A tool called with no arguments may get no input at all.
+      const input = value ?? (def.input.type === "object" ? {} : value)
+      return valid(def.input, input, errors) ? def.execute(input, tc) : text(`error: ${errors.join("; ")}. Nothing was done.`)
     },
   }
 }

@@ -684,7 +684,8 @@ export default Plugin.define({
         try {
           for await (const ev of ctx.event.subscribe({ signal: abort.signal })) {
             backoff = 1000
-            const sid = "sessionID" in ev.data && typeof ev.data.sessionID === "string" ? ev.data.sessionID : undefined
+            const data: unknown = ev.data
+            const sid = typeof data === "object" && data !== null && "sessionID" in data && typeof data.sessionID === "string" ? data.sessionID : undefined
             const compaction = sid ? compactions.get(sid) : undefined
             if (compaction && EXECUTION_ENDS.has(ev.type)) {
               compaction.ended()
