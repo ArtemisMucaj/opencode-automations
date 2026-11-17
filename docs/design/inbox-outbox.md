@@ -91,7 +91,7 @@ inbox.
 {
   "id": "alert-triage",
   "listen": {
-    "channels": ["datadog"],        // which channels' events it takes (was `on.channels`)
+    "channels": ["datadog"],        // which channels' events it takes
     "match": { "title": "*P1*" },   // optional: a glob per field (title, body, key, url)
     "from": "now"                   // where its cursor starts when it is created: "now" (default), or "24h", "7d"
   },
@@ -189,8 +189,8 @@ pending (message, sender) pair, it:
 
 ```jsonc
 "outbox": {
-  "on": ["failed", "timeout"],      // automatic notices (was notify.on)
-  "maxPerRun": 5,                   // was notify.maxPerRun
+  "on": ["failed", "timeout"],      // automatic notices
+  "maxPerRun": 5,
   "senders": [
     { "id": "desktop", "type": "native", "sound": "Glass" },
     { "id": "phone", "type": "pushover", "token": "{env:PUSHOVER_TOKEN}", "user": "{env:PUSHOVER_USER}",
@@ -232,7 +232,7 @@ Changes:
 |---|---|
 | `automation_notify` | Writes to the outbox and returns `Queued.` Input: title, message, priority, url, url_title. No sender, no sink-specific limits |
 | `automation_memory_update` | Unchanged. Possibly offered to every run (open question 3) |
-| `automation_create/update` | `listen` replaces `channels` (still accepted). Routing (`outbox.to`) is config only |
+| `automation_create/update` | `listen` replaces `channels`. Routing (`outbox.to`) is config only |
 | `channel_*` | Unchanged for the agent. `channel_poll` reports events written to the inbox and the runs it woke |
 
 There are no new agent tools. `guides.ts`: `RUN_GUIDE` stops mentioning phones and Pushover (the user is notified),
@@ -261,27 +261,25 @@ dataDir/
 
 Lock order is jobs, then consumers, then inbox, then outbox. Inbox and outbox appends take only their own lock.
 
-## Compatibility and migration
+## Compatibility: a clean break
 
-On first start with the new version, under the jobs lock:
+There is no migration. Existing config and state are not carried over: automations and channels are recreated
+on the new shapes.
 
-- Each `queues[jobID].pending` is appended to the inbox, and that automation's cursor is set just below the first one,
-  so nothing waiting is lost. `queues[].sessions` → `consumers.json` sessions and `memory.json`.
-- `job.memory` → `memory.json`. `runRequestedAt` → a `manual` inbox event.
-- Config: `notify.native` and `notify.pushover` are read as the senders `desktop` and `phone`, `notify.on` and
-  `maxPerRun` as `outbox.on` and `maxPerRun`, and `on: { channels }` as `listen: { channels }`. The old keys keep
-  working with a deprecation warning in the log.
-- The old fields are removed from `channels.json` and `jobs.json` once migrated. `channels.json` keeps a
-  `version: 2`.
+- The old config keys (`notify`, `on`) are not accepted as aliases. A config that still uses them fails to load,
+  with an error naming the new key (`outbox.senders`, `listen`), so nothing is silently ignored.
+- Old state files (`channels.json` queues, `memory` on jobs, `runRequestedAt`) are not read. On first start, the
+  plugin moves the old data directory's files aside to `legacy-<date>/` and starts empty. It doesn't delete
+  them, so a downgrade is still possible by hand.
+- Released as `feat!`, with a `BREAKING CHANGE:` footer that says to recreate automations and channels.
 
-A user who doesn't touch their config gets the same notifications on the same destinations. Delivery may come up to
-one tick later when the tool is called in a non-leader process. This is a `feat!` because the files on disk change and
-the TUI reads the new ones. Old plugin versions can't read the new state.
+That drops a whole category of code: alias handling, a migration pass, deprecation warnings, and tests for each of
+them.
 
 ## Rollout, as separate PRs
 
 1. **Outbox + senders.** It is self-contained and the biggest win (retries, routing, a record of what was sent).
-   `notify.ts` splits into the outbox, the dispatcher and one adapter per sender. Config migration for `notify`.
+   `notify.ts` splits into the outbox, the dispatcher and one adapter per sender. `notify` config is replaced by `outbox`.
 2. **Inbox + consumers.** Channels write to `inbox.jsonl`, `consumers.json` replaces the queues, and timers and manual
    runs become inbox events. This is where `index.ts` gets simpler: the per-automation queues, `requeue`,
    `pendingStarts` across processes, and the first-poll code go.
@@ -290,7 +288,7 @@ the TUI reads the new ones. Old plugin versions can't read the new state.
 4. **Memory file** (+ optionally memory for every automation).
 5. **TUI** inbox and outbox views.
 
-Each PR keeps `bun test` and `bun run typecheck` green and ships its migration.
+Each PR keeps `bun test` and `bun run typecheck` green. Since there is no migration, each one may change what's on disk freely until the release.
 
 ## Open questions
 
