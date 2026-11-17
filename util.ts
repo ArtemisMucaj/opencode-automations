@@ -57,3 +57,24 @@ export async function orError(fn: () => Promise<{ content: string }>): Promise<{
 }
 
 export const leaderLine = (leader: boolean) => `Leader: ${leader ? "this process" : "another process"}`
+
+/**
+ * A map of this instance's entries, mirrored into a map shared with other instances in the process. Reads see
+ * only this instance's entries, except `find`, which falls back to the other instances' entries.
+ */
+export class Owned<V> {
+  private readonly mine = new Map<string, V>()
+  constructor(private readonly all: Map<string, V>) {}
+  get(id: string) { return this.mine.get(id) }
+  has(id: string) { return this.mine.has(id) }
+  set(id: string, value: V) { this.mine.set(id, value); this.all.set(id, value); return this }
+  delete(id: string) {
+    if (this.mine.has(id) && this.all.get(id) === this.mine.get(id)) this.all.delete(id)
+    return this.mine.delete(id)
+  }
+  clear() { for (const id of [...this.mine.keys()]) this.delete(id) }
+  values() { return this.mine.values() }
+  [Symbol.iterator]() { return this.mine[Symbol.iterator]() }
+  /** This instance's entry, else another instance's. */
+  find(id: string) { return this.mine.get(id) ?? this.all.get(id) }
+}

@@ -608,6 +608,55 @@ test("automation_notify is offered, with guidance, only to runs that may notify"
   expect((await app.call("automation_notify", { title: "x", message: "y" }, "session-2")).content).toContain("error")
 })
 
+/** Another instance of the plugin in this process, as opencode sets up one per directory: its own tools and hooks. */
+async function another(app: Awaited<ReturnType<typeof start>>) {
+  const tools = new Map<string, any>()
+  const hooks = new Map<string, (input: any) => void>()
+  const ctx = {
+    ...app.ctx,
+    tool: {
+      transform: async (fn: any) => fn({
+        add: (tool: any) => tools.set(tool.options?.namespace ? `${tool.options.namespace}_${tool.name}` : tool.name, tool),
+        namespace: () => {},
+      }),
+    },
+    command: { transform: async () => {} },
+    session: { ...app.ctx.session, hook: async (name: string, fn: any) => { hooks.set(name, fn); return { dispose: async () => {} } } },
+  }
+  const teardown = await plugin.setup(ctx as any)
+  cleanups.push(async () => { if (typeof teardown === "function") await teardown() })
+  await flush()
+  const call = (name: string, input: unknown, sessionID: string) => tools.get(name).execute(input, { sessionID })
+  return { call, hooks }
+}
+
+test("a run's tools and guidance work through another instance of the plugin in the same process", async () => {
+  const fetch = spyOn(globalThis, "fetch").mockResolvedValue(new Response("ok"))
+  try {
+    const app = await start({ notify: pushover }, [job({ session: "sticky" })])
+    const other = await another(app)
+    await app.call("automation_run", { id: "morning" })
+
+    // Both instances' hooks may see the session: the guidance comes once, and the run's tools stay.
+    const c = { sessionID: "session-1", options: {}, system: [] as any[], tools: { automation_notify: {}, automation_memory_update: {} } }
+    app.context("session-1")
+    other.hooks.get("context")!(c)
+    other.hooks.get("context")!(c)
+    expect(Object.keys(c.tools)).toEqual(["automation_notify", "automation_memory_update"])
+    const system = c.system.map((p) => p.text)
+    expect(system.join("\n")).toContain("End every run with automation_memory_update")
+    expect(new Set(system).size).toBe(system.length)
+
+    expect((await other.call("automation_notify", { title: "Brief", message: "MR !12 blocked" }, "session-1")).content).toContain("Sent via pushover")
+    expect((await other.call("automation_memory_update", { note: "MR !12 reported." }, "session-1")).content).toContain("Saved")
+    await end(app, "session-1")
+    // The run that started in the first instance saw both: it ended without asking again.
+    expect(app.prompts).toHaveLength(1)
+    expect(app.store.history()[0]).toMatchObject({ status: "succeeded", notifications: 1 })
+    expect(app.store.loadJobs()[0].memory?.note).toBe("MR !12 reported.")
+  } finally { fetch.mockRestore() }
+})
+
 // ---------- sticky memory ----------
 
 /** The memory of a job's sticky session, or of one of its session keys. */
