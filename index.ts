@@ -43,7 +43,7 @@ type Compaction = { summary: string; ended: () => void }
  * only look it up, so a run's tools and guidance work whichever instance serves its session.
  */
 const shared: { running: Map<string, Running>; compactions: Map<string, Compaction> } =
-  ((globalThis as any)[Symbol.for("opencode-automations.running")] ??= { running: new Map(), compactions: new Map() })
+  ((globalThis as any)[Symbol.for("OpencodeAutomations-Running")] ??= { running: new Map(), compactions: new Map() })
 const EXECUTION_ENDS = new Set(["session.execution.succeeded", "session.execution.failed", "session.execution.interrupted", "session.idle"])
 
 export default Plugin.define({
