@@ -37,7 +37,8 @@ export interface ConfigJob extends ScheduleInput {
   notify?: JobNotify
 }
 
-export interface InFlight {
+/** A run in progress in this process: its saved record (status "running") and what tracks it until it ends. */
+export interface Running {
   job: Job
   run: Run
   lastText?: string
@@ -66,7 +67,7 @@ export interface Runtime {
   opts: Options
   store: Store
   /** The run in progress in a session, if any. */
-  runOf(sessionID: string): InFlight | undefined
+  runOf(sessionID: string): Running | undefined
   /** IDs of the jobs running in this process. */
   runningJobs(): string[]
   tickMs: number

@@ -15,13 +15,17 @@ const noNetwork = async (): Promise<Response> => { throw new Error("unexpected n
 const noExec = async () => { throw new Error("unexpected native notification") }
 
 /** The message of the error given to the first log call. */
-const failure = (spy: { mock: { calls: any[][] } }) => String(spy.mock.calls[0][0].err?.message)
+const failure = (spy: { mock: { calls: unknown[][] } }) => {
+  const fields = spy.mock.calls[0][0]
+  const err = typeof fields === "object" && fields !== null && "err" in fields ? fields.err : undefined
+  return String(err instanceof Error ? err.message : undefined)
+}
 
 test("removed notification channels never send requests", async () => {
   let requests = 0
-  await send({
-    ntfy: { topic: "old-topic" }, bark: { key: "old-key" }, webhook: { url: "https://example.invalid" },
-  } as any, message, { platform: "darwin", fetch: async () => { requests++; return new Response("ok") }, exec: noExec })
+  // An old config: these keys are no longer part of the notify options.
+  const old: Record<string, unknown> = { ntfy: { topic: "old-topic" }, bark: { key: "old-key" }, webhook: { url: "https://example.invalid" } }
+  await send(old, message, { platform: "darwin", fetch: async () => { requests++; return new Response("ok") }, exec: noExec })
   expect(requests).toBe(0)
 })
 
@@ -129,7 +133,7 @@ test("Pushover failures include the response body in the log", async () => {
 
 test("long messages are split into numbered parts at paragraph boundaries, in order", async () => {
   const paragraphs = Array.from({ length: 6 }, (_, i) => `Finding ${i + 1}: ` + "detail ".repeat(40).trim())
-  const bodies: any[] = []
+  const bodies: Array<{ title: string; message: string; url?: string }> = []
   const result = await send({ pushover: { token: "t", user: "u" } }, { title: "Audit", body: paragraphs.join("\n\n"), url: "https://x.test" }, {
     platform: "linux", fetch: async (_url, input) => { bodies.push(JSON.parse(input?.body as string)); return new Response("ok") }, exec: noExec,
   })

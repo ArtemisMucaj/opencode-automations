@@ -6,6 +6,59 @@ import { join } from "node:path"
 import plugin from "../index.ts"
 import { cacheLifetime } from "../cache.ts"
 import { Store, type Job, type Memory } from "../store.ts"
+import type { Context, ToolEditor } from "../types.ts"
+
+type Tool = Parameters<ToolEditor["add"]>[0]
+type ToolContext = Parameters<Tool["execute"]>[1]
+type Namespace = Parameters<ToolEditor["namespace"]>[0]
+type CommandEditor = Parameters<Parameters<Context["command"]["transform"]>[0]>[0]
+type Command = Parameters<CommandEditor["add"]>[0]
+/** The session a command is typed in. */
+const CALLER = "caller" as Parameters<Command["execute"]>[0]["sessionID"]
+/** What the plugin sends with session.prompt: the fields the tests read. */
+interface Prompt { sessionID: string; text: string; delivery?: string; metadata: { automation: { reason?: string; [key: string]: unknown } } }
+/** What the plugin sends with session.create: the fields the tests read. */
+interface NewSession { title?: string; model?: unknown; [key: string]: unknown }
+/** What a context or compaction hook gets: the fields the plugin reads and sets. */
+interface HookInput {
+  sessionID: string
+  system?: Array<{ type: string; text: string }>
+  tools?: Record<string, unknown>
+  options?: Record<string, unknown>
+  messages?: unknown[]
+  result?: { summary: string }
+}
+type Hook = (input: HookInput) => void
+
+/** The fake tool editor of a plugin instance: tools by exposed name (namespace_name, as opencode exposes them). */
+function toolEditor(tools: Map<string, Tool>, namespaces: Namespace[] = []) {
+  return {
+    transform: async (fn: (editor: Pick<ToolEditor, "add" | "namespace">) => void) => fn({
+      add: (tool) => { tools.set(tool.options?.namespace ? `${tool.options?.namespace}_${tool.name}` : tool.name, tool) },
+      namespace: (ns) => { namespaces.push(ns) },
+    }),
+  }
+}
+
+/** Call a tool as the session `sessionID` would. */
+async function callTool(tools: Map<string, Tool>, name: string, input: unknown, sessionID: string) {
+  const tool = tools.get(name)
+  if (!tool) throw new Error(`no tool ${name}`)
+  // The tools only read the session from their context.
+  const { content } = await tool.execute(input, { sessionID } as unknown as ToolContext)
+  return { content: typeof content === "string" ? content : JSON.stringify(content) }
+}
+
+type FetchInput = Parameters<typeof fetch>[0]
+type FetchInit = Parameters<typeof fetch>[1]
+/** Replace fetch: `answer` gets the URL as a string and the request options. */
+const mockFetch = (answer: (url: string, init: FetchInit) => Response | Promise<Response>) =>
+  spyOn(globalThis, "fetch").mockImplementation(Object.assign(
+    async (input: FetchInput, init?: FetchInit) => answer(input instanceof Request ? input.url : String(input), init),
+    { preconnect: fetch.preconnect },
+  ))
+/** A request's JSON body. */
+const json = (init: FetchInit): Record<string, unknown> => JSON.parse(String(init?.body))
 
 const cleanups: Array<() => Promise<void>> = []
 afterEach(async () => {
@@ -18,49 +71,44 @@ async function start(options: Record<string, unknown> = {}, jobs: Job[] = [], se
   const store = new Store(dataDir)
   store.saveJobs(jobs)
   await seed?.(store)
-  const tools = new Map<string, any>()
-  const namespaces: any[] = []
+  const tools = new Map<string, Tool>()
+  const namespaces: Namespace[] = []
   const removed: string[] = []
-  const commands = new Map<string, any>()
-  const prompts: any[] = []
-  const sessions: any[] = []
+  const commands = new Map<string, Command>()
+  const prompts: Prompt[] = []
+  const sessions: NewSession[] = []
   /** Compactions asked for, with the summary the plugin's compaction hook gave. */
   const compactions: Array<{ sessionID: string; summary?: string }> = []
   /** Whether compact() rejects the call. */
   const compactMode = { value: "ok" as "ok" | "throw" }
   const events = new EventEmitter()
-  const hooks = new Map<string, (input: any) => void>()
+  const hooks = new Map<string, Hook>()
   const ctx = {
     options: { dataDir, ...options },
     location: { directory: dataDir },
-    // Keyed by the exposed name: namespace_name for namespaced tools, as opencode exposes them.
-    tool: {
-      transform: async (fn: any) => fn({
-        add: (tool: any) => tools.set(tool.options?.namespace ? `${tool.options.namespace}_${tool.name}` : tool.name, tool),
-        namespace: (ns: any) => namespaces.push(ns),
-      }),
-    },
-    command: { transform: async (fn: any) => fn({ add: (command: any) => commands.set(command.name, command) }) },
+    tool: toolEditor(tools, namespaces),
+    command: { transform: async (fn: (editor: Pick<CommandEditor, "add">) => void) => fn({ add: (command) => { commands.set(command.name, command) } }) },
     session: {
-      get: async ({ sessionID }: any) => ({ id: sessionID, time: {}, location: { directory: dataDir } }),
-      create: async (input: any) => {
+      get: async ({ sessionID }: { sessionID: string }): Promise<{ id: string; time: { archived?: number }; location: { directory: string } }> =>
+        ({ id: sessionID, time: {}, location: { directory: dataDir } }),
+      create: async (input: NewSession) => {
         sessions.push(input)
         return { id: `session-${sessions.length}` }
       },
-      prompt: async (input: any) => { prompts.push(input) },
+      prompt: async (input: Prompt) => { prompts.push(input) },
       // Like opencode: the compaction hook may supply the summary, and the compaction's end event comes after it returns.
-      compact: async ({ sessionID }: any) => {
+      compact: async ({ sessionID }: { sessionID: string }) => {
         if (compactMode.value === "throw") throw new Error("no compact endpoint")
-        const c: any = { sessionID, system: [], messages: [], tools: {}, options: {} }
+        const c: HookInput = { sessionID, system: [], messages: [], tools: {}, options: {} }
         hooks.get("compaction")?.(c)
         compactions.push({ sessionID, summary: c.result?.summary })
         setTimeout(() => events.emit("event", { type: "session.execution.succeeded", data: { sessionID } }), 0)
         return { id: "msg_compaction", sessionID, type: "compaction" }
       },
-      wait: async () => {},
-      remove: async ({ sessionID }: any) => { removed.push(sessionID) },
+      wait: async (): Promise<void> => {},
+      remove: async ({ sessionID }: { sessionID: string }) => { removed.push(sessionID) },
       interrupt: async () => {},
-      hook: async (name: string, fn: any) => { hooks.set(name, fn); return { dispose: async () => {} } },
+      hook: async (name: string, fn: Hook) => { hooks.set(name, fn); return { dispose: async () => {} } },
     },
     event: {
       async *subscribe({ signal }: { signal: AbortSignal }) {
@@ -71,23 +119,25 @@ async function start(options: Record<string, unknown> = {}, jobs: Job[] = [], se
     },
   }
   cleanups.push(async () => { store.release(); rmSync(dataDir, { recursive: true, force: true }) })
-  const teardown = await plugin.setup(ctx as any)
+  // Only the parts the plugin uses: the rest of opencode's context isn't there.
+  const teardown = await plugin.setup(ctx as unknown as Context)
   let stopped = false
   const stop = async () => { if (!stopped && typeof teardown === "function") { stopped = true; await teardown() } }
   cleanups.push(stop)
   await flush()
-  const call = (name: string, input = {}, sessionID = "caller") => tools.get(name).execute(input, { sessionID })
+  const call = (name: string, input: unknown = {}, sessionID = "caller") => callTool(tools, name, input, sessionID)
   /** What the model would see for a session: system prompt additions and tool names. */
   const context = (sessionID: string, options: Record<string, unknown> = {}) => {
-    const c = { sessionID, options, system: [] as any[], tools: Object.fromEntries([...tools.keys()].map((k) => [k, {}])) }
+    const system: Array<{ type: string; text: string }> = []
+    const c: HookInput = { sessionID, options, system, tools: Object.fromEntries([...tools.keys()].map((k) => [k, {}])) }
     hooks.get("context")!(c)
-    return { system: c.system.map((p) => p.text).join("\n"), tools: Object.keys(c.tools) }
+    return { system: system.map((p) => p.text).join("\n"), tools: Object.keys(c.tools ?? {}) }
   }
   /** The summary the plugin's compaction hook would give a compaction of this session now. */
   const compactionSummary = (sessionID: string) => {
-    const c: any = { sessionID }
+    const c: HookInput = { sessionID }
     hooks.get("compaction")?.(c)
-    return c.result?.summary as string | undefined
+    return c.result?.summary
   }
   return { store, tools, namespaces, commands, prompts, sessions, compactions, compactMode, removed, events, call, context, compactionSummary, dataDir, stop, ctx }
 }
@@ -112,13 +162,13 @@ test("server loads with current command API and exposes working CRUD tools", asy
   await app.call("automation_delete", { id: "audit" })
   expect(app.store.loadJobs()).toEqual([])
   expect(app.commands.has("automation")).toBe(true)
-  await app.commands.get("automation").execute({ sessionID: "caller", prompt: { text: "list" }, delivery: "queue" })
+  await app.commands.get("automation")!.execute({ sessionID: CALLER, prompt: { text: "list" }, delivery: "queue" })
   expect(app.prompts[0].text).toContain("automation_create")
   expect(app.prompts[0].text).toContain("list")
   expect(app.commands.has("channel")).toBe(true)
-  await app.commands.get("channel").execute({ sessionID: "caller", prompt: { text: "datadog alerts" }, delivery: "queue" })
-  expect(app.prompts.at(-1).text).toContain("channel_create")
-  expect(app.prompts.at(-1).text).toContain("Request: datadog alerts")
+  await app.commands.get("channel")!.execute({ sessionID: CALLER, prompt: { text: "datadog alerts" }, delivery: "queue" })
+  expect(app.prompts.at(-1)?.text).toContain("channel_create")
+  expect(app.prompts.at(-1)?.text).toContain("Request: datadog alerts")
 })
 
 test("paused TUI jobs never fire automatically", async () => {
@@ -180,7 +230,8 @@ test("V2 execution success completes the run without waiting for legacy idle", a
 test("the old session name reuse still loads, as sticky", async () => {
   const app = await start(
     { jobs: [{ id: "cfg", prompt: "p", every: "1h", directory: process.cwd(), session: "reuse" }] },
-    [job({ session: "reuse" as any })],
+    // Saved before "reuse" was renamed, so not a session mode any more.
+    [JSON.parse(JSON.stringify(job({ session: "sticky" })).replace('"sticky"', '"reuse"'))],
   )
   const jobs = app.store.loadJobs()
   expect(jobs.find((j) => j.id === "morning")?.session).toBe("sticky")
@@ -213,7 +264,7 @@ test("editing a completed one-shot schedule reactivates it", async () => {
 })
 
 const pushover = { pushover: { token: "test-token", user: "test-user" } }
-const bodies = (fetch: any) => fetch.mock.calls.map((c: any) => JSON.parse(c[1]?.body as string))
+const bodies = (fetch: { mock: { calls: Array<[FetchInput, FetchInit?]> } }) => fetch.mock.calls.map(([, init]) => json(init))
 
 test("the run's agent sends notifications itself; a successful run then sends nothing else", async () => {
   const fetch = spyOn(globalThis, "fetch").mockResolvedValue(new Response("ok"))
@@ -329,8 +380,8 @@ const triage = (overrides: Record<string, unknown> = {}) => ({
 const monitor = (id: number, modified = "t1", state = "Alert") =>
   ({ id, name: `Monitor ${id}`, overall_state: state, overall_state_modified: modified, message: `details ${id}` })
 /** A fetch that answers channel polls with `monitors()` and anything else (Pushover) with ok. */
-const api = (monitors: () => unknown[]) => spyOn(globalThis, "fetch").mockImplementation((async (url: any) =>
-  String(url).includes("dd.test") ? new Response(JSON.stringify(monitors())) : new Response("ok")) as any)
+const api = (monitors: () => unknown[]) => mockFetch((url) =>
+  url.includes("dd.test") ? new Response(JSON.stringify(monitors())) : new Response("ok"))
 const waiting = (app: { store: Store }, jobID: string) => app.store.loadChannels().queues[jobID]?.pending.map((e) => e.id) ?? []
 
 test("items already there are delivered on the first poll, including to automations added later", async () => {
@@ -410,9 +461,9 @@ test("sticky on a channel with session keys keeps one session per key and queues
     expect(app.store.loadChannels().queues.triage.sessions["dd:1"].at).toBeGreaterThan(usedAt)
     expect(app.sessions).toHaveLength(2)
     const last = app.prompts.at(-1)
-    expect(last.sessionID).toBe("session-1")
-    expect(last.delivery).toBe("queue")
-    expect(last.text).toContain('id="1:t2"')
+    expect(last?.sessionID).toBe("session-1")
+    expect(last?.delivery).toBe("queue")
+    expect(last?.text).toContain('id="1:t2"')
     expect(waiting(app, "triage")).toEqual([])
   } finally { fetch.mockRestore() }
 })
@@ -438,12 +489,12 @@ test("sticky without session keys keeps one session; new ignores session keys", 
 test("one automation runs on several channels; same IDs and keys from different channels stay apart", async () => {
   let dd: unknown[] = []
   let sentry: unknown[] = []
-  const fetch = spyOn(globalThis, "fetch").mockImplementation((async (url: any) => {
-    const u = String(url)
+  const fetch = mockFetch(async (url) => {
+    const u = url
     if (u.includes("dd.test")) return new Response(JSON.stringify(dd))
     if (u.includes("sentry.test")) return new Response(JSON.stringify(sentry))
     return new Response("ok")
-  }) as any)
+  })
   try {
     const app = await start({
       channels: [channel(), channel({ id: "sentry", name: "Sentry", request: { url: "https://sentry.test/issues" } })],
@@ -526,13 +577,13 @@ test("channels nobody listens to aren't polled, and paused automations get no ev
 })
 
 test("a channel that keeps failing notifies once and shows its error", async () => {
-  const fetch = spyOn(globalThis, "fetch").mockImplementation((async (url: any) =>
-    String(url).includes("dd.test") ? new Response("bad key", { status: 403 }) : new Response("ok")) as any)
+  const fetch = mockFetch((url) =>
+    url.includes("dd.test") ? new Response("bad key", { status: 403 }) : new Response("ok"))
   try {
     const app = await start({ notify: pushover, channels: [channel()], jobs: [triage()] })
     for (let i = 0; i < 4; i++) await app.call("channel_poll", { id: "dd" })
     await flush()
-    const notices = fetch.mock.calls.filter((c: any) => String(c[0]).includes("pushover")).map((c: any) => JSON.parse(c[1].body))
+    const notices = fetch.mock.calls.filter(([url]) => String(url).includes("pushover")).map(([, init]) => json(init))
     expect(notices).toHaveLength(1)
     expect(notices[0].title).toBe("Channel Datadog can't poll")
     expect(notices[0].message).toContain("HTTP 403: bad key")
@@ -543,13 +594,13 @@ test("a channel that keeps failing notifies once and shows its error", async () 
 test("a poll still running at shutdown starts nothing and is waited for", async () => {
   let release!: () => void
   let polled = 0
-  const fetch = spyOn(globalThis, "fetch").mockImplementation((async (_url: any, init: any) => {
+  const fetch = mockFetch(async (_url, init) => {
     polled++
     if (polled === 1) return new Response("[]") // first poll primes
     // Second poll hangs until shutdown aborts it.
-    await new Promise<void>((resolve) => { release = resolve; init.signal.addEventListener("abort", () => resolve()) })
+    await new Promise<void>((resolve) => { release = resolve; init?.signal?.addEventListener("abort", () => resolve()) })
     return new Response(JSON.stringify([monitor(1)]))
-  }) as any)
+  })
   try {
     const app = await start({ channels: [channel()], jobs: [triage()] })
     const pending = app.call("channel_poll", { id: "dd" })
@@ -594,7 +645,7 @@ test("automation_notify is offered, with guidance, only to runs that may notify"
   expect(run.system).toEndWith('This run is for the automation "Morning" (id: morning). Each run starts in a new session. You can send up to 5 notifications in this run.')
   expect(run.system).toContain("not sent anywhere")
   expect(run.system).toContain("no markdown")
-  expect(app.tools.get("automation_notify").description).toContain("full URLs")
+  expect(app.tools.get("automation_notify")?.description).toContain("full URLs")
 
   for (const sid of ["session-2", "caller"]) {
     const c = app.context(sid)
@@ -610,23 +661,18 @@ test("automation_notify is offered, with guidance, only to runs that may notify"
 
 /** Another instance of the plugin in this process, as opencode sets up one per directory: its own tools and hooks. */
 async function another(app: Awaited<ReturnType<typeof start>>) {
-  const tools = new Map<string, any>()
-  const hooks = new Map<string, (input: any) => void>()
+  const tools = new Map<string, Tool>()
+  const hooks = new Map<string, Hook>()
   const ctx = {
     ...app.ctx,
-    tool: {
-      transform: async (fn: any) => fn({
-        add: (tool: any) => tools.set(tool.options?.namespace ? `${tool.options.namespace}_${tool.name}` : tool.name, tool),
-        namespace: () => {},
-      }),
-    },
+    tool: toolEditor(tools),
     command: { transform: async () => {} },
-    session: { ...app.ctx.session, hook: async (name: string, fn: any) => { hooks.set(name, fn); return { dispose: async () => {} } } },
+    session: { ...app.ctx.session, hook: async (name: string, fn: Hook) => { hooks.set(name, fn); return { dispose: async () => {} } } },
   }
-  const teardown = await plugin.setup(ctx as any)
+  const teardown = await plugin.setup(ctx as unknown as Context)
   cleanups.push(async () => { if (typeof teardown === "function") await teardown() })
   await flush()
-  const call = (name: string, input: unknown, sessionID: string) => tools.get(name).execute(input, { sessionID })
+  const call = (name: string, input: unknown, sessionID: string) => callTool(tools, name, input, sessionID)
   return { call, hooks }
 }
 
@@ -638,7 +684,7 @@ test("a run's tools and guidance work through another instance of the plugin in 
     await app.call("automation_run", { id: "morning" })
 
     // Both instances' hooks may see the session: the guidance comes once, and the run's tools stay.
-    const c = { sessionID: "session-1", options: {}, system: [] as any[], tools: { automation_notify: {}, automation_memory_update: {} } }
+    const c = { sessionID: "session-1", options: {}, system: [] as Array<{ type: string; text: string }>, tools: { automation_notify: {}, automation_memory_update: {} } }
     app.context("session-1")
     other.hooks.get("context")!(c)
     other.hooks.get("context")!(c)
@@ -742,7 +788,7 @@ test("a run that saves no memory drops the old one, and one that sent the model 
   await chill(app.store, "morning")
   await app.call("automation_run", { id: "morning" })
   expect(app.compactions).toEqual([])
-  expect(app.prompts.at(-1).sessionID).toBe("session-1")
+  expect(app.prompts.at(-1)?.sessionID).toBe("session-1")
 })
 
 test("if compaction can't be done, the cold run goes on in its whole session", async () => {
@@ -799,10 +845,10 @@ test("with session keys, each key's session goes cold and is compacted to its ow
     await app.call("channel_poll", { id: "dd" })
     const for1 = app.prompts.find((p) => p.text.includes('id="1:t2"'))
     const for2 = app.prompts.find((p) => p.text.includes('id="2:t2"'))
-    expect(for1.sessionID).toBe(one)
+    expect(for1?.sessionID).toBe(one)
     expect(sid("dd:1")).toBe(one)
     expect(app.compactions).toEqual([{ sessionID: one, summary: "Monitor 1: disk full on db-3." }])
-    expect(for2.sessionID).toBe(two)
+    expect(for2?.sessionID).toBe(two)
   } finally { fetch.mockRestore() }
 })
 
@@ -835,7 +881,7 @@ test("a session with a one-hour cache stays warm for a gap a default cache would
   await app.call("automation_run", { id: "morning" })
   await app.call("automation_run", { id: "short" })
   expect(app.prompts.at(-2)).toMatchObject({ sessionID: "session-1", text: "Check things" })
-  expect(app.prompts.at(-1).sessionID).toBe("session-2")
+  expect(app.prompts.at(-1)?.sessionID).toBe("session-2")
   expect(app.compactions.map((c) => c.sessionID)).toEqual(["session-2"])
 })
 
@@ -871,7 +917,7 @@ test("the memory lives on the session's record: a new session starts fresh, and 
   await end(app, "session-1")
   expect(memory(app.store, "morning")).toMatchObject({ note: "state" })
   // The session is gone: the new one starts without the old session's memory, and nothing is compacted.
-  app.ctx.session.get = async ({ sessionID }: any) => ({ id: sessionID, time: { archived: Date.now() }, location: { directory: app.dataDir } })
+  app.ctx.session.get = async ({ sessionID }) => ({ id: sessionID, time: { archived: Date.now() }, location: { directory: app.dataDir } })
   await app.call("automation_run", { id: "morning" })
   expect(app.prompts[1]).toMatchObject({ sessionID: "session-2", text: "Check things" })
   expect(memory(app.store, "morning")).toBeUndefined()
@@ -958,18 +1004,18 @@ test("events from a run that failed to start go back to the queue, up to 3 attem
     const app = await start({ channels: [channel()], jobs: [triage()] })
     let failing = true
     const prompt = app.ctx.session.prompt
-    app.ctx.session.prompt = async (input: any) => { if (failing) throw new Error("server busy"); return prompt(input) }
+    app.ctx.session.prompt = async (input) => { if (failing) throw new Error("server busy"); return prompt(input) }
     current = [monitor(1)]
     await app.call("channel_poll", { id: "dd" })
     expect(app.store.loadChannels().queues.triage.pending).toMatchObject([{ id: "1:t1", attempts: 1 }])
     // It starts once the server is back: nothing was lost.
     failing = false
     await app.call("automation_run", { id: "triage" })
-    expect(app.prompts.at(-1).text).toContain('id="1:t1"')
+    expect(app.prompts.at(-1)?.text).toContain('id="1:t1"')
     expect(app.store.loadChannels().queues.triage.pending).toEqual([])
 
     // A start that keeps failing gives up after 3 attempts.
-    app.events.emit("event", { type: "session.idle", data: { sessionID: app.prompts.at(-1).sessionID } })
+    app.events.emit("event", { type: "session.idle", data: { sessionID: app.prompts.at(-1)?.sessionID } })
     await flush()
     failing = true
     current = [monitor(2)]
@@ -992,7 +1038,7 @@ test("two deliveries at once hand a chunk over only once", async () => {
     expect(app.prompts).toEqual([])
     const runs = await Promise.all([app.call("automation_run", { id: "triage" }), app.call("automation_run", { id: "triage" })])
     expect(app.prompts).toHaveLength(1)
-    expect(runs.map((r: any) => r.content).join("\n")).toContain("still busy")
+    expect(runs.map((r) => r.content).join("\n")).toContain("still busy")
     expect(app.store.history().filter((r) => r.status === "skipped")).toEqual([])
   } finally { fetch.mockRestore() }
 })
@@ -1000,12 +1046,12 @@ test("two deliveries at once hand a chunk over only once", async () => {
 test("channel polls in a tick run in parallel", async () => {
   const started: number[] = []
   const ended: number[] = []
-  const fetch = spyOn(globalThis, "fetch").mockImplementation((async () => {
+  const fetch = mockFetch(async () => {
     started.push(Date.now())
     await new Promise((r) => setTimeout(r, 150))
     ended.push(Date.now())
     return new Response("[]")
-  }) as any)
+  })
   try {
     await start({
       channels: [channel(), channel({ id: "two", request: { url: "https://api.dd.test/two" } })],
@@ -1084,12 +1130,37 @@ test("a tick drops queues of automations that no longer exist", async () => {
   } finally { rmSync(dataDir, { recursive: true, force: true }) }
 })
 
+test("tool input is checked against the tool's schema before the tool runs", async () => {
+  const app = await start()
+  const wrong = await app.call("automation_create", { name: "Audit", prompt: 42, every: "1h" })
+  expect(wrong.content).toBe("error: input.prompt must be a string. Nothing was done.")
+  expect((await app.call("automation_create", { prompt: "p", every: "1h" })).content).toContain("input.name is required")
+  expect((await app.call("automation_create", { name: "A", prompt: "p", every: "1h", colour: "red" })).content).toContain("input.colour is not a field")
+  expect((await app.call("automation_create", { name: "A", prompt: "p", every: "1h", session: "reuse" })).content).toContain("input.session must be one of new, sticky, current")
+  expect((await app.call("automation_create", { name: "A", prompt: "p", channels: ["dd", 3] })).content).toContain("input.channels[1] must be a string")
+  expect(app.store.loadJobs()).toEqual([])
+  // A null optional field counts as left out, as models often send one.
+  expect((await app.call("automation_create", { name: "Audit", prompt: "p", every: "1h", model: null })).content).toContain("Created automation")
+  // Nested fields are checked too.
+  expect((await app.call("channel_create", { id: "dd", request: { url: 1 }, event: { id: "{id}" } })).content).toContain("input.request.url must be a string")
+  expect((await app.call("channel_create", { id: "dd", request: { url: "https://x.test" }, event: { id: "{id}" }, filter: { state: { a: 1 } } })).content)
+    .toContain("filter.state must be a string, number, boolean, null or a list of them")
+  // A null in a filter is a value to match (field null or missing), not a field left out.
+  await app.call("channel_create", { id: "unassigned", request: { url: "https://x.test" }, event: { id: "{id}" }, filter: { assignee: null } })
+  expect(app.store.loadChannels().defs.unassigned.filter).toEqual({ assignee: null })
+  // One wrong value, one error.
+  expect((await app.call("automation_create", { name: "A", prompt: "p", every: "1h", session: 3 })).content)
+    .toBe("error: input.session must be a string. Nothing was done.")
+  // A tool with no arguments may get no input at all.
+  expect((await app.call("automation_list", null)).content).toContain("- audit [on]")
+})
+
 test("every tool goes through code mode, in two namespaces", async () => {
   const app = await start()
-  expect(app.namespaces.map((n: any) => n.name)).toEqual(["automation", "channel"])
+  expect(app.namespaces.map((n) => n.name)).toEqual(["automation", "channel"])
   for (const [name, tool] of app.tools) {
     expect(tool.options).toEqual({ namespace: name.split("_")[0], codemode: true })
-    expect(`${tool.options.namespace}_${tool.name}`).toBe(name) // exposed names stay automation_* / channel_* 
+    expect(`${tool.options?.namespace}_${tool.name}`).toBe(name) // exposed names stay automation_* / channel_* 
   }
   expect([...app.tools.keys()]).toContain("automation_notify")
   expect([...app.tools.keys()]).not.toContain("channel_test")
@@ -1146,7 +1217,7 @@ test("a session made for a chunk that someone else took is removed again", async
     const app = await start({ channels: [channel()], jobs: [triage({ session: "sticky", cron: "0 0 1 1 *" })] })
     // Another process takes the events while this one creates the key's session.
     const create = app.ctx.session.create
-    app.ctx.session.create = async (input: any) => {
+    app.ctx.session.create = async (input) => {
       await app.store.mutateChannels((s) => { s.queues.triage.pending = [] })
       return create(input)
     }
@@ -1194,7 +1265,7 @@ test("a session made for a chunk is removed when its events can't be taken", asy
     const app = await start({ channels: [channel()], jobs: [triage({ session: "sticky", cron: "0 0 1 1 *" })] })
     const mutateChannels = Store.prototype.mutateChannels
     const create = app.ctx.session.create
-    app.ctx.session.create = async (input: any) => {
+    app.ctx.session.create = async (input) => {
       Store.prototype.mutateChannels = async () => { throw new Error("Lock file is already being held") }
       return create(input)
     }
@@ -1224,8 +1295,8 @@ test("runs on events set the last run time; a digest with nothing waiting doesn'
 test("an automation run can't create or change channels", async () => {
   process.env.TEST_DD_KEY = "s3cret-value"
   // An API that echoes the key back.
-  const fetch = spyOn(globalThis, "fetch").mockImplementation((async (_: any, init: any) =>
-    new Response(JSON.stringify([{ ...monitor(1), echoed: init.headers["DD-API-KEY"] }]))) as any)
+  const fetch = mockFetch((_, init) =>
+    new Response(JSON.stringify([{ ...monitor(1), echoed: new Headers(init?.headers).get("DD-API-KEY") }])))
   try {
     const app = await start({}, [job()])
     expect((await app.call("channel_create", { id: "dd", ...draftChannel() })).content).toContain("Created channel dd")
@@ -1254,7 +1325,7 @@ test("only the leader publishes its config channels", async () => {
 
 test("an API that leaves the items out when there is nothing is an empty poll, not a failure", async () => {
   let body: unknown = { data: {} }
-  const fetch = spyOn(globalThis, "fetch").mockImplementation((async () => new Response(JSON.stringify(body))) as any)
+  const fetch = mockFetch(() => new Response(JSON.stringify(body)))
   try {
     const app = await start({ channels: [channel({ items: "data.issues" })], jobs: [triage({ cron: "0 0 1 1 *" })] })
     expect((await app.call("channel_poll", { id: "dd" })).content).toContain("0 new events")
@@ -1306,9 +1377,9 @@ test("timeouts a timer can't hold are refused", async () => {
 test("two starts of one automation at once make one run, not two in the same session", async () => {
   const app = await start({}, [job({ session: "sticky" })])
   const create = app.ctx.session.create
-  app.ctx.session.create = async (input: any) => { await flush(); return create(input) }
+  app.ctx.session.create = async (input) => { await flush(); return create(input) }
   const [a, b] = await Promise.all([app.call("automation_run", { id: "morning" }), app.call("automation_run", { id: "morning" })])
-  expect([a.content, b.content].filter((c: string) => c.includes("skipped"))).toHaveLength(1)
+  expect([a.content, b.content].filter((c) => c.includes("skipped"))).toHaveLength(1)
   expect(app.prompts).toHaveLength(1)
   expect(app.sessions).toHaveLength(1)
 })
@@ -1335,11 +1406,16 @@ test("a compaction that never finishes doesn't hold the run when the plugin stop
 test("a compaction given up on still gets its summary, and its late end doesn't end the run", async () => {
   // The 30 s the plugin gives a compaction, cut short.
   const real = globalThis.setTimeout
-  const timers = spyOn(globalThis, "setTimeout").mockImplementation(((fn: any, ms?: number, ...args: any[]) => real(fn, ms === 30_000 ? 10 : ms, ...args)) as any)
+  // setTimeout is overloaded (Node's callback form and the DOM's): this stands in for the callback form the plugin uses.
+  const shortened = Object.assign(
+    (fn: () => void, ms?: number) => real(fn, ms === 30_000 ? 10 : ms),
+    { __promisify__: real.__promisify__ },
+  ) as typeof real
+  const timers = spyOn(globalThis, "setTimeout").mockImplementation(shortened)
   try {
     const app = await start({}, [job({ session: "sticky", sessionID: "session-9", memory: { note: "state" } })])
     // The compaction is accepted but only happens later (the session is busy).
-    app.ctx.session.compact = async ({ sessionID }: any) => ({ id: "msg_compaction", sessionID, type: "compaction" })
+    app.ctx.session.compact = async ({ sessionID }) => ({ id: "msg_compaction", sessionID, type: "compaction" })
     app.ctx.session.wait = () => new Promise<void>(() => {})
     expect((await app.call("automation_run", { id: "morning" })).content).toContain("running")
     expect(app.prompts).toHaveLength(1)
@@ -1357,8 +1433,8 @@ test("a compaction given up on still gets its summary, and its late end doesn't 
 
 test("a poll error never carries a key the API echoed back", async () => {
   process.env.TEST_DD_KEY = "s3cret-value"
-  const fetch = spyOn(globalThis, "fetch").mockImplementation((async (_: any, init: any) =>
-    new Response(`forbidden for key ${init.headers["DD-API-KEY"]}`, { status: 403 })) as any)
+  const fetch = mockFetch((_, init) =>
+    new Response(`forbidden for key ${new Headers(init?.headers).get("DD-API-KEY")}`, { status: 403 }))
   try {
     const app = await start()
     await app.call("channel_create", { id: "dd", ...draftChannel() })

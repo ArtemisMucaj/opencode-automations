@@ -4,6 +4,9 @@ import { parseInterval } from "./cron.ts"
 import { errorMessage, httpError, plural, type Fetch } from "./util.ts"
 import type { Memory } from "./store.ts"
 
+/** A filter value. null matches an item whose field is null or missing. */
+export type Scalar = string | number | boolean | null
+
 export interface ChannelConfig {
   id: string
   name?: string
@@ -20,7 +23,7 @@ export interface ChannelConfig {
   /** Dot path to the array of items in the response. Empty or missing: the response itself. */
   items?: string
   /** Keep items whose field (dot path) equals the value, or one of the values. */
-  filter?: Record<string, string | number | boolean | Array<string | number | boolean>>
+  filter?: Record<string, Scalar | Scalar[]>
   /**
    * Templates over each item: `{path.to.field}`.
    * `id` says what counts as a new event. `sessionKey` says which events share a session for an
@@ -35,7 +38,7 @@ export interface Channel {
   everyMs: number
   request: ChannelConfig["request"]
   items: string
-  filter: Record<string, Array<string | number | boolean>>
+  filter: Record<string, Scalar[]>
   event: ChannelConfig["event"]
 }
 
@@ -162,10 +165,10 @@ export function parseChannel(c: ChannelConfig): Channel {
 /** Value at a dot path ("a.b.0.c"). Empty path: the value itself. */
 export function get(value: unknown, path: string): unknown {
   if (!path) return value
-  let cur: any = value
+  let cur: unknown = value
   for (const part of path.split(".")) {
     if (cur === null || cur === undefined) return undefined
-    cur = cur[part]
+    cur = (cur as Record<string, unknown>)[part]
   }
   return cur
 }

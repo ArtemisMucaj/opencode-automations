@@ -20,7 +20,7 @@ import {
 import { checkTimeout, DEFAULT_TIMEOUT_MINUTES, defaultDataDir, find, isActive, listens, parseModel, toSchedule } from "./jobs.ts"
 import { canNotify, compose, DEFAULT_MAX_PER_RUN, send, shouldNotify } from "./notify.ts"
 import { sessionMode, Store, type Job, type Memory, type Run } from "./store.ts"
-import type { InFlight, Loaded, Options, PollResult, Reason, Runtime } from "./types.ts"
+import type { Loaded, Options, PollResult, Reason, Running, Runtime } from "./types.ts"
 import { errorMessage, Owned, within } from "./util.ts"
 
 const MISSED_GRACE_MS = 2 * 60_000
@@ -42,8 +42,10 @@ type Compaction = { summary: string; ended: () => void }
  * instance other than the one that started its run. That one owns the run (its events, its end); the others
  * only look it up, so a run's tools and guidance work whichever instance serves its session.
  */
-const shared: { runs: Map<string, InFlight>; compactions: Map<string, Compaction> } =
-  ((globalThis as any)[Symbol.for("opencode-automations.inflight")] ??= { runs: new Map(), compactions: new Map() })
+type Shared = { running: Map<string, Running>; compactions: Map<string, Compaction> }
+const SHARED: unique symbol = Symbol.for("OpencodeAutomations-Running")
+const globals: typeof globalThis & { [SHARED]?: Shared } = globalThis
+const shared = (globals[SHARED] ??= { running: new Map(), compactions: new Map() })
 const EXECUTION_ENDS = new Set(["session.execution.succeeded", "session.execution.failed", "session.execution.interrupted", "session.idle"])
 
 export default Plugin.define({
@@ -54,7 +56,7 @@ export default Plugin.define({
     const defaultTimeout = checkTimeout(opts.defaultTimeoutMinutes) ?? DEFAULT_TIMEOUT_MINUTES
     const dataDir = opts.dataDir ?? defaultDataDir()
     const store = new Store(dataDir)
-    const inflight = new Owned<InFlight>(shared.runs) // sessionID -> run started here
+    const running = new Owned<Running>(shared.running) // sessionID -> run started here
     const abort = new AbortController()
     let leader = false
 
@@ -235,9 +237,9 @@ export default Plugin.define({
     }
 
     function finish(sessionID: string, status: Run["status"], error?: string) {
-      const f = inflight.get(sessionID)
+      const f = running.get(sessionID)
       if (!f) return
-      inflight.delete(sessionID)
+      running.delete(sessionID)
       clearTimeout(f.timer)
       const run: Run = {
         ...f.run, status, endedAt: Date.now(), error,
@@ -271,7 +273,7 @@ export default Plugin.define({
 
     /** A turn ended: finish the run, unless it may notify, sent nothing and didn't say why (then ask once). */
     function ended(sessionID: string) {
-      const f = inflight.get(sessionID)
+      const f = running.get(sessionID)
       if (!f) return
       if (f.checked) return finish(sessionID, "succeeded")
       const notificationSent = !!f.sent || !canNotify(opts.notify, f.job) || saidNothing(f.lastText)
@@ -298,8 +300,8 @@ export default Plugin.define({
       }
     }
 
-    const running = (jobID: string, key?: string) =>
-      [...inflight.values()].some((f) => f.run.jobID === jobID && f.key === key)
+    const isRunning = (jobID: string, key?: string) =>
+      [...running.values()].some((f) => f.run.jobID === jobID && f.key === key)
     /**
      * Runs being started right now, by job and session key: taking events, picking the session and
      * compacting it all take a while. Reserved before the first await, so a second start (an overlapping
@@ -307,7 +309,7 @@ export default Plugin.define({
      */
     const pendingStarts = new Set<string>()
     const slotOf = (jobID: string, key?: string) => `${jobID}\u0000${key ?? ""}`
-    const busy = (jobID: string, key?: string) => pendingStarts.has(slotOf(jobID, key)) || running(jobID, key)
+    const busy = (jobID: string, key?: string) => pendingStarts.has(slotOf(jobID, key)) || isRunning(jobID, key)
 
     function loadAll(): Loaded {
       const state = store.loadChannels()
@@ -386,7 +388,7 @@ export default Plugin.define({
           // Someone else set this key's session since we read it: keep theirs.
           const current = q.sessions[key!]?.id
           const id = current && current !== savedSession && current !== found ? current : found
-          const keep = [...inflight.values()].filter((f) => f.job.id === job.id && f.key !== undefined).map((f) => f.key!)
+          const keep = [...running.values()].filter((f) => f.job.id === job.id && f.key !== undefined).map((f) => f.key!)
           assign(q, key!, id, Date.now(), keep)
           return { taken, sessionID: id }
         })
@@ -439,7 +441,7 @@ export default Plugin.define({
       // Shutting down: nothing would track the run, and another process may take over.
       if (abort.signal.aborted) return skipped("plugin stopping")
       const slot = slotOf(job.id, how.key)
-      if (how.held ? running(job.id, how.key) : busy(job.id, how.key)) {
+      if (how.held ? isRunning(job.id, how.key) : busy(job.id, how.key)) {
         const run = skipped("previous run still in progress")
         store.appendRun(run)
         return run
@@ -473,8 +475,8 @@ export default Plugin.define({
         // Stopped while it was being prepared: nothing was sent, so events it took go back to their queue.
         if (abort.signal.aborted) return skipped("plugin stopping")
         const run: Run = { ...base, sessionID }
-        const entry: InFlight = { job, run, sent: 0, key: how.key }
-        inflight.set(sessionID, entry)
+        const entry: Running = { job, run, sent: 0, key: how.key }
+        running.set(sessionID, entry)
         store.appendRun(run)
         await mutate((jobs) => { const j = find(jobs, job.id); if (j) j.lastRunAt = run.startedAt })
           .catch((e) => log.error({ job: job.id, err: e }, "couldn't save the last run time"))
@@ -498,7 +500,7 @@ export default Plugin.define({
         return run
       } catch (e) {
         const failed: Run = { ...base, status: "failed", endedAt: Date.now(), error: errorMessage(e) }
-        for (const [sid, f] of inflight) if (f.run.runID === runID) { clearTimeout(f.timer); inflight.delete(sid) }
+        for (const [sid, f] of running) if (f.run.runID === runID) { clearTimeout(f.timer); running.delete(sid) }
         store.appendRun(failed)
         await mutate((jobs) => { const j = find(jobs, job.id); if (j) { j.lastStatus = "failed"; j.lastRunAt = base.startedAt } }).catch(() => {})
         notify(job, failed)
@@ -682,30 +684,31 @@ export default Plugin.define({
         try {
           for await (const ev of ctx.event.subscribe({ signal: abort.signal })) {
             backoff = 1000
-            const sid = (ev as any).data?.sessionID as string | undefined
+            const data: unknown = ev.data
+            const sid = typeof data === "object" && data !== null && "sessionID" in data && typeof data.sessionID === "string" ? data.sessionID : undefined
             const compaction = sid ? compactions.get(sid) : undefined
             if (compaction && EXECUTION_ENDS.has(ev.type)) {
               compaction.ended()
               compactions.delete(sid!)
               continue
             }
-            if (!sid || !inflight.has(sid)) continue
+            if (!sid || !running.has(sid)) continue
             switch (ev.type) {
               case "session.text.ended":
-                inflight.get(sid)!.lastText = (ev as any).data.text
+                running.get(sid)!.lastText = ev.data.text
                 break
               case "session.execution.failed":
-                finish(sid, "failed", JSON.stringify((ev as any).data.error))
+                finish(sid, "failed", JSON.stringify(ev.data.error))
                 break
               case "session.execution.interrupted": // stopped by the user; a timeout finishes the run before it interrupts
                 finish(sid, "failed", "interrupted")
                 break
               case "session.execution.succeeded": // V2 execution completed
-                inflight.get(sid)!.v2 = true
+                running.get(sid)!.v2 = true
                 ended(sid)
                 break
               case "session.idle": // compatibility with hosts emitting legacy idle
-                if (!inflight.get(sid)!.v2) ended(sid)
+                if (!running.get(sid)!.v2) ended(sid)
                 break
             }
           }
@@ -724,10 +727,10 @@ export default Plugin.define({
     const maxPerRun = opts.notify?.maxPerRun ?? DEFAULT_MAX_PER_RUN
 
     await ctx.session.hook?.("context", (c) => {
-      const f = inflight.find(c.sessionID)
+      const f = running.find(c.sessionID)
       const notifies = !!f && canNotify(opts.notify, f.job)
       // Every instance's hook may see the session: add each text once.
-      const add = (text: string) => { if (!c.system.some((p: any) => p.text === text)) c.system.push({ type: "text", text }) }
+      const add = (text: string) => { if (!c.system.some((p) => p.text === text)) c.system.push({ type: "text", text }) }
       if (notifies) add(RUN_GUIDE)
       else delete c.tools[NOTIFY_TOOL]
       if (f?.job.session === "sticky") {
@@ -744,8 +747,8 @@ export default Plugin.define({
 
     const rt: Runtime = {
       ctx, opts, store, tickMs, defaultTimeout, maxPerRun, configChannels,
-      runOf: (sessionID) => inflight.find(sessionID),
-      runningJobs: () => [...inflight.values()].map((f) => f.run.jobID),
+      runOf: (sessionID) => running.find(sessionID),
+      runningJobs: () => [...running.values()].map((f) => f.run.jobID),
       isPolling: (channelID) => polling.has(channelID),
       leader: () => leader,
       load, mutate, checkChannels, allChannels, remember, runAutomation, pollChannels, processArrivals, track,
@@ -786,8 +789,8 @@ export default Plugin.define({
       // Let in-flight ticks and polls (aborted above) settle before another process can take the lease.
       await Promise.allSettled([...work])
       // Nothing tracks these runs any more: close their records, or they'd show as running forever.
-      const open = [...inflight.values()]
-      inflight.clear()
+      const open = [...running.values()]
+      running.clear()
       for (const f of open) {
         clearTimeout(f.timer)
         try { store.appendRun({ ...f.run, status: "failed", endedAt: Date.now(), error: "opencode stopped before the run ended" }) } catch {}

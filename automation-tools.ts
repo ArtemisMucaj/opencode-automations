@@ -6,6 +6,7 @@ import { CODE_MODE, MAX_NOTE } from "./guides.ts"
 import { checkTimeout, find, isActive, newJob, parseModel, runnable, toSchedule } from "./jobs.ts"
 import { canNotify, longLine, MAX_LINE, MAX_PARTS, PUSHOVER, send, split, type Priority } from "./notify.ts"
 import { sessionMode } from "./store.ts"
+import { tool } from "./schema.ts"
 import type { Runtime, ToolEditor } from "./types.ts"
 import { elapsed, errorMessage, fmt, leaderLine, orError, text } from "./util.ts"
 
@@ -18,7 +19,7 @@ const scheduleProps = {
 
 export function automationTools(tools: ToolEditor, rt: Runtime) {
   const { ctx, opts, store, defaultTimeout, maxPerRun, load, mutate, checkChannels, remember, runAutomation } = rt
-  tools.add({
+  tools.add(tool({
     name: "notify",
     options: { namespace: "automation", ...CODE_MODE },
     description:
@@ -47,12 +48,12 @@ export function automationTools(tools: ToolEditor, rt: Runtime) {
       required: ["title", "message"],
       additionalProperties: false,
     },
-    execute: async (input: any, tc) => {
+    execute: async (input, tc) => {
       const f = rt.runOf(tc.sessionID)
       if (!f || !canNotify(opts.notify, f.job)) return text("error: notifications are only available inside an automation run that has them enabled.")
       if (f.sent >= maxPerRun) return text(`error: this run already sent ${f.sent} notifications (limit ${maxPerRun}). Don't send more.`)
-      const title = String(input.title ?? "").trim()
-      const message = String(input.message ?? "").trim()
+      const title = input.title.trim()
+      const message = input.message.trim()
       if (!title || !message) return text("error: title and message are required.")
       const long = longLine(message)
       if (long) {
@@ -70,7 +71,7 @@ export function automationTools(tools: ToolEditor, rt: Runtime) {
           )
         }
       }
-      const priority: Priority = ["low", "normal", "high"].includes(input.priority) ? input.priority : "normal"
+      const priority: Priority = input.priority ?? "normal"
       const result = await send(opts.notify!, { title, body: message, priority, url: input.url, urlTitle: input.url_title })
       if (!result.sent.length) return text(`error: delivery failed (${result.failed.join(", ")}). It was logged; don't retry.`)
       f.sent++
@@ -79,9 +80,9 @@ export function automationTools(tools: ToolEditor, rt: Runtime) {
         `${maxPerRun - f.sent} notifications left for this run.`,
       )
     },
-  })
+  }))
 
-  tools.add({
+  tools.add(tool({
     name: "memory_update",
     options: { namespace: "automation", ...CODE_MODE },
     description:
@@ -95,10 +96,10 @@ export function automationTools(tools: ToolEditor, rt: Runtime) {
       required: ["note"],
       additionalProperties: false,
     },
-    execute: async (input: any, tc) => {
+    execute: async (input, tc) => {
       const f = rt.runOf(tc.sessionID)
       if (f?.job.session !== "sticky") return text("error: memory is only kept for runs of sticky automations.")
-      const note = String(input.note ?? "").trim()
+      const note = input.note.trim()
       if (!note) return text("error: the note is empty.")
       if (note.length > MAX_NOTE) {
         return text(`error: the note is ${note.length} characters; the limit is ${MAX_NOTE}. Keep what the next run needs. Nothing was saved.`)
@@ -109,9 +110,9 @@ export function automationTools(tools: ToolEditor, rt: Runtime) {
       f.memoryUpdated = true
       return text(`Saved (${note.length} characters). The next run that doesn't see this conversation starts from it.`)
     },
-  })
+  }))
 
-  tools.add({
+  tools.add(tool({
     name: "create",
     options: { namespace: "automation", ...CODE_MODE },
     description:
@@ -135,7 +136,7 @@ export function automationTools(tools: ToolEditor, rt: Runtime) {
       required: ["name", "prompt"],
       additionalProperties: false,
     },
-    execute: (input: any, tc) => orError(async () => {
+    execute: (input, tc) => orError(async () => {
       const ids = checkChannels({ on: input.channels?.length ? { channels: input.channels } : undefined, maxEvents: input.maxEvents })
       const on = ids ? { channels: ids } : undefined
       const schedule = toSchedule(input, { channels: !!on })
@@ -173,9 +174,9 @@ export function automationTools(tools: ToolEditor, rt: Runtime) {
         : `${describe(job.schedule)}, next run ${fmt(job.nextRunAt)}`
       return text(`Created automation "${job.name}" (id ${job.id}): ${when}, session=${job.session}.`)
     }),
-  })
+  }))
 
-  tools.add({
+  tools.add(tool({
     name: "list",
     options: { namespace: "automation", ...CODE_MODE },
     description: "List automations: schedule, channels, next and last run.",
@@ -192,9 +193,9 @@ export function automationTools(tools: ToolEditor, rt: Runtime) {
       const running = rt.runningJobs()
       return text(lines.join("\n") + (running.length ? `\nRunning now: ${running.join(", ")}` : "") + `\n${leaderLine(rt.leader())}`)
     },
-  })
+  }))
 
-  tools.add({
+  tools.add(tool({
     name: "update",
     options: { namespace: "automation", ...CODE_MODE },
     description:
@@ -213,7 +214,7 @@ export function automationTools(tools: ToolEditor, rt: Runtime) {
       required: ["id"],
       additionalProperties: false,
     },
-    execute: (input: any) => orError(async () => {
+    execute: (input) => orError(async () => {
       let dropQueue: { all: boolean; channels: string[] } | undefined
       const msg = await mutate(async (jobs) => {
         const j = find(jobs, input.id)
@@ -263,14 +264,14 @@ export function automationTools(tools: ToolEditor, rt: Runtime) {
       })
       return text(msg)
     }),
-  })
+  }))
 
-  tools.add({
+  tools.add(tool({
     name: "delete",
     options: { namespace: "automation", ...CODE_MODE },
     description: "Delete an automation.",
     input: { type: "object", properties: { id: { type: "string" } }, required: ["id"], additionalProperties: false },
-    execute: (input: any) => orError(async () => {
+    execute: (input) => orError(async () => {
       const name = await mutate(async (jobs) => {
         const j = find(jobs, input.id)
         if (!j) throw new Error(`no job "${input.id}"`)
@@ -281,23 +282,23 @@ export function automationTools(tools: ToolEditor, rt: Runtime) {
       })
       return text(`Deleted "${name}".`)
     }),
-  })
+  }))
 
-  tools.add({
+  tools.add(tool({
     name: "run",
     options: { namespace: "automation", ...CODE_MODE },
     description: "Run an automation now.",
     input: { type: "object", properties: { id: { type: "string" } }, required: ["id"], additionalProperties: false },
-    execute: async (input: any) => {
+    execute: async (input) => {
       const j = find(load(), input.id)
       if (!j) return text(`error: no job "${input.id}"`)
       const run = await runAutomation(j, "manual")
       if (typeof run === "string") return text(`Nothing started: ${run}.`)
       return text(`Run ${run.runID}: ${run.status}${run.sessionID ? ` in session ${run.sessionID}` : ""}${run.error ? ` — ${run.error}` : ""}`)
     },
-  })
+  }))
 
-  tools.add({
+  tools.add(tool({
     name: "history",
     options: { namespace: "automation", ...CODE_MODE },
     description: "Recent runs, optionally for one automation: outcome and session. What a run said is in its session.",
@@ -306,7 +307,7 @@ export function automationTools(tools: ToolEditor, rt: Runtime) {
       properties: { id: { type: "string" }, limit: { type: "number" } },
       additionalProperties: false,
     },
-    execute: async (input: any) => {
+    execute: async (input) => {
       const runs = store.history(input.id ? (find(load(), input.id)?.id ?? input.id) : undefined, input.limit ?? 10)
       if (!runs.length) return text("No runs yet.")
       return text(
@@ -320,5 +321,5 @@ export function automationTools(tools: ToolEditor, rt: Runtime) {
           .join("\n"),
       )
     },
-  })
+  }))
 }

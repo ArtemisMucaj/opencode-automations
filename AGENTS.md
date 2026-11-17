@@ -22,12 +22,17 @@ The `.ts` files (the server plugin and everything it and the TUI import) need no
 
 - `index.ts`: the server plugin's setup. Job state, sessions and sticky memory, starting and ending runs, the ticker, channel polling, the event pump, hooks and commands.
 - `automation-tools.ts`, `channel-tools.ts`: the `automation_*` and `channel_*` tools. They reach the running plugin through the `Runtime` object built in `index.ts` (`types.ts`).
+- `schema.ts`: the tools' input schemas. `tool()` types a tool's input from its JSON schema and checks the input against it before the tool runs (opencode passes JSON-schema input through unchecked).
 - `guides.ts`: everything the agent is told (tool names, namespaces, command and run guides).
 - `jobs.ts`: job helpers without state (schedule and model parsing, IDs, what counts as active or running). `cron.ts`: schedules.
 - `channels.ts`: channel definitions, polling, queues, the event prompt. `notify.ts`: notifications. `store.ts`: files and locks.
 - `log.ts`: the pino logger. It writes JSON lines to stderr, never stdout. Log with fields (`log.warn({ job, err }, "what happened")`), not `console`.
 - `util.ts`: small helpers with no knowledge of jobs or channels (bounded waits, error text, time and count formatting, the tools' error wrapper).
 - `tui.tsx`: the whole TUI view. It stays one file: only `tui.tsx` is compiled to `tui.js`, so JSX can't live anywhere else. Logic without JSX goes in a `.ts` file.
+
+## Types
+
+No `any`, in the source or the tests: use `unknown` and narrow it, or a type taken from the SDK. A test fake that stands in for part of an SDK type is cast once, `as unknown as T`, with a comment saying what it leaves out.
 
 ## Commits
 
