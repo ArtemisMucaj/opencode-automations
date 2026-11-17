@@ -1,6 +1,6 @@
 # Design draft: inbox, outbox and senders
 
-Status: draft, for discussion. Nothing here is implemented yet.
+Status: implemented, in a simpler form than drafted below. See [As built](#as-built) for where it differs.
 
 This reshapes the plugin around the primitives described in Anthropic's
 [Building always-on agents](https://claude.com/resources/articles/building-always-on-agents):
@@ -320,13 +320,30 @@ freely until the release.
 1. **Storage**: `bun:sqlite`, one `state.db`.
 2. **First attach**: from the channel's latest poll (`from: "latest"`, default).
 3. **Memory**: one note per automation (per key with sticky keys), for every automation.
-4. **Manual runs**: queued in the inbox and started by the leader on its next tick. The caller is told it's queued.
+4. **Manual runs**: started by the leader. From another process they are queued for its next tick, and the caller is told so.
 5. **Senders**: global config only. Each sender has its own `minPriority`, `maxPerHour` and `quiet` hours, and there
    is no per-automation routing.
 6. **Compatibility**: a clean break, with no migration.
 
+## As built
+
+The implementation follows the decisions above. It keeps less machinery than the rest of this draft describes:
+
+- **Timers don't go through the inbox.** Schedules stay on the job (`nextRunAt`) and the leader fires them on its tick,
+  as before. The scheduler and the worker are the same process, so an inbox event between them would add nothing.
+  Manual runs from another process set `runRequestedAt`, which the leader picks up; the caller is told the run is
+  queued.
+- **No `listen` key.** An automation's `on.channels` is its selector. There are no `match` globs and no `from`
+  option: attaching always starts from the channel's latest poll.
+- **Senders have `minPriority` only.** No `maxPerHour`, no quiet hours, and no per-automation routing yet. Failed
+  sends are retried after 1, 5 and 30 minutes.
+- **Documents where columns aren't needed.** Jobs, channel definitions, poll status and runs are JSON documents in
+  `id, data` tables. Only the inbox, deliveries, subscriptions, sessions, memory and the outbox have columns.
+- **Old files are ignored**, not moved aside. The README says to recreate automations and channels.
+- **The TUI** shows what each automation sent, with each sender's status, in its details. There are no separate inbox
+  or outbox views.
+- **Memory** is offered to every automation except one-shots (`at`), which have no next run.
+
 ## Open questions
 
-1. **Agent-set follow-ups.** The article's other timer kind: `automation_followup({ in: "2h", note })` would append a
-   timer event to the same automation (and key) later, for example "check whether the rollback fixed it". It fits
-   the inbox naturally. Proposed: next update, once the inbox is in.
+None. Agent-set follow-ups (`automation_followup`) are out of scope for this update.

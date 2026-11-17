@@ -1,4 +1,6 @@
 // opencode v2 plugin: run prompts on a schedule, or on events from a channel.
+// Channels write their events to the inbox, and each automation takes the ones from its channels. What a run
+// tells the user goes to the outbox, which the dispatcher delivers to the configured senders (outbox.ts).
 // The tools are in automation-tools.ts and channel-tools.ts, what the agent is told in guides.ts.
 
 import { Plugin } from "@opencode/plugin"
@@ -6,21 +8,17 @@ import { randomUUID } from "node:crypto"
 import { automationTools } from "./automation-tools.ts"
 import { cacheLifetime } from "./cache.ts"
 import { channelTools } from "./channel-tools.ts"
-import {
-  assign, chunks, composeEvents, emptySource, enqueue, ingest, MAX_START_ATTEMPTS, parseChannel, poll, queueOf, requeue,
-  summarize, touch, uid,
-  type Channel, type ChannelEvent, type ChannelsState,
-} from "./channels.ts"
+import { chunks, composeEvents, parseChannel, poll, summarize, type Channel, type ChannelEvent } from "./channels.ts"
 import { nextRun } from "./cron.ts"
 import { log } from "./log.ts"
 import {
   AUTOMATIONS_GUIDE, CHANNEL_GUIDE, MEMORY_GUIDE, MEMORY_GUIDE_SHORT, NAMESPACES, NOTIFY_TOOL, RUN_GUIDE, RUN_GUIDE_SHORT,
-  runContext, saidNothing, UPDATE_TOOL,
+  runContext, saidNothing, UPDATE_TOOL, withMemory,
 } from "./guides.ts"
-import { checkTimeout, DEFAULT_TIMEOUT_MINUTES, defaultDataDir, find, isActive, listens, parseModel, toSchedule } from "./jobs.ts"
-import { canNotify, compose, DEFAULT_MAX_PER_RUN, send, shouldNotify } from "./notify.ts"
-import { sessionMode, Store, type Job, type Memory, type Run } from "./store.ts"
-import type { Loaded, Options, PollResult, Reason, Running, Runtime } from "./types.ts"
+import { checkTimeout, DEFAULT_TIMEOUT_MINUTES, defaultDataDir, find, isActive, listens, parseModel, remembers, toSchedule } from "./jobs.ts"
+import { compose, Outbox } from "./outbox.ts"
+import { Store, type Job, type Run } from "./store.ts"
+import type { Options, PollResult, Reason, Running, Runtime } from "./types.ts"
 import { errorMessage, Owned, within } from "./util.ts"
 
 const MISSED_GRACE_MS = 2 * 60_000
@@ -52,10 +50,12 @@ export default Plugin.define({
   id: "automations",
   setup: async (ctx) => {
     const opts = (ctx.options ?? {}) as Options
+    if ("notify" in opts) throw new Error("[automations] the notify option was replaced by outbox (senders under outbox.senders); see the README")
     const tickMs = Math.max(5, opts.tickSeconds ?? 30) * 1000
     const defaultTimeout = checkTimeout(opts.defaultTimeoutMinutes) ?? DEFAULT_TIMEOUT_MINUTES
     const dataDir = opts.dataDir ?? defaultDataDir()
     const store = new Store(dataDir)
+    const outbox = new Outbox(store, opts.outbox)
     const running = new Owned<Running>(shared.running) // sessionID -> run started here
     const abort = new AbortController()
     let leader = false
@@ -125,7 +125,7 @@ export default Plugin.define({
         prompt: c.prompt,
         schedule: toSchedule(c, { channels: !!ids, allowPast: true }),
         directory: c.directory,
-        session: sessionMode(c.session) ?? "new",
+        session: c.session ?? "new",
         agent: c.agent ?? opts.defaultAgent,
         model: c.model ?? opts.defaultModel,
         timeoutMinutes,
@@ -148,8 +148,6 @@ export default Plugin.define({
         byID.set(def.id, {
           ...def,
           createdAt: prev?.createdAt ?? def.createdAt,
-          sessionID: prev?.sessionID,
-          memory: prev?.memory,
           lastRunAt: prev?.lastRunAt,
           lastStatus: prev?.lastStatus,
           paused: prev?.paused,
@@ -161,11 +159,13 @@ export default Plugin.define({
       return [...byID.values()]
     }
 
-    function mutate<T>(fn: (jobs: Job[]) => T | Promise<T>): Promise<T> {
-      return store.mutate(async (jobs) => {
+    /** Change jobs in one transaction (`fn` must be synchronous). Subscriptions to the inbox follow their channels. */
+    function mutate<T>(fn: (jobs: Job[]) => T): Promise<T> {
+      return store.mutate((jobs) => {
         const merged = load(jobs)
-        const out = await fn(merged)
+        const out = fn(merged)
         jobs.splice(0, jobs.length, ...merged)
+        store.subscribe(merged)
         return out
       })
     }
@@ -191,49 +191,26 @@ export default Plugin.define({
       return s.id
     }
 
-    // ---------- sticky memory ----------
-    // A sticky session is continued while its prompt cache is warm. Once cold, the next run compacts it to the
-    // memory the last run saved, so the earlier runs aren't re-read at full price.
-
-    function memoryOf(jobID: string, key: string | undefined, sessionID: string): Memory | undefined {
-      try {
-        if (key === undefined) {
-          const j = find(load(), jobID)
-          return j?.sessionID === sessionID ? j.memory : undefined
-        }
-        const entry = store.loadChannels().queues[jobID]?.sessions[key]
-        return entry?.id === sessionID ? entry : undefined
-      } catch (e) {
-        log.warn({ job: jobID, err: e }, "couldn't read the memory")
-        return undefined
-      }
-    }
-    const prevNote = (m: Memory | undefined, now = Date.now()) => m?.note && now >= (m.warmUntil ?? 0) ? m.note : undefined
-    async function remember(jobID: string, key: string | undefined, sessionID: string, patch: Memory) {
-      if (key === undefined) {
-        await mutate((jobs) => { const j = find(jobs, jobID); if (j?.sessionID === sessionID) j.memory = { ...j.memory, ...patch } })
-      } else {
-        await store.mutateChannels((s) => { const entry = s.queues[jobID]?.sessions[key]; if (entry?.id === sessionID) Object.assign(entry, patch) })
-      }
-    }
-
-    async function resolveSession(job: Job): Promise<string> {
-      if (job.session !== "new" && job.sessionID) {
-        const id = await alive(job.sessionID)
-        if (id) return id
-        if (job.session === "current") throw new Error(`session ${job.sessionID} is gone`)
-      }
-      const id = await createSession(job, `⏰ ${job.name}${job.session === "new" ? ` · ${new Date().toLocaleString()}` : ""}`)
-      if (job.session === "sticky") await mutate((jobs) => { const j = find(jobs, job.id); if (j) { j.sessionID = id; delete j.memory } })
-      return id
-    }
+    /** Keys of this job's runs in progress, whose sessions mustn't be evicted. */
+    const keysRunning = (jobID: string) => [...running.values()].filter((f) => f.job.id === jobID && f.key !== undefined).map((f) => f.key!)
 
     /**
-     * The sticky session for a session key: the saved one if it still exists, else a new one.
-     * Nothing is written here; startChunk() saves the mapping together with taking the events.
+     * The session a run goes to, and whether it was just made. `sticky`: the saved one for the key (""
+     * without one) if it still exists, else a new one that is saved. `current`: the chat it was made from.
      */
-    async function keySession(job: Job, key: string, events: ChannelEvent[], saved?: string): Promise<string> {
-      return (await alive(saved)) ?? (await createSession(job, `⏰ ${job.name} · ${(events[0]?.title ?? key).slice(0, 60)}`))
+    async function sessionFor(job: Job, key: string | undefined, title: string): Promise<{ id: string; fresh: boolean }> {
+      if (job.session === "current") {
+        const id = await alive(job.sessionID)
+        if (!id) throw new Error(`session ${job.sessionID} is gone`)
+        return { id, fresh: false }
+      }
+      if (job.session === "sticky") {
+        const id = await alive(store.session(job.id, key ?? "")?.id)
+        if (id) return { id, fresh: false }
+      }
+      const id = await createSession(job, title)
+      if (job.session === "sticky") store.setSession(job.id, key ?? "", id, Date.now(), keysRunning(job.id))
+      return { id, fresh: true }
     }
 
     function finish(sessionID: string, status: Run["status"], error?: string) {
@@ -245,29 +222,21 @@ export default Plugin.define({
         ...f.run, status, endedAt: Date.now(), error,
         ...(f.sent ? { notifications: f.sent } : {}),
       }
-      store.appendRun(run)
       // The run is done in memory already (above, synchronously, so a second end event can't finish it twice);
-      // what's saved on disk follows (tracked, so shutdown waits for it).
-      const memory: Memory | undefined = f.job.session !== "sticky" ? undefined : {
-        ...(f.cacheMs !== undefined ? { warmUntil: run.endedAt! + f.cacheMs * WARM_SHARE } : {}),
-        ...(f.memoryUpdated ? {} : { note: undefined }),
-      }
+      // what's saved follows (tracked, so shutdown waits for it).
       void track((async () => {
-        await Promise.all([
-          mutate((jobs) => {
-            const j = find(jobs, run.jobID)
-            if (!j) return
-            j.lastStatus = status
-            if (memory && f.key === undefined && j.sessionID === sessionID) j.memory = { ...j.memory, ...memory }
-          }).catch((e) => log.error({ job: run.jobID, err: e }, "couldn't save the run's outcome on the job")),
-          // A key's session counts as used when its run ends, so an active key isn't the one evicted.
-          f.key !== undefined && store.mutateChannels((s) => {
-            touch(s.queues[f.job.id], f.key!, sessionID)
-            const entry = s.queues[f.job.id]?.sessions[f.key!]
-            if (memory && entry?.id === sessionID) Object.assign(entry, memory)
-          }).catch((e) => log.error({ job: f.job.id, err: e }, "couldn't save channel state after the run")),
-        ])
-        notify(f.job, run)
+        try {
+          store.appendRun(run)
+          if (f.job.session === "sticky") {
+            const key = f.key ?? ""
+            store.touchSession(f.job.id, key, sessionID, run.endedAt!, f.cacheMs !== undefined ? run.endedAt! + f.cacheMs * WARM_SHARE : undefined)
+            // A cold session is compacted to the memory: one this run didn't write would drop what it found.
+            if (!f.memoryUpdated) store.setNote(f.job.id, key, undefined)
+          }
+        } catch (e) { log.error({ job: run.jobID, err: e }, "couldn't save the run's end") }
+        await mutate((jobs) => { const j = find(jobs, run.jobID); if (j) j.lastStatus = status })
+          .catch((e) => log.error({ job: run.jobID, err: e }, "couldn't save the run's outcome on the job"))
+        notice(f.job, run)
       })())
     }
 
@@ -276,8 +245,8 @@ export default Plugin.define({
       const f = running.get(sessionID)
       if (!f) return
       if (f.checked) return finish(sessionID, "succeeded")
-      const notificationSent = !!f.sent || !canNotify(opts.notify, f.job) || saidNothing(f.lastText)
-      const memoryUpdated = f.job.session !== "sticky" || !!f.memoryUpdated
+      const notificationSent = !!f.sent || !outbox.canNotify(f.job) || saidNothing(f.lastText)
+      const memoryUpdated = !!f.memoryUpdated || !remembers(f.job)
       if (notificationSent && memoryUpdated) return finish(sessionID, "succeeded")
       f.checked = true
       const reminders: string[] = []
@@ -294,62 +263,67 @@ export default Plugin.define({
       })
     }
 
-    function notify(job: Job, run: Run) {
-      if (shouldNotify(opts.notify, job, run.status)) {
-        void send(opts.notify!, compose(job, run)).catch((err) => log.error({ job: job.id, err }, "notification failed"))
-      }
+    /** The automatic notice for a run's outcome, if it gets one. */
+    function notice(job: Job, run: Run) {
+      if (!outbox.noticeFor(job, run.status)) return
+      try { outbox.add(compose(job, run), { job: job.id, run: run.runID }) } catch (e) { log.error({ job: job.id, err: e }, "couldn't write a notice to the outbox") }
+      dispatch()
+    }
+
+    /** Send what is due now. Only the leader sends; elsewhere the leader picks it up on its next tick. */
+    function dispatch() {
+      if (leader) void track(outbox.dispatch()).catch((e) => log.error({ err: e }, "outbox dispatch failed"))
     }
 
     const isRunning = (jobID: string, key?: string) =>
       [...running.values()].some((f) => f.run.jobID === jobID && f.key === key)
     /**
-     * Runs being started right now, by job and session key: taking events, picking the session and
-     * compacting it all take a while. Reserved before the first await, so a second start (an overlapping
-     * tick, a manual run or poll) can't take the same events or run in the same session.
+     * Runs being started right now, by job and session key: picking the session and compacting it take a
+     * while. Reserved before the first await, so a second start (an overlapping tick, a manual run or poll)
+     * can't take the same events or run in the same session. Only the leader starts runs, so this is enough.
      */
     const pendingStarts = new Set<string>()
     const slotOf = (jobID: string, key?: string) => `${jobID}\u0000${key ?? ""}`
     const busy = (jobID: string, key?: string) => pendingStarts.has(slotOf(jobID, key)) || isRunning(jobID, key)
-
-    function loadAll(): Loaded {
-      const state = store.loadChannels()
-      return { state, channels: allChannels(state.defs) }
-    }
 
     /**
      * Run a job; returns its run, or why none started. A channel job takes its waiting events: with session
      * keys, several runs may start, and chunks whose session is busy keep waiting. A scheduled digest with
      * nothing waiting doesn't run; a manual run then runs anyway and says there were no new events.
      */
-    async function runAutomation(job: Job, reason: Reason, loaded?: Loaded): Promise<Run | string> {
-      if (!job.on) return startSession(job, reason, { text: job.prompt, session: () => resolveSession(job) })
-      const { runs, why } = await processEvents(job, reason, loaded ?? loadAll())
+    async function runAutomation(job: Job, reason: Reason): Promise<Run | string> {
+      if (!job.on) return startSession(job, reason, { text: job.prompt })
+      const { runs, why } = await processEvents(job, reason)
       if (runs.length) return runs[0]
       if (why !== NOTHING_WAITING || reason !== "manual") return why!
-      return startSession(job, reason, { text: composeEvents(job.prompt, [], channelNames(job.on.channels)), session: () => resolveSession(job) })
+      return startSession(job, reason, { text: composeEvents(job.prompt, [], channelNames(job.on.channels)) })
     }
 
     const NOTHING_WAITING = "nothing is waiting"
     const STOPPING = "the plugin is stopping"
 
-    async function processEvents(job: Job, reason: Reason, loaded: Loaded): Promise<{ runs: Run[]; why?: string }> {
-      const subscribed = (job.on?.channels ?? []).map((id) => loaded.channels.get(id)).filter((c): c is Channel => !!c)
+    async function processEvents(job: Job, reason: Reason, channels = allChannels()): Promise<{ runs: Run[]; why?: string }> {
+      const subscribed = (job.on?.channels ?? []).map((id) => channels.get(id)).filter((c): c is Channel => !!c)
       if (!subscribed.length) return { runs: [], why: `none of its channels exist any more (${job.on?.channels.join(", ")})` }
-      const queue = loaded.state.queues[job.id]
-      if (!queue?.pending.length) return { runs: [], why: NOTHING_WAITING }
-      const names = channelNames(job.on!.channels, loaded.channels)
+      let waiting: ChannelEvent[]
+      try { waiting = store.waiting(job.id) } catch (e) {
+        log.warn({ job: job.id, err: e }, "couldn't read the inbox, will retry")
+        return { runs: [], why: "the inbox couldn't be read; it is retried on the next tick" }
+      }
+      if (!waiting.length) return { runs: [], why: NOTHING_WAITING }
+      const names = channelNames(job.on!.channels, channels)
       const max = job.maxEvents ?? (job.schedule.kind === "event" ? 10 : 50)
       // `sticky` with channels that set session keys: one session per key (per channel).
       const byKey = job.session === "sticky" && subscribed.some((c) => !!c.event.sessionKey)
       const runs: Run[] = []
       let why: string | undefined
-      for (const { key, events } of chunks(queue.pending, byKey, max)) {
+      for (const { key, events } of chunks(waiting, byKey, max)) {
         if (abort.signal.aborted) { why = STOPPING; break }
         if (busy(job.id, key)) { why ??= "its waiting events are for sessions that are still busy; they go in when those finish"; continue }
         const slot = slotOf(job.id, key)
         pendingStarts.add(slot)
         try {
-          const r = await startChunk(job, reason, key, events, names, key !== undefined ? queue.sessions[key]?.id : undefined)
+          const r = await startChunk(job, reason, key, events, names)
           if (typeof r === "string") why ??= r
           else runs.push(r)
         } finally { pendingStarts.delete(slot) }
@@ -358,63 +332,25 @@ export default Plugin.define({
     }
 
     /**
-     * Take one chunk off the queue and start its run; returns the run, or why it didn't start.
-     * Taking the events and saving the key's session is one locked write, before sending, so a crash
-     * can't deliver them twice. If the run doesn't start, the events go back: always when skipped,
-     * up to MAX_START_ATTEMPTS when the start failed.
+     * Hand one chunk of events to a run; returns the run, or why it didn't start. The events are marked as
+     * taken before the prompt is sent, so a crash can't deliver them twice. If the run doesn't start, they go
+     * back: always when skipped, up to MAX_START_ATTEMPTS when the start failed.
      */
-    async function startChunk(
-      job: Job, reason: Reason, key: string | undefined, events: ChannelEvent[], names: Record<string, string>, savedSession?: string,
-    ): Promise<Run | string> {
-      const ids = new Set(events.map(uid))
-      let took: { taken: ChannelEvent[]; sessionID?: string }
-      let found: string | undefined
-      // A key's session that can't be made is a failed start (recorded, notified, counted), not a retry forever.
-      let sessionError: unknown
-      if (key !== undefined) {
-        try { found = await keySession(job, key, events, savedSession) } catch (e) { sessionError = e }
-      }
-      const discard = (used?: string) => {
-        if (found && found !== savedSession && used !== found) void ctx.session.remove?.({ sessionID: found }).catch(() => {})
-      }
-      if (abort.signal.aborted) { discard(); return STOPPING }
-      try {
-        took = await store.mutateChannels((s) => {
-          const q = queueOf(s, job.id)
-          // Only what is still waiting: another process may have taken some in the meantime.
-          const taken = q.pending.filter((e) => ids.has(uid(e)))
-          q.pending = q.pending.filter((e) => !ids.has(uid(e)))
-          if (!taken.length || !found) return { taken }
-          // Someone else set this key's session since we read it: keep theirs.
-          const current = q.sessions[key!]?.id
-          const id = current && current !== savedSession && current !== found ? current : found
-          const keep = [...running.values()].filter((f) => f.job.id === job.id && f.key !== undefined).map((f) => f.key!)
-          assign(q, key!, id, Date.now(), keep)
-          return { taken, sessionID: id }
-        })
-      } catch (e) {
-        discard()
+    async function startChunk(job: Job, reason: Reason, key: string | undefined, events: ChannelEvent[], names: Record<string, string>): Promise<Run | string> {
+      const seqs = events.map((e) => e.seq!)
+      try { store.take(job.id, seqs) } catch (e) {
         log.warn({ job: job.id, err: e }, "couldn't hand over events, will retry")
         return "the events couldn't be handed over; they're retried on the next tick"
       }
-      const { taken, sessionID } = took
-      discard(sessionID)
-      if (!taken.length) return "another process already took these events"
       const run = await startSession(job, reason, {
-        text: composeEvents(job.prompt, taken, names),
-        session: sessionError !== undefined ? () => Promise.reject(sessionError) : sessionID ? async () => sessionID : () => resolveSession(job),
+        text: composeEvents(job.prompt, events, names),
         key,
         held: true,
-        events: taken.map((e) => `${e.channel}:${e.id}`),
+        events: events.map((e) => `${e.channel}:${e.id}`),
+        ...(key !== undefined ? { title: `⏰ ${job.name} · ${(events[0]?.title ?? key).slice(0, 60)}` } : {}),
       })
       if (run.status !== "running") {
-        const back = run.status === "skipped"
-          ? taken
-          : taken.map((e) => ({ ...e, attempts: (e.attempts ?? 0) + 1 })).filter((e) => e.attempts < MAX_START_ATTEMPTS)
-        if (back.length) {
-          try { await store.mutateChannels((s) => requeue(queueOf(s, job.id), back)) }
-          catch (e) { log.error({ job: job.id, err: e }, "couldn't put events back") }
-        }
+        try { store.giveBack(job.id, seqs, run.status !== "skipped") } catch (e) { log.error({ job: job.id, err: e }, "couldn't put events back") }
       }
       return run
     }
@@ -426,13 +362,14 @@ export default Plugin.define({
     const compactions = new Owned<Compaction>(shared.compactions)
 
     /**
-     * Start a run: pick the session, record it, send the prompt, and arm the timeout.
+     * Start a run: pick the session, record it, send the prompt, and arm the timeout. A fresh session gets
+     * the previous run's memory ahead of the prompt; a cold sticky one is compacted to it.
      * `held`: the caller reserved the job's slot in pendingStarts already.
      */
     async function startSession(
       job: Job,
       reason: Reason,
-      how: { text: string; session: () => Promise<string>; key?: string; events?: string[]; held?: boolean },
+      how: { text: string; key?: string; events?: string[]; held?: boolean; title?: string },
     ): Promise<Run> {
       const runID = `${job.id}-${randomUUID()}`
       const base: Run = { jobID: job.id, runID, startedAt: Date.now(), status: "running" }
@@ -449,10 +386,14 @@ export default Plugin.define({
       // Held until the run is tracked: a manual run and a scheduled one mustn't both start in one session.
       if (!how.held) pendingStarts.add(slot)
       try {
-        const sessionID = await how.session()
+        const key = how.key ?? ""
+        const title = how.title ?? `⏰ ${job.name}${job.session === "new" ? ` · ${new Date().toLocaleString()}` : ""}`
+        const { id: sessionID, fresh } = await sessionFor(job, how.key, title)
+        const note = store.note(job.id, key)
+        const text = fresh ? withMemory(how.text, note) : how.text
         // Compact before tracking the run, so the compaction's events aren't taken for the run's.
-        const note = job.session === "sticky" ? prevNote(memoryOf(job.id, how.key, sessionID)) : undefined
-        if (note) {
+        const cold = job.session === "sticky" && !fresh && Date.now() >= (store.session(job.id, key)?.warmUntil ?? 0)
+        if (cold && note) {
           // Given up on but still queued ahead of the run: it keeps its entry, so it still gets its summary
           // and its end event, which comes before the run's, isn't taken for the run's.
           let queued = false
@@ -487,7 +428,7 @@ export default Plugin.define({
 
         await ctx.session.prompt({
           sessionID,
-          text: how.text,
+          text,
           // Don't barge into a session that's mid-turn; wait our turn.
           delivery: job.session === "new" ? null : "queue",
           metadata: {
@@ -503,7 +444,7 @@ export default Plugin.define({
         for (const [sid, f] of running) if (f.run.runID === runID) { clearTimeout(f.timer); running.delete(sid) }
         store.appendRun(failed)
         await mutate((jobs) => { const j = find(jobs, job.id); if (j) { j.lastStatus = "failed"; j.lastRunAt = base.startedAt } }).catch(() => {})
-        notify(job, failed)
+        notice(job, failed)
         return failed
       } finally { if (!how.held) pendingStarts.delete(slot) }
     }
@@ -519,7 +460,7 @@ export default Plugin.define({
     }
 
     async function tickOnce() {
-      leader = store.lease(tickMs * 3)
+      try { leader = store.lease(tickMs * 3) } catch (e) { log.error({ err: e }, "couldn't take the leader lease"); leader = false }
       if (!leader) { published = false; return }
       await publishConfig()
       const now = Date.now()
@@ -547,14 +488,14 @@ export default Plugin.define({
           if (job.nextRunAt === undefined) job.done = true
         }
       })
-      // Unreadable channel state stops the channels, not the automations that only have a schedule.
-      let loaded: Loaded | undefined
-      try { loaded = loadAll() } catch (e) { log.error({ err: e }, "channel state can't be read or saved") }
       // The due jobs' next runs are saved already: one that throws mustn't take the others with it.
       for (const [job, reason] of due) {
-        try { await runAutomation(job, reason, loaded) } catch (e) { log.error({ job: job.id, err: e }, "run couldn't be started") }
+        try { await runAutomation(job, reason) } catch (e) { log.error({ job: job.id, err: e }, "run couldn't be started") }
       }
-      if (loaded) await tickChannels(now, loaded, due.some(([j]) => j.on))
+      // Unreadable channel state stops the channels, not the automations that only have a schedule.
+      try { await tickChannels(now) } catch (e) { log.error({ err: e }, "channel state can't be read or saved") }
+      try { store.trim(now) } catch (e) { log.warn({ err: e }, "couldn't trim the inbox and outbox") }
+      await outbox.dispatch()
     }
 
     // ---------- channel polling ----------
@@ -573,11 +514,11 @@ export default Plugin.define({
 
     /**
      * Poll channels in parallel (one slow API doesn't hold up the others) and save all the results in one
-     * write: new events are queued for each subscriber. Returns each channel's result, and the saved state.
+     * transaction: their events go to the inbox. Returns each channel's result.
      */
-    async function pollChannels(list: Channel[], jobs = load()): Promise<{ results: Map<string, PollResult>; state?: ChannelsState }> {
+    async function pollChannels(list: Channel[], jobs = load()): Promise<Map<string, PollResult>> {
       const results = new Map<string, PollResult>()
-      if (!list.length) return { results }
+      if (!list.length) return results
       for (const ch of list) polling.add(ch.id)
       try {
         const polled = await Promise.all(list.map(async (ch): Promise<Polled> => {
@@ -586,15 +527,15 @@ export default Plugin.define({
         }))
         if (abort.signal.aborted) {
           for (const ch of list) results.set(ch.id, { fresh: 0, error: STOPPING })
-          return { results }
+          return results
         }
         const notices: Array<{ ch: Channel; failures: number; error: string }> = []
-        let state: ChannelsState | undefined
+        const at = Date.now()
         try {
-          state = await store.mutateChannels((s) => {
+          await store.mutateChannels((s) => {
             for (const p of polled) {
-              const src = (s.sources[p.ch.id] ??= emptySource())
-              src.lastPollAt = Date.now()
+              const src = (s.sources[p.ch.id] ??= {})
+              src.lastPollAt = at
               src.pollRequestedAt = undefined
               if (p.events === undefined) {
                 src.lastError = p.error
@@ -603,77 +544,54 @@ export default Plugin.define({
                 if (src.failures === CHANNEL_FAILURE_NOTICE) notices.push({ ch: p.ch, failures: src.failures, error: p.error! })
                 continue
               }
-              src.lastOkAt = src.lastPollAt
+              src.lastOkAt = at
               src.lastError = undefined
               src.failures = 0
-              const fresh = ingest(src, p.events)
-              // Paused automations keep collecting, so nothing is lost while they're paused; finished ones don't.
-              for (const j of jobs) {
-                if (!listens(j, p.ch.id) || !j.enabled || j.done) continue
-                const q = queueOf(s, j.id)
-                // An automation's first poll of a channel gets everything currently there; after that, only what's new.
-                const first = !q.started?.includes(p.ch.id)
-                if (first) q.started = [...(q.started ?? []), p.ch.id]
-                enqueue(q, first ? p.events : fresh) // enqueue skips repeated IDs
-              }
-              results.set(p.ch.id, { fresh: fresh.length })
+              results.set(p.ch.id, { fresh: store.ingest(p.ch.id, p.events, at) })
             }
-            return s
           })
         } catch (e) {
-          // The APIs answered; only saving failed (the lock stayed busy). Not failed polls: the next ones catch up.
+          // The APIs answered; only saving failed (the database stayed busy). Not failed polls: the next ones catch up.
           const error = `couldn't save the poll: ${errorMessage(e)}`
           log.warn({ channels: polled.map((p) => p.ch.id), err: e }, "couldn't save the poll")
           for (const p of polled) results.set(p.ch.id, { fresh: 0, error: p.error ?? error })
-          return { results }
+          return results
         }
         for (const p of polled) if (p.error) log.warn({ channel: p.ch.id, error: p.error }, "poll failed")
         for (const n of notices) {
-          if (!subscribers(n.ch.id, jobs).some((j) => canNotify(opts.notify, j))) continue
-          void send(opts.notify!, {
-            title: `Channel ${n.ch.name} can't poll`,
-            body: `${n.failures} failed polls in a row. Last error: ${n.error}`,
-            priority: "normal",
-          }).catch((err) => log.error({ channel: n.ch.id, err }, "notification failed"))
+          if (!subscribers(n.ch.id, jobs).some((j) => outbox.canNotify(j))) continue
+          try {
+            outbox.add({ title: `Channel ${n.ch.name} can't poll`, body: `${n.failures} failed polls in a row. Last error: ${n.error}`, priority: "normal" })
+          } catch (e) { log.error({ channel: n.ch.id, err: e }, "couldn't write a notice to the outbox") }
         }
-        return { results, state }
+        if (notices.length) dispatch()
+        return results
       } finally { for (const ch of list) polling.delete(ch.id) }
     }
 
-    async function processArrivals(jobs = load(), channelID?: string, state = store.loadChannels()): Promise<number> {
-      const loaded: Loaded = { state, channels: allChannels(state.defs) }
+    /** Start runs for the automations that take events as they arrive (on `channelID`, or on any channel). */
+    async function processArrivals(jobs = load(), channelID?: string): Promise<number> {
+      const channels = allChannels()
       let started = 0
       for (const job of jobs) {
         if (job.schedule.kind !== "event" || !isActive(job) || (channelID && !listens(job, channelID))) continue
-        started += (await processEvents(job, "event", loaded)).runs.filter((r) => r.status === "running").length
+        started += (await processEvents(job, "event", channels)).runs.filter((r) => r.status === "running").length
       }
       return started
     }
 
-    /** `changed`: this tick's due runs took events, so `loaded` is stale. */
-    async function tickChannels(now: number, loaded: Loaded, changed: boolean) {
+    async function tickChannels(now: number) {
       const jobs = load()
-      const { sources, queues } = loaded.state
-      // Queues of automations that no longer exist (deleted from chat, the TUI, or config). Checked again
-      // under the lock against the jobs saved now: an automation created during this tick keeps its queue.
-      if (Object.keys(queues).some((id) => !jobs.some((j) => j.id === id))) {
-        try {
-          await store.mutateChannels((s) => {
-            const ids = new Set(load().map((j) => j.id))
-            for (const id of Object.keys(s.queues)) if (!ids.has(id)) delete s.queues[id]
-          })
-          changed = true
-        } catch (e) { log.error({ err: e }, "channel state can't be read or saved") }
-      }
-      const due = [...loaded.channels.values()].filter((ch) => {
+      const { sources, defs } = store.loadChannels()
+      const due = [...allChannels(defs).values()].filter((ch) => {
         const src = sources[ch.id]
         const requested = src?.pollRequestedAt !== undefined
         if (polling.has(ch.id) || (!requested && !subscribers(ch.id, jobs).length)) return false
         // Half a tick of slack keeps polls close to `every` instead of drifting a whole tick late.
         return requested || !src?.lastPollAt || now - src.lastPollAt >= ch.everyMs - tickMs / 2
       })
-      const { state } = await pollChannels(due, jobs)
-      await processArrivals(jobs, undefined, state ?? (changed || due.length ? store.loadChannels() : loaded.state))
+      await pollChannels(due, jobs)
+      await processArrivals(jobs)
     }
 
     // ---------- event pump: track runs to completion ----------
@@ -724,20 +642,17 @@ export default Plugin.define({
 
     // ---------- hooks, tools, commands ----------
 
-    const maxPerRun = opts.notify?.maxPerRun ?? DEFAULT_MAX_PER_RUN
-
     await ctx.session.hook?.("context", (c) => {
       const f = running.find(c.sessionID)
-      const notifies = !!f && canNotify(opts.notify, f.job)
+      const notifies = !!f && outbox.canNotify(f.job)
       // Every instance's hook may see the session: add each text once.
       const add = (text: string) => { if (!c.system.some((p) => p.text === text)) c.system.push({ type: "text", text }) }
       if (notifies) add(RUN_GUIDE)
       else delete c.tools[NOTIFY_TOOL]
-      if (f?.job.session === "sticky") {
-        add(MEMORY_GUIDE)
-        f.cacheMs ??= cacheLifetime(c.options)
-      } else delete c.tools[UPDATE_TOOL]
-      if (f) add(runContext(f.job, notifies ? maxPerRun : undefined))
+      if (f && remembers(f.job)) add(MEMORY_GUIDE)
+      else delete c.tools[UPDATE_TOOL]
+      if (f?.job.session === "sticky") f.cacheMs ??= cacheLifetime(c.options)
+      if (f) add(runContext(f.job, notifies ? outbox.maxPerRun : undefined))
     })
 
     await ctx.session.hook?.("compaction", (c) => {
@@ -746,12 +661,12 @@ export default Plugin.define({
     })
 
     const rt: Runtime = {
-      ctx, opts, store, tickMs, defaultTimeout, maxPerRun, configChannels,
+      ctx, opts, store, outbox, tickMs, defaultTimeout, configChannels,
       runOf: (sessionID) => running.find(sessionID),
       runningJobs: () => [...running.values()].map((f) => f.run.jobID),
       isPolling: (channelID) => polling.has(channelID),
       leader: () => leader,
-      load, mutate, checkChannels, allChannels, remember, runAutomation, pollChannels, processArrivals, track,
+      load, mutate, checkChannels, allChannels, runAutomation, pollChannels, processArrivals, dispatch, track,
     }
     await ctx.tool.transform((tools) => {
       for (const ns of NAMESPACES) tools.namespace(ns)
@@ -799,8 +714,8 @@ export default Plugin.define({
         await mutate((jobs) => { for (const f of open) { const j = find(jobs, f.job.id); if (j) j.lastStatus = "failed" } })
           .catch((e) => log.error({ err: e }, "couldn't save the stopped runs' outcome"))
       }
-      store.release()
       await pump.catch(() => {})
+      store.close()
     }
   },
 })

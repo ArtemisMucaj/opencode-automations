@@ -1,8 +1,8 @@
-// Channels: event sources for automations.
+// Channels: event sources polled from HTTP APIs. A poll's events go to the inbox (store.ts), where each
+// automation takes the ones from its channels.
 
 import { parseInterval } from "./cron.ts"
 import { errorMessage, httpError, plural, type Fetch } from "./util.ts"
-import type { Memory } from "./store.ts"
 
 /** A filter value. null matches an item whose field is null or missing. */
 export type Scalar = string | number | boolean | null
@@ -43,6 +43,8 @@ export interface Channel {
 }
 
 export interface ChannelEvent {
+  /** Its place in the inbox, once it is there. */
+  seq?: number
   /** The channel it came from. IDs and session keys are only unique within a channel. */
   channel: string
   id: string
@@ -51,12 +53,12 @@ export interface ChannelEvent {
   title: string
   body?: string
   url?: string
-  /** Runs that failed to start with it; it is dropped after MAX_START_ATTEMPTS. */
+  /** Runs that failed to start with it; it is dropped after MAX_START_ATTEMPTS (store.ts). */
   attempts?: number
 }
 
+/** A channel's poll status. */
 export interface SourceState {
-  seen: string[]
   pollRequestedAt?: number
   lastPollAt?: number
   lastOkAt?: number
@@ -64,18 +66,8 @@ export interface SourceState {
   failures?: number
 }
 
-/** Events waiting for one automation, and its session per session key (`sticky` with session keys). */
-export interface QueueState {
-  pending: ChannelEvent[]
-  /** Channels this automation has had a first poll from (which delivers everything already there). */
-  started?: string[]
-  /** Session per session key, with when it was last used (for eviction). */
-  sessions: Record<string, { id: string; at: number } & Memory>
-}
-
 export interface ChannelsState {
   sources: Record<string, SourceState>
-  queues: Record<string, QueueState>
   /** Channels created with channel_create (config channels live in opencode.json). */
   defs: Record<string, ChannelConfig>
   /** What the server's config channels look like, for the TUI (which can't read the server's options). */
@@ -118,26 +110,13 @@ export function channelRows(s: ChannelsState): ChannelRow[] {
   return rows.sort((a, b) => a.id.localeCompare(b.id))
 }
 
-export const emptySource = (): SourceState => ({ seen: [] })
-export const emptyQueue = (): QueueState => ({ pending: [], sessions: {} })
-export const queueOf = (state: ChannelsState, jobID: string): QueueState => (state.queues[jobID] ??= emptyQueue())
-export const emptyChannels = (): ChannelsState => ({ sources: {}, queues: {}, defs: {}, config: {} })
+export const emptyChannels = (): ChannelsState => ({ sources: {}, defs: {}, config: {} })
 
 /** Ask the leader to poll this channel on its next tick, whether or not an automation uses it. */
 export function requestPoll(state: ChannelsState, id: string) {
-  (state.sources[id] ??= emptySource()).pollRequestedAt = Date.now()
+  (state.sources[id] ??= {}).pollRequestedAt = Date.now()
 }
 
-export function removeChannel(state: ChannelsState, id: string) {
-  delete state.defs[id]
-  delete state.sources[id]
-  for (const q of Object.values(state.queues)) forget(q, [id])
-}
-
-const MIN_SEEN = 1000
-const MAX_SESSIONS = 200
-/** Most events one automation keeps waiting; the oldest go first. Bounds a long digest or a stuck session. */
-export const MAX_QUEUE = 500
 const MAX_BODY = 2000
 const REQUEST_TIMEOUT_MS = 20_000
 
@@ -223,58 +202,6 @@ export function extract(ch: Channel, response: unknown): ChannelEvent[] {
   return out
 }
 
-/** Record a poll's events and return the ones not seen before. On a first poll, that is all of them. */
-export function ingest(source: SourceState, events: ChannelEvent[]): ChannelEvent[] {
-  const seen = new Set(source.seen)
-  const fresh: ChannelEvent[] = []
-  for (const e of events) {
-    if (seen.has(e.id)) continue
-    seen.add(e.id)
-    source.seen.push(e.id)
-    fresh.push(e)
-  }
-  // Forget the oldest IDs, but never one still in this response: forgetting it would deliver it again.
-  const keep = Math.max(MIN_SEEN, events.length * 2)
-  if (source.seen.length > keep) {
-    const current = new Set(events.map((e) => e.id))
-    let drop = source.seen.length - keep
-    source.seen = source.seen.filter((id) => drop <= 0 || current.has(id) || (drop--, false))
-  }
-  return fresh
-}
-
-/** Starts that may fail for an event before it is dropped (each failure is recorded and notified). */
-export const MAX_START_ATTEMPTS = 3
-
-/** Add events to an automation's queue, skipping any already waiting, and dropping the oldest beyond MAX_QUEUE. */
-export function enqueue(queue: QueueState, events: ChannelEvent[]) {
-  const waiting = new Set(queue.pending.map(uid))
-  for (const e of events) {
-    if (waiting.has(uid(e))) continue
-    waiting.add(uid(e))
-    queue.pending.push(e)
-  }
-  if (queue.pending.length > MAX_QUEUE) queue.pending.splice(0, queue.pending.length - MAX_QUEUE)
-}
-
-/** Put events back at the front of a queue (a run with them didn't start), skipping any already waiting. */
-export function requeue(queue: QueueState, events: ChannelEvent[]) {
-  const waiting = new Set(queue.pending.map(uid))
-  // Past the cap, the oldest go, as in enqueue: the events put back are the oldest here.
-  queue.pending = [...events.filter((e) => !waiting.has(uid(e))), ...queue.pending].slice(-MAX_QUEUE)
-}
-
-/** Remove everything a queue holds from these channels: waiting events, first-poll marks, sessions. */
-export function forget(queue: QueueState | undefined, channelIDs: Iterable<string>) {
-  if (!queue) return
-  const gone = new Set(channelIDs)
-  queue.pending = queue.pending.filter((e) => !gone.has(e.channel))
-  queue.started = queue.started?.filter((c) => !gone.has(c))
-  for (const key of Object.keys(queue.sessions)) {
-    if ([...gone].some((c) => key.startsWith(`${c}:`))) delete queue.sessions[key]
-  }
-}
-
 /**
  * Waiting events cut into chunks, one run each: oldest first, at most `max` per chunk.
  * With `byKey`, one chunk per session key (each goes to that key's session); otherwise a single chunk.
@@ -290,29 +217,6 @@ export function chunks(pending: ChannelEvent[], byKey: boolean, max: number): Ar
     out.set(key, list)
   }
   return [...out].map(([key, events]) => ({ ...(key !== undefined ? { key } : {}), events }))
-}
-
-/**
- * Assign a session to a session key. A new mapping counts as used now; an unchanged one keeps its
- * time, which touch() moves when a run ends.
- * Past MAX_SESSIONS keys, the least recently used go, except `keep` (keys with a run in progress)
- * and `key` itself. By timestamp, not key order: numeric keys (monitor IDs) don't keep insertion
- * order in an object.
- */
-export function assign(queue: QueueState, key: string, sessionID: string, now = Date.now(), keep: Iterable<string> = []) {
-  const prev = queue.sessions[key]
-  queue.sessions[key] = prev?.id === sessionID ? prev : { id: sessionID, at: now }
-  const keys = Object.keys(queue.sessions)
-  if (keys.length <= MAX_SESSIONS) return
-  const kept = new Set([...keep, key])
-  const candidates = keys.filter((k) => !kept.has(k)).sort((a, b) => queue.sessions[a].at - queue.sessions[b].at)
-  for (const k of candidates.slice(0, keys.length - MAX_SESSIONS)) delete queue.sessions[k]
-}
-
-/** Mark a key's session as used, if the key still points at it. Called when a run in it ends. */
-export function touch(queue: QueueState | undefined, key: string, sessionID: string, now = Date.now()) {
-  const entry = queue?.sessions[key]
-  if (entry?.id === sessionID) entry.at = now
 }
 
 // ---------- prompt ----------

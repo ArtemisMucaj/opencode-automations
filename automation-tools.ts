@@ -1,11 +1,9 @@
 // The automation_* tools: create, list, update, delete, run, history; notify and memory_update inside runs.
 
 import { describe, nextRun } from "./cron.ts"
-import { forget } from "./channels.ts"
 import { CODE_MODE, MAX_NOTE } from "./guides.ts"
-import { checkTimeout, find, isActive, newJob, parseModel, runnable, toSchedule } from "./jobs.ts"
-import { canNotify, longLine, MAX_LINE, MAX_PARTS, PUSHOVER, send, split, type Priority } from "./notify.ts"
-import { sessionMode } from "./store.ts"
+import { checkTimeout, find, isActive, newJob, parseModel, remembers, runnable, toSchedule } from "./jobs.ts"
+import { longLine, MAX_LINE, MAX_MESSAGE, type Priority } from "./notify.ts"
 import { tool } from "./schema.ts"
 import type { Runtime, ToolEditor } from "./types.ts"
 import { elapsed, errorMessage, fmt, leaderLine, orError, text } from "./util.ts"
@@ -18,29 +16,29 @@ const scheduleProps = {
 } as const
 
 export function automationTools(tools: ToolEditor, rt: Runtime) {
-  const { ctx, opts, store, defaultTimeout, maxPerRun, load, mutate, checkChannels, remember, runAutomation } = rt
+  const { ctx, opts, store, outbox, defaultTimeout, load, mutate, checkChannels, runAutomation } = rt
+  const { maxPerRun } = outbox
   tools.add(tool({
     name: "notify",
     options: { namespace: "automation", ...CODE_MODE },
     description:
-      "Send a notification to the user's phone and desktop from this automation run. " +
-      "It is read on a lock screen, so write for a glance: a title that states the outcome " +
+      "Notify the user from this automation run. It goes to the outbox, which delivers it wherever the user set up " +
+      "(phone, desktop, …): you don't choose where. It is read at a glance, so write a title that states the outcome " +
       '(e.g. "3 MRs need your review", not "Report"), then the details that support it, most important first: ' +
-      "the lock screen shows only the first lines. " +
+      "often only the first lines are shown. " +
       "Format it as a notification, not markdown: plain text, short lines, one item per line, a blank line " +
       `between groups, links pasted directly as full URLs. Lines over ${MAX_LINE} characters (links aside) are refused. ` +
       "No **bold**, headings, backticks, tables or [text](url) links. " +
-      `Keep the message under ${PUSHOVER.message} characters (Pushover's limit); longer text arrives as ` +
-      `numbered parts, at most ${MAX_PARTS}. One notification per topic: send several only for ` +
+      `Keep it short: ideally under 1000 characters, at most ${MAX_MESSAGE}. One notification per topic: send several only for ` +
       "separate findings that each deserve attention, not one per item.",
     input: {
       type: "object",
       properties: {
         title: { type: "string", description: "Headline stating the outcome. Under 60 characters reads best." },
-        message: { type: "string", description: `Plain text, no markdown. One item per line, blank lines between groups, full URLs for links. Ideally under ${PUSHOVER.message} characters.` },
+        message: { type: "string", description: `Plain text, no markdown. One item per line, blank lines between groups, full URLs for links. At most ${MAX_MESSAGE} characters.` },
         priority: {
           type: "string", enum: ["low", "normal", "high"],
-          description: "high = needs action soon (alerts on the phone); low = FYI, no sound. Default normal.",
+          description: "high = needs action soon; low = FYI. Default normal.",
         },
         url: { type: "string", description: "One link to open, shown as a button (e.g. the MR or dashboard)." },
         url_title: { type: "string", description: "Button label for url." },
@@ -50,7 +48,7 @@ export function automationTools(tools: ToolEditor, rt: Runtime) {
     },
     execute: async (input, tc) => {
       const f = rt.runOf(tc.sessionID)
-      if (!f || !canNotify(opts.notify, f.job)) return text("error: notifications are only available inside an automation run that has them enabled.")
+      if (!f || !outbox.canNotify(f.job)) return text("error: notifications are only available inside an automation run that has them enabled.")
       if (f.sent >= maxPerRun) return text(`error: this run already sent ${f.sent} notifications (limit ${maxPerRun}). Don't send more.`)
       const title = input.title.trim()
       const message = input.message.trim()
@@ -62,23 +60,19 @@ export function automationTools(tools: ToolEditor, rt: Runtime) {
           `Break it up: one item per line, at most ${MAX_LINE} characters each, a blank line between groups. Nothing was sent.`,
         )
       }
-      if (opts.notify!.pushover) {
-        const parts = split(message, PUSHOVER.message, "html").length
-        if (parts > MAX_PARTS) {
-          return text(
-            `error: message is ${message.length} characters, ${parts} Pushover messages; the limit is ${MAX_PARTS}. ` +
-            `Shorten it to the essentials (under ${PUSHOVER.message} characters), or send separate topics as separate notifications.`,
-          )
-        }
+      if (message.length > MAX_MESSAGE) {
+        return text(
+          `error: message is ${message.length} characters; the limit is ${MAX_MESSAGE}. ` +
+          `Shorten it to the essentials, or send separate topics as separate notifications. Nothing was sent.`,
+        )
       }
       const priority: Priority = input.priority ?? "normal"
-      const result = await send(opts.notify!, { title, body: message, priority, url: input.url, urlTitle: input.url_title })
-      if (!result.sent.length) return text(`error: delivery failed (${result.failed.join(", ")}). It was logged; don't retry.`)
+      try {
+        outbox.add({ title, body: message, priority, url: input.url, urlTitle: input.url_title }, { job: f.job.id, run: f.run.runID })
+      } catch (e) { return text(`error: couldn't queue it (${errorMessage(e)}). Try once more.`) }
       f.sent++
-      return text(
-        `Sent via ${result.sent.join(", ")}${result.failed.length ? `; failed: ${result.failed.join(", ")}` : ""}. ` +
-        `${maxPerRun - f.sent} notifications left for this run.`,
-      )
+      rt.dispatch()
+      return text(`Queued for delivery. ${maxPerRun - f.sent} notifications left for this run.`)
     },
   }))
 
@@ -86,7 +80,7 @@ export function automationTools(tools: ToolEditor, rt: Runtime) {
     name: "memory_update",
     options: { namespace: "automation", ...CODE_MODE },
     description:
-      "Hand the result of this run to the next run of this sticky automation; it replaces the previous memory. " +
+      "Hand the result of this run to the next run of this automation; it replaces the previous memory. " +
       "The next run may see only this, not this conversation. Write the current " +
       "state, what changed, open items, what the user was already told, useful IDs and links. " +
       `At most ${MAX_NOTE} characters. Call it before your final reply.`,
@@ -98,15 +92,13 @@ export function automationTools(tools: ToolEditor, rt: Runtime) {
     },
     execute: async (input, tc) => {
       const f = rt.runOf(tc.sessionID)
-      if (f?.job.session !== "sticky") return text("error: memory is only kept for runs of sticky automations.")
+      if (!f || !remembers(f.job)) return text("error: memory is only kept inside a run of an automation that runs again.")
       const note = input.note.trim()
       if (!note) return text("error: the note is empty.")
       if (note.length > MAX_NOTE) {
         return text(`error: the note is ${note.length} characters; the limit is ${MAX_NOTE}. Keep what the next run needs. Nothing was saved.`)
       }
-      try {
-        await remember(f.job.id, f.key, tc.sessionID, { note })
-      } catch (e) { return text(`error: couldn't save the memory (${errorMessage(e)}). Try once more.`) }
+      try { store.setNote(f.job.id, f.key ?? "", note) } catch (e) { return text(`error: couldn't save the memory (${errorMessage(e)}). Try once more.`) }
       f.memoryUpdated = true
       return text(`Saved (${note.length} characters). The next run that doesn't see this conversation starts from it.`)
     },
@@ -119,7 +111,8 @@ export function automationTools(tools: ToolEditor, rt: Runtime) {
       "Create an automation: one of cron/every/at, and/or channels. With channels and no schedule it runs as events arrive; " +
       "with a schedule it is a digest of what arrived since the last run. session: new (default, fresh per run), sticky " +
       "(context carries across runs: the session while its cache is warm, else compacted to the last run's memory; " +
-      "with channels that set event.sessionKey, per key), current (this chat). The prompt must be self-contained.",
+      "with channels that set event.sessionKey, per key), current (this chat). Every run gets the previous run's memory. " +
+      "The prompt must be self-contained.",
     input: {
       type: "object",
       properties: {
@@ -142,7 +135,7 @@ export function automationTools(tools: ToolEditor, rt: Runtime) {
       const schedule = toSchedule(input, { channels: !!on })
       parseModel(input.model)
       const timeoutMinutes = checkTimeout(input.timeoutMinutes) ?? defaultTimeout
-      const session = sessionMode(input.session) ?? "new"
+      const session = input.session ?? "new"
       let directory = process.cwd()
       try {
         directory = (await ctx.session.get({ sessionID: tc.sessionID })).location.directory ?? directory
@@ -215,8 +208,7 @@ export function automationTools(tools: ToolEditor, rt: Runtime) {
       additionalProperties: false,
     },
     execute: (input) => orError(async () => {
-      let dropQueue: { all: boolean; channels: string[] } | undefined
-      const msg = await mutate(async (jobs) => {
+      const msg = await mutate((jobs) => {
         const j = find(jobs, input.id)
         if (!j) throw new Error(`no job "${input.id}"`)
         const edits = input.prompt || input.cron || input.every || input.at || input.timeoutMinutes !== undefined || input.channels
@@ -228,11 +220,9 @@ export function automationTools(tools: ToolEditor, rt: Runtime) {
           if (!ids && j.schedule.kind === "event" && !(input.cron || input.every || input.at)) {
             throw new Error("it runs only on events: give it a schedule (cron/every/at) before removing all channels")
           }
-          const removed = (j.on?.channels ?? []).filter((c) => !ids?.includes(c))
+          // Its subscriptions follow (mutate): a channel added takes what the channel's latest poll returned.
           if (ids) j.on = { channels: ids }
           else delete j.on
-          // What it held from channels it no longer uses is dropped below, once every check has passed.
-          if (removed.length || !ids) dropQueue = { all: !ids, channels: removed }
         }
         if (input.cron || input.every || input.at) {
           j.schedule = toSchedule(input, { channels: !!j.on })
@@ -251,14 +241,6 @@ export function automationTools(tools: ToolEditor, rt: Runtime) {
           throw new Error("it has no channels and no schedule, so it would never run: add channels or a schedule (cron/every/at)")
         }
         if (j.enabled && j.nextRunAt === undefined) j.nextRunAt = nextRun(j.schedule, Date.now(), j.createdAt)
-        // Last, after every check: a throw above leaves both the job and its queue as they were.
-        if (dropQueue) {
-          const drop = dropQueue
-          await store.mutateChannels((s) => {
-            if (drop.all) delete s.queues[j.id]
-            else forget(s.queues[j.id], drop.channels)
-          })
-        }
         return `Updated ${j.id}: ${isActive(j) ? "enabled" : "paused"}, ${describe(j.schedule)}` +
           `${j.on ? `, channels ${j.on.channels.join(", ")}` : ""}, next ${fmt(j.nextRunAt)}.`
       })
@@ -272,12 +254,12 @@ export function automationTools(tools: ToolEditor, rt: Runtime) {
     description: "Delete an automation.",
     input: { type: "object", properties: { id: { type: "string" } }, required: ["id"], additionalProperties: false },
     execute: (input) => orError(async () => {
-      const name = await mutate(async (jobs) => {
+      // What it took from the inbox, its sessions and memory go with it (mutate).
+      const name = await mutate((jobs) => {
         const j = find(jobs, input.id)
         if (!j) throw new Error(`no job "${input.id}"`)
         if (j.source === "config") throw new Error("config jobs are removed from opencode.json(c); use automation_update enabled=false to pause")
         jobs.splice(jobs.indexOf(j), 1)
-        await store.mutateChannels((s) => { delete s.queues[j.id] })
         return j.name
       })
       return text(`Deleted "${name}".`)
@@ -287,11 +269,16 @@ export function automationTools(tools: ToolEditor, rt: Runtime) {
   tools.add(tool({
     name: "run",
     options: { namespace: "automation", ...CODE_MODE },
-    description: "Run an automation now.",
+    description: "Run an automation now (from another process than the leader: on the leader's next tick).",
     input: { type: "object", properties: { id: { type: "string" } }, required: ["id"], additionalProperties: false },
     execute: async (input) => {
       const j = find(load(), input.id)
       if (!j) return text(`error: no job "${input.id}"`)
+      // Only the leader starts runs: elsewhere, ask it to.
+      if (!rt.leader()) {
+        await mutate((jobs) => { const x = find(jobs, j.id); if (x) x.runRequestedAt = Date.now() })
+        return text(`Queued: "${j.name}" starts on the leader's next tick, within ${rt.tickMs / 1000}s.`)
+      }
       const run = await runAutomation(j, "manual")
       if (typeof run === "string") return text(`Nothing started: ${run}.`)
       return text(`Run ${run.runID}: ${run.status}${run.sessionID ? ` in session ${run.sessionID}` : ""}${run.error ? ` — ${run.error}` : ""}`)

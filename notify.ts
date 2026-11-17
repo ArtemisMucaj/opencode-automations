@@ -1,32 +1,22 @@
-// Notifications, sent from the server plugin so they work with no TUI open.
-// Channels: native desktop notifications (macOS/Linux) and Pushover.
-// During a run, the agent decides what to send with the automation_notify tool.
-// The plugin itself only sends a notice when a run fails or times out (`on`);
-// a successful run is never notified automatically.
+// Notifications: formatting a message for each kind of sink, and delivering it to one sender.
+// What gets sent, to whom and when (the outbox and its dispatcher) is in outbox.ts.
 
 import { spawn } from "node:child_process"
-import type { Job, Run, RunStatus } from "./store.ts"
-import { log } from "./log.ts"
-import { elapsed, httpError, type Fetch } from "./util.ts"
-
-export interface NotifyConfig {
-  /** Run outcomes that get an automatic notice. Default: failed, timeout. Successful runs never do. */
-  on?: RunStatus[]
-  /** Most automation_notify calls one run may make. Default 5. */
-  maxPerRun?: number
-  /** Desktop notifications. Sound customization applies to macOS only. */
-  native?: boolean | { sound?: string }
-  pushover?: { token: string; user: string }
-}
-
-/** Per job: false = never notify, true = plugin defaults, array = these outcomes get an automatic notice. */
-export type JobNotify = boolean | RunStatus[]
+import { withEnv } from "./channels.ts"
+import { httpError, type Fetch } from "./util.ts"
 
 export type Priority = "low" | "normal" | "high"
 
+/** Where messages go. Configured once, under `outbox.senders`; the agent never picks one. */
+export type Sender = { id: string; minPriority?: Priority } & (
+  | { type: "native"; sound?: string }
+  | { type: "pushover"; token: string; user: string }
+  | { type: "webhook"; url: string; headers?: Record<string, string> }
+)
+
 export interface Message {
   title: string
-  /** Plain text. Light markdown (bullets, **bold**, links, headings) is cleaned up per channel. */
+  /** Plain text. Light markdown (bullets, **bold**, links, headings) is cleaned up per sink. */
   body: string
   priority?: Priority
   url?: string
@@ -39,10 +29,7 @@ export interface Deps {
   platform: NodeJS.Platform
 }
 
-const DEFAULT_ON: RunStatus[] = ["failed", "timeout"]
-export const DEFAULT_MAX_PER_RUN = 5
-
-const defaultDeps: Deps = {
+export const defaultDeps: Deps = {
   fetch: (input, init) => fetch(input, init),
   platform: process.platform,
   exec: (command, args) =>
@@ -54,37 +41,14 @@ const defaultDeps: Deps = {
     }),
 }
 
-/** Whether a job may notify at all (the automation_notify tool is offered only then). */
-export function canNotify(cfg: NotifyConfig | undefined, job: Job): cfg is NotifyConfig {
-  return !!cfg && job.notify !== false && !!(cfg.native || cfg.pushover)
-}
-
-export function shouldNotify(cfg: NotifyConfig | undefined, job: Job, status: RunStatus) {
-  // On success the agent notifies if something needs it; silence means nothing did.
-  if (status === "succeeded" || !canNotify(cfg, job)) return false
-  const on = Array.isArray(job.notify) ? job.notify : (cfg.on ?? DEFAULT_ON)
-  return on.includes(status)
-}
-
-/** The automatic end-of-run notice. Agent output is not included: the agent notifies itself. */
-export function compose(job: Job, run: Run): Message {
-  const error = run.error?.trim()
-  switch (run.status) {
-    case "failed":
-      return { title: `${job.name} failed`, body: error || `Failed after ${elapsed(run)}.`, priority: "high" }
-    case "timeout":
-      return { title: `${job.name} timed out`, body: error ? `Stopped: ${error}.` : `Stopped after ${elapsed(run)}.`, priority: "high" }
-    default:
-      return { title: `${job.name} ${run.status}`, body: error || `After ${elapsed(run)}.`, priority: "normal" }
-  }
-}
-
 // ---------- formatting ----------
 
 /** Pushover's documented limits. https://pushover.net/api#limits */
 export const PUSHOVER = { message: 1024, title: 250, url: 512, urlTitle: 100 } as const
-/** Most messages one notification may be split into. */
+/** Most messages one notification is split into on Pushover; the rest is cut. */
 export const MAX_PARTS = 4
+/** Longest message the agent may send, whatever the sinks: about what fits in MAX_PARTS Pushover messages. */
+export const MAX_MESSAGE = 4000
 
 const escapeHTML = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
 
@@ -192,10 +156,14 @@ export function split(text: string, max: number, style: Style): string[] {
 
 const clip = (s: string, max: number) => (s.length <= max ? s : s.slice(0, max - 1).trimEnd() + "…")
 
-/** Pushover payloads for one notification: several numbered parts when it's long. */
+/** Pushover payloads for one notification: several numbered parts when it's long, at most MAX_PARTS. */
 export function pushoverParts(m: Message): Array<Record<string, string | number>> {
   const bodies = split(m.body, PUSHOVER.message, "html")
   if (!bodies.length) bodies.push(escapeHTML(m.title))
+  if (bodies.length > MAX_PARTS) {
+    bodies.length = MAX_PARTS
+    if (bodies[MAX_PARTS - 1].length + 2 <= PUSHOVER.message) bodies[MAX_PARTS - 1] += "\n…"
+  }
   const priority = m.priority === "high" ? 1 : m.priority === "low" ? -1 : 0
   return bodies.map((message, i) => {
     const suffix = bodies.length > 1 ? ` (${i + 1}/${bodies.length})` : ""
@@ -221,75 +189,46 @@ const ok = async (r: Response) => {
 }
 const timeout = () => AbortSignal.timeout(10_000)
 
-export interface Delivery {
-  /** Channels that delivered, e.g. "pushover (2 messages)". */
-  sent: string[]
-  failed: string[]
-}
-
-export async function send(cfg: NotifyConfig, m: Message, deps: Deps = defaultDeps): Promise<Delivery> {
-  const tasks: Array<[string, () => Promise<string | void>]> = []
+/** Deliver one message through one sender; throws if it couldn't. {env:NAME} in its settings is filled now. */
+export async function deliver(sender: Sender, m: Message, deps: Deps = defaultDeps): Promise<void> {
   const plain = format(m.body, "plain") || m.title
-
-  if (cfg.native) {
-    const native = cfg.native
-    const high = m.priority === "high"
-    tasks.push([
-      "native",
-      async () => {
-        const body = m.url ? `${plain}\n${m.url}` : plain
-        if (deps.platform === "darwin") {
-          const sound = typeof native === "object" ? native.sound : high ? "Basso" : "Glass"
-          await deps.exec("osascript", [
-            "-e", "on run argv",
-            "-e", `display notification (item 2 of argv) with title (item 1 of argv) subtitle (item 3 of argv)${sound ? ` sound name "${sound.replace(/"/g, "")}"` : ""}`,
-            "-e", "end run",
-            m.title, body.slice(0, 240), "opencode automations",
-          ])
-        } else if (deps.platform === "linux") {
-          await deps.exec("notify-send", [
-            "--app-name", "opencode automations",
-            "--urgency", high ? "critical" : m.priority === "low" ? "low" : "normal",
-            "--", m.title, body,
-          ])
-        } else {
-          throw new Error(`native notifications are not supported on ${deps.platform}`)
-        }
-      },
-    ])
-  }
-
-  if (cfg.pushover) {
-    const creds = cfg.pushover
-    tasks.push([
-      "pushover",
-      async () => {
-        const parts = pushoverParts(m)
-        // In order, so parts arrive 1/n … n/n.
-        for (const part of parts) {
-          await deps
-            .fetch("https://api.pushover.net/1/messages.json", {
-              method: "POST",
-              signal: timeout(),
-              headers: { "content-type": "application/json" },
-              body: JSON.stringify({ ...creds, ...part }),
-            })
-            .then(ok)
-        }
-        if (parts.length > 1) return `${parts.length} messages`
-      },
-    ])
-  }
-
-  const results = await Promise.allSettled(tasks.map(([, t]) => t()))
-  const out: Delivery = { sent: [], failed: [] }
-  results.forEach((r, i) => {
-    const name = tasks[i][0]
-    if (r.status === "fulfilled") out.sent.push(r.value ? `${name} (${r.value})` : name)
-    else {
-      out.failed.push(name)
-      log.error({ via: name, err: r.reason }, "notification failed")
+  const high = m.priority === "high"
+  switch (sender.type) {
+    case "native": {
+      const body = m.url ? `${plain}\n${m.url}` : plain
+      if (deps.platform === "darwin") {
+        const sound = sender.sound ?? (high ? "Basso" : "Glass")
+        return deps.exec("osascript", [
+          "-e", "on run argv",
+          "-e", `display notification (item 2 of argv) with title (item 1 of argv) subtitle (item 3 of argv) sound name "${sound.replace(/"/g, "")}"`,
+          "-e", "end run",
+          m.title, body.slice(0, 240), "opencode automations",
+        ])
+      }
+      if (deps.platform === "linux") {
+        return deps.exec("notify-send", [
+          "--app-name", "opencode automations",
+          "--urgency", high ? "critical" : m.priority === "low" ? "low" : "normal",
+          "--", m.title, body,
+        ])
+      }
+      throw new Error(`native notifications are not supported on ${deps.platform}`)
     }
-  })
-  return out
+    case "pushover": {
+      const creds = { token: withEnv(sender.token), user: withEnv(sender.user) }
+      // In order, so parts arrive 1/n … n/n.
+      for (const part of pushoverParts(m)) {
+        await deps.fetch("https://api.pushover.net/1/messages.json", {
+          method: "POST", signal: timeout(), headers: { "content-type": "application/json" }, body: JSON.stringify({ ...creds, ...part }),
+        }).then(ok)
+      }
+      return
+    }
+    case "webhook": {
+      const body = { title: m.title, message: plain, priority: m.priority ?? "normal", ...(m.url ? { url: m.url } : {}), ...(m.urlTitle ? { url_title: m.urlTitle } : {}) }
+      await deps.fetch(withEnv(sender.url), {
+        method: "POST", signal: timeout(), headers: { "content-type": "application/json", ...withEnv(sender.headers ?? {}) }, body: JSON.stringify(body),
+      }).then(ok)
+    }
+  }
 }

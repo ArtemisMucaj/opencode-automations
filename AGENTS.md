@@ -20,15 +20,20 @@ The `.ts` files (the server plugin and everything it and the TUI import) need no
 
 ## Where things live
 
-- `index.ts`: the server plugin's setup. Job state, sessions and sticky memory, starting and ending runs, the ticker, channel polling, the event pump, hooks and commands.
+- `index.ts`: the server plugin's setup. Job state, sessions and memory, starting and ending runs, the ticker, channel polling, the event pump, hooks and commands.
 - `automation-tools.ts`, `channel-tools.ts`: the `automation_*` and `channel_*` tools. They reach the running plugin through the `Runtime` object built in `index.ts` (`types.ts`).
 - `schema.ts`: the tools' input schemas. `tool()` types a tool's input from its JSON schema and checks the input against it before the tool runs (opencode passes JSON-schema input through unchecked).
 - `guides.ts`: everything the agent is told (tool names, namespaces, command and run guides).
 - `jobs.ts`: job helpers without state (schedule and model parsing, IDs, what counts as active or running). `cron.ts`: schedules.
-- `channels.ts`: channel definitions, polling, queues, the event prompt. `notify.ts`: notifications. `store.ts`: files and locks.
+- `channels.ts`: channel definitions, polling, the event prompt. `store.ts`: all state, in one SQLite database (`bun:sqlite`): jobs, runs, the inbox and what each automation took from it, sticky sessions, memory, the outbox.
+- `outbox.ts`: what is sent to the user and the dispatcher that delivers it to the configured senders. `notify.ts`: formatting a message and delivering it through one sender.
 - `log.ts`: the pino logger. It writes JSON lines to stderr, never stdout. Log with fields (`log.warn({ job, err }, "what happened")`), not `console`.
 - `util.ts`: small helpers with no knowledge of jobs or channels (bounded waits, error text, time and count formatting, the tools' error wrapper).
 - `tui.tsx`: the whole TUI view. It stays one file: only `tui.tsx` is compiled to `tui.js`, so JSX can't live anywhere else. Logic without JSX goes in a `.ts` file.
+
+## State
+
+`bun:sqlite` calls are synchronous, and a write waits (blocking its event loop) while another process writes. Keep transactions (`store.tx`, `mutate`, `mutateChannels`) short and synchronous: never `await` inside one. Fetch first, then write.
 
 ## Types
 

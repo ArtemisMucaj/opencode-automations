@@ -1,24 +1,20 @@
-import { appendFileSync, closeSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, writeFileSync, unlinkSync } from "node:fs"
+// All state, in one SQLite database (bun:sqlite, built into Bun: no dependency, no build step).
+// Definitions and small records are JSON documents (jobs, channels, sources, runs); what is queried by
+// field gets columns: the inbox, what each automation took from it, sticky sessions, memory and the outbox.
+
+import { Database } from "bun:sqlite"
+import { mkdirSync } from "node:fs"
 import { join } from "node:path"
 import { randomUUID } from "node:crypto"
-import lockfile from "proper-lockfile"
 import type { Schedule } from "./cron.ts"
-import type { JobNotify } from "./notify.ts"
-import { emptyChannels, type ChannelsState } from "./channels.ts"
+import type { JobNotify, Priority } from "./outbox.ts"
+import type { ChannelEvent, ChannelsState } from "./channels.ts"
 
 /**
  * `sticky`: runs keep going to the same session. With a channel that sets `event.sessionKey`,
  * one sticky session per session key.
  */
 export type SessionMode = "new" | "sticky" | "current"
-
-/** `reuse` is the old name of `sticky`, still accepted in saved jobs and config. */
-export const sessionMode = (mode?: string): SessionMode | undefined => (mode === "reuse" ? "sticky" : (mode as SessionMode | undefined))
-/** A sticky session's memory: the last run's note, and until when the session's prompt cache is warm. */
-export interface Memory {
-  note?: string
-  warmUntil?: number
-}
 export type RunStatus = "running" | "succeeded" | "failed" | "timeout" | "skipped"
 export interface Job {
   id: string
@@ -27,8 +23,8 @@ export interface Job {
   schedule: Schedule
   directory: string
   session: SessionMode
+  /** The chat a `current` automation runs in. */
   sessionID?: string
-  memory?: Memory
   agent?: string
   model?: string
   timeoutMinutes: number
@@ -38,7 +34,7 @@ export interface Job {
   done?: boolean
   runRequestedAt?: number
   notify?: JobNotify
-  /** Runs on these channels' events: as they arrive (schedule kind "event") or on the schedule, as a digest. */
+  /** Takes these channels' events from the inbox: as they arrive (schedule kind "event") or on the schedule, as a digest. */
   on?: { channels: string[] }
   /** Most events in one run. Default 10, or 50 for a digest. */
   maxEvents?: number
@@ -61,170 +57,410 @@ export interface Run {
   notifications?: number
 }
 
-function read(path: string): string | undefined {
-  try { return readFileSync(path, "utf8") }
-  catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined
-    throw error
-  }
-}
+/** A sticky session: per automation, and per session key ("" without one). */
+export interface StickySession { id: string; usedAt: number; warmUntil?: number }
 
-/**
- * A file's lines, last first, read from its end a block at a time: the caller stops when it has enough,
- * so reading the latest runs doesn't mean reading the whole history.
- */
-function* linesFromEnd(path: string, block = 64 * 1024): Generator<string> {
-  let fd: number
-  try { fd = openSync(path, "r") } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return
-    throw error
-  }
-  try {
-    let pos = fstatSync(fd).size
-    let rest = Buffer.alloc(0) // the start of a line whose beginning is in the block before
-    while (pos > 0) {
-      const size = Math.min(block, pos)
-      pos -= size
-      const chunk = Buffer.alloc(size)
-      readSync(fd, chunk, 0, size, pos)
-      // Cut on the newline byte, which never falls inside a UTF-8 character.
-      const buf = Buffer.concat([chunk, rest])
-      const first = pos > 0 ? buf.indexOf(10) : -1
-      if (pos > 0 && first < 0) { rest = buf; continue }
-      rest = buf.subarray(0, first + 1)
-      const lines = buf.subarray(first + 1).toString("utf8").split("\n")
-      for (let i = lines.length - 1; i >= 0; i--) if (lines[i].trim()) yield lines[i]
-    }
-  } finally { closeSync(fd) }
+export interface OutboxMessage {
+  id: number
+  at: number
+  job?: string
+  run?: string
+  title: string
+  body: string
+  priority: Priority
+  url?: string
+  urlTitle?: string
 }
+export type SendStatus = "pending" | "sent" | "failed"
+export interface Send { message: OutboxMessage; sender: string; attempts: number }
 
-/**
- * Take a file lock, retrying for up to `waitMs` while another holder has it (another process, or another
- * call in this one). The waits are async, so a busy lock never blocks the server's event loop or the TUI.
- */
-async function lock(path: string, waitMs = 2000): Promise<() => Promise<void>> {
-  const deadline = Date.now() + waitMs
-  for (;;) {
-    try { return await lockfile.lock(path, { realpath: false }) } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ELOCKED" || Date.now() >= deadline) throw error
-      await new Promise((r) => setTimeout(r, 10))
-    }
-  }
-}
+/** How long inbox events are kept once their item is gone from the channel. */
+export const INBOX_RETENTION_MS = 7 * 24 * 60 * 60_000
+const OUTBOX_RETENTION_MS = 30 * 24 * 60 * 60_000
+/** Starts that may fail for an event before it is dropped (each failure is recorded and notified). */
+export const MAX_START_ATTEMPTS = 3
+/** Most events looked at for one automation at once; the rest wait for the next pass. */
+const MAX_WAITING = 500
+/** Most sticky sessions one automation keeps (one per session key); the least recently used go. */
+export const MAX_SESSIONS = 200
 
-/** An unchanged file isn't rewritten, so a tick that changes nothing doesn't wake what watches the directory (the TUI). */
-function writeAtomic(path: string, content: string): void {
-  if (read(path) === content) return
-  const temp = `${path}.${randomUUID()}.tmp`
-  try {
-    writeFileSync(temp, content, { mode: 0o600 })
-    renameSync(temp, path)
-  } finally {
-    try { unlinkSync(temp) } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
-    }
-  }
-}
+const SCHEMA = 1
+const TABLES = `
+CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS channel_defs (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS channel_config (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS sources (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, job TEXT NOT NULL, started_at INTEGER NOT NULL, data TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS runs_by_start ON runs (started_at);
+CREATE TABLE IF NOT EXISTS inbox (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT, channel TEXT NOT NULL, id TEXT NOT NULL, key TEXT,
+  title TEXT NOT NULL, body TEXT, url TEXT, at INTEGER NOT NULL, seen_at INTEGER NOT NULL, UNIQUE (channel, id));
+CREATE TABLE IF NOT EXISTS subscriptions (
+  job TEXT NOT NULL, channel TEXT NOT NULL, since_seq INTEGER NOT NULL, since_poll INTEGER, PRIMARY KEY (job, channel));
+CREATE TABLE IF NOT EXISTS deliveries (
+  job TEXT NOT NULL, seq INTEGER NOT NULL REFERENCES inbox (seq) ON DELETE CASCADE,
+  status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (job, seq));
+CREATE TABLE IF NOT EXISTS sessions (
+  job TEXT NOT NULL, key TEXT NOT NULL, session_id TEXT NOT NULL, used_at INTEGER NOT NULL, warm_until INTEGER,
+  PRIMARY KEY (job, key));
+CREATE TABLE IF NOT EXISTS memory (job TEXT NOT NULL, key TEXT NOT NULL, note TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (job, key));
+CREATE TABLE IF NOT EXISTS outbox (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, job TEXT, run TEXT,
+  title TEXT NOT NULL, body TEXT NOT NULL, priority TEXT NOT NULL, url TEXT, url_title TEXT);
+CREATE TABLE IF NOT EXISTS sends (
+  message INTEGER NOT NULL REFERENCES outbox (id) ON DELETE CASCADE, sender TEXT NOT NULL,
+  status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL, error TEXT, PRIMARY KEY (message, sender));
+CREATE TABLE IF NOT EXISTS lease (name TEXT PRIMARY KEY, holder TEXT NOT NULL, until INTEGER NOT NULL);
+`
+
+type Row = Record<string, string | number | null>
 
 export class Store {
-  private readonly jobsPath: string
-  private readonly historyPath: string
-  private readonly channelsPath: string
-  private unlockLeader?: () => void
+  readonly db: Database
+  /** Who holds the lease: this store, not this process (the plugin is set up once per directory it serves). */
+  private readonly holder = randomUUID()
 
-  constructor(readonly dataDir: string) {
+  /** `busyMs`: how long a write waits for another process's (the TUI waits less, so it never feels stuck). */
+  constructor(readonly dataDir: string, { busyMs = 2000 }: { busyMs?: number } = {}) {
     mkdirSync(dataDir, { recursive: true, mode: 0o700 })
-    this.jobsPath = join(dataDir, "jobs.json")
-    this.historyPath = join(dataDir, "history.jsonl")
-    this.channelsPath = join(dataDir, "channels.json")
-  }
-
-  loadJobs(): Job[] {
-    const raw = read(this.jobsPath)
-    if (raw === undefined) return []
-    const jobs: unknown = JSON.parse(raw)
-    if (!Array.isArray(jobs)) throw new Error("jobs.json must contain an array")
-    return (jobs as Job[]).map((j) => ({ ...j, session: sessionMode(j.session)! }))
-  }
-
-  saveJobs(jobs: Job[]): void {
-    writeAtomic(this.jobsPath, JSON.stringify(jobs, null, 2) + "\n")
+    this.db = new Database(join(dataDir, "state.db"))
+    this.db.exec(`PRAGMA busy_timeout = ${Math.floor(busyMs)}; PRAGMA foreign_keys = ON;`)
+    // WAL lets the TUI and the other instances read while one process writes.
+    this.db.exec("PRAGMA journal_mode = WAL;")
+    const version = (this.db.query("PRAGMA user_version").get() as { user_version: number }).user_version
+    if (version > SCHEMA) throw new Error(`[automations] ${join(dataDir, "state.db")} is from a newer version of the plugin`)
+    if (version < SCHEMA) this.tx(() => { this.db.exec(TABLES); this.db.exec(`PRAGMA user_version = ${SCHEMA}`) })
   }
 
   /**
-   * Change jobs under the lock. `fn` may be async only to take the channels lock inside it (jobs, then
-   * channels: that order everywhere), never to wait on anything slow.
+   * Run `fn` in a write transaction (nested calls join it). `fn` must be synchronous and quick: a writer in
+   * another process waits for it, blocking its event loop meanwhile.
    */
-  async mutate<T>(fn: (jobs: Job[]) => T | Promise<T>): Promise<T> {
-    // Retried like the channels lock: deletes and edits hold this one while they update channels.json.
-    const unlock = await lock(this.jobsPath)
-    try {
+  tx<T>(fn: () => T): T {
+    return this.db.transaction(fn).immediate()
+  }
+
+  /** Changes when another connection commits: the TUI polls it to know when to re-read. */
+  version(): number {
+    return (this.db.query("PRAGMA data_version").get() as { data_version: number }).data_version
+  }
+
+  close(): void {
+    this.release()
+    this.db.close()
+  }
+
+  // ---------- documents ----------
+
+  private docs<T>(table: string): Map<string, T> {
+    const rows = this.db.query(`SELECT id, data FROM ${table}`).all() as Array<{ id: string; data: string }>
+    return new Map(rows.map((r) => [r.id, JSON.parse(r.data) as T]))
+  }
+
+  /** Make a table hold exactly these documents. Unchanged ones aren't written, so a no-op write wakes nobody. */
+  private sync(table: string, docs: Map<string, unknown>): void {
+    const saved = new Map((this.db.query(`SELECT id, data FROM ${table}`).all() as Array<{ id: string; data: string }>).map((r) => [r.id, r.data]))
+    const put = this.db.prepare(`INSERT OR REPLACE INTO ${table} (id, data) VALUES (?, ?)`)
+    for (const [id, doc] of docs) {
+      const data = JSON.stringify(doc)
+      if (saved.get(id) !== data) put.run(id, data)
+    }
+    const del = this.db.prepare(`DELETE FROM ${table} WHERE id = ?`)
+    for (const id of saved.keys()) if (!docs.has(id)) del.run(id)
+  }
+
+  loadJobs(): Job[] {
+    return [...this.docs<Job>("jobs").values()]
+  }
+
+  saveJobs(jobs: Job[]): void {
+    this.tx(() => this.sync("jobs", new Map(jobs.map((j) => [j.id, j]))))
+  }
+
+  /** Change jobs in one transaction. `fn` must be synchronous (see tx). */
+  async mutate<T>(fn: (jobs: Job[]) => T): Promise<T> {
+    return this.tx(() => {
       const jobs = this.loadJobs()
-      const result = await fn(jobs)
+      const result = fn(jobs)
       this.saveJobs(jobs)
       return result
-    } finally { await unlock() }
+    })
   }
 
   loadChannels(): ChannelsState {
-    const raw = read(this.channelsPath)
-    if (raw === undefined) return emptyChannels()
-    const state = JSON.parse(raw) as Partial<ChannelsState>
-    if (!state || typeof state !== "object" || Array.isArray(state)) throw new Error("channels.json must contain an object")
-    return { sources: state.sources ?? {}, queues: state.queues ?? {}, defs: state.defs ?? {}, config: state.config ?? {} }
+    return {
+      sources: Object.fromEntries(this.docs<ChannelsState["sources"][string]>("sources")),
+      defs: Object.fromEntries(this.docs<ChannelsState["defs"][string]>("channel_defs")),
+      config: Object.fromEntries(this.docs<ChannelsState["config"][string]>("channel_config")),
+    }
   }
 
-  /** `waitMs`: how long to wait for another holder of the lock (the TUI waits less, so it never feels stuck). */
-  async mutateChannels<T>(fn: (state: ChannelsState) => T, waitMs = 2000): Promise<T> {
-    // No file is created before locking: the lock doesn't need it, and loadChannels() treats it as empty.
-    // Retried: polls, deliveries and finished runs all write here, possibly from several processes.
-    const unlock = await lock(this.channelsPath, waitMs)
-    try {
+  saveChannels(s: ChannelsState): void {
+    this.tx(() => {
+      this.sync("sources", new Map(Object.entries(s.sources)))
+      this.sync("channel_defs", new Map(Object.entries(s.defs)))
+      this.sync("channel_config", new Map(Object.entries(s.config)))
+    })
+  }
+
+  /** Change channel definitions and poll state in one transaction. `fn` must be synchronous (see tx). */
+  async mutateChannels<T>(fn: (state: ChannelsState) => T): Promise<T> {
+    return this.tx(() => {
       const state = this.loadChannels()
       const result = fn(state)
-      writeAtomic(this.channelsPath, JSON.stringify(state) + "\n") // compact: rewritten on every poll
+      this.saveChannels(state)
       return result
-    } finally { await unlock() }
+    })
   }
 
+  /** Delete a channel created from chat: its poll state, its events, and the sessions and memory of its keys. */
+  removeChannel(id: string): void {
+    this.tx(() => {
+      for (const table of ["channel_defs", "sources"]) this.db.run(`DELETE FROM ${table} WHERE id = ?`, [id])
+      this.db.run("DELETE FROM subscriptions WHERE channel = ?", [id])
+      this.db.run("DELETE FROM inbox WHERE channel = ?", [id])
+      // Session keys are "channel:key".
+      for (const table of ["sessions", "memory"]) this.db.run(`DELETE FROM ${table} WHERE substr(key, 1, length(?) + 1) = ? || ':'`, [id, id])
+    })
+  }
+
+  // ---------- runs ----------
+
+  /** Record a run; a later record of the same run replaces it. */
   appendRun(run: Run): void {
-    appendFileSync(this.historyPath, JSON.stringify(run) + "\n", { mode: 0o600 })
+    this.db.run("INSERT OR REPLACE INTO runs (id, job, started_at, data) VALUES (?, ?, ?, ?)", [run.runID, run.jobID, run.startedAt, JSON.stringify(run)])
   }
 
   history(jobID?: string, limit = 10): Run[] {
     if (!Number.isFinite(limit) || limit <= 0) return []
-    const max = Math.floor(limit)
-    const latest = new Map<string, Run>()
-    // Last line first, so the first record met for a run is its latest, and reading stops at `limit` runs.
-    for (const line of linesFromEnd(this.historyPath)) {
-      let run: Run
-      // A line cut short (an append in progress, or a crash in the middle of one) is skipped, not fatal.
-      try { run = JSON.parse(line) as Run } catch { continue }
-      if (latest.has(run.runID) || (jobID && run.jobID !== jobID)) continue
-      latest.set(run.runID, run)
-      if (latest.size >= max) break
-    }
-    return [...latest.values()].sort((a, b) => b.startedAt - a.startedAt)
+    const rows = (jobID
+      ? this.db.query("SELECT data FROM runs WHERE job = ? ORDER BY started_at DESC LIMIT ?").all(jobID, Math.floor(limit))
+      : this.db.query("SELECT data FROM runs ORDER BY started_at DESC LIMIT ?").all(Math.floor(limit))) as Array<{ data: string }>
+    return rows.map((r) => JSON.parse(r.data) as Run)
   }
 
-  lease(ttl: number): boolean {
-    if (this.unlockLeader) return true
-    try {
-      this.unlockLeader = lockfile.lockSync(join(this.dataDir, "leader"), {
-        realpath: false,
-        stale: Math.max(2000, ttl),
-        onCompromised: () => { this.unlockLeader = undefined },
-      })
-      return true
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ELOCKED") return false
-      throw error
-    }
+  // ---------- inbox ----------
+
+  /**
+   * Write a poll's events to the inbox and return how many are new. Every event of the poll is marked as seen
+   * at `at`: an item still there isn't dropped by retention, and a new subscriber gets it (see subscribe).
+   */
+  ingest(channel: string, events: ChannelEvent[], at: number): number {
+    return this.tx(() => {
+      const add = this.db.prepare(
+        "INSERT OR IGNORE INTO inbox (channel, id, key, title, body, url, at, seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+      const seen = this.db.prepare("UPDATE inbox SET seen_at = ? WHERE channel = ? AND id = ?")
+      let fresh = 0
+      for (const e of events) {
+        fresh += add.run(channel, e.id, e.sessionKey ?? null, e.title, e.body ?? null, e.url ?? null, at, at).changes
+        seen.run(at, channel, e.id)
+      }
+      return fresh
+    })
+  }
+
+  /**
+   * Make each automation's subscriptions match its channels, and drop what automations that are gone left.
+   * A new subscription takes what the channel's latest poll returned (what is alerting right now), and
+   * everything after. A paused automation keeps its subscription, so its events wait; a disabled or
+   * finished one doesn't.
+   */
+  subscribe(jobs: Job[]): void {
+    this.tx(() => {
+      const add = this.db.prepare(
+        "INSERT OR IGNORE INTO subscriptions (job, channel, since_seq, since_poll) VALUES (?, ?, " +
+        "(SELECT COALESCE(MAX(seq), 0) FROM inbox), (SELECT json_extract(data, '$.lastOkAt') FROM sources WHERE id = ?))")
+      const wanted = new Set<string>()
+      for (const j of jobs) {
+        if (!j.enabled || j.done) continue
+        for (const c of j.on?.channels ?? []) {
+          wanted.add(`${j.id}\u0000${c}`)
+          add.run(j.id, c, c)
+        }
+      }
+      const subs = this.db.query("SELECT job, channel FROM subscriptions").all() as Array<{ job: string; channel: string }>
+      for (const s of subs) {
+        if (!wanted.has(`${s.job}\u0000${s.channel}`)) this.db.run("DELETE FROM subscriptions WHERE job = ? AND channel = ?", [s.job, s.channel])
+      }
+      const ids = JSON.stringify(jobs.map((j) => j.id))
+      for (const table of ["deliveries", "sessions", "memory"]) {
+        this.db.run(`DELETE FROM ${table} WHERE job NOT IN (SELECT value FROM json_each(?))`, [ids])
+      }
+    })
+  }
+
+  /** Inbox events waiting for an automation, oldest first: on its channels, not taken yet or to be retried. */
+  waiting(jobID: string): ChannelEvent[] {
+    const rows = this.db.query(
+      "SELECT i.seq, i.channel, i.id, i.key, i.title, i.body, i.url, d.attempts FROM subscriptions s " +
+      "JOIN inbox i ON i.channel = s.channel LEFT JOIN deliveries d ON d.job = s.job AND d.seq = i.seq " +
+      "WHERE s.job = ? AND (i.seq > s.since_seq OR i.seen_at >= s.since_poll) AND (d.status IS NULL OR d.status = 'retry') " +
+      "ORDER BY i.seq LIMIT ?",
+    ).all(jobID, MAX_WAITING) as Row[]
+    return rows.map((r) => ({
+      seq: r.seq as number,
+      channel: r.channel as string,
+      id: r.id as string,
+      ...(r.key !== null ? { sessionKey: r.key as string } : {}),
+      title: r.title as string,
+      ...(r.body !== null ? { body: r.body as string } : {}),
+      ...(r.url !== null ? { url: r.url as string } : {}),
+      ...(r.attempts ? { attempts: r.attempts as number } : {}),
+    }))
+  }
+
+  /** Mark events as handed to a run. */
+  take(jobID: string, seqs: number[]): void {
+    this.tx(() => {
+      const put = this.db.prepare(
+        "INSERT INTO deliveries (job, seq, status) VALUES (?, ?, 'taken') ON CONFLICT (job, seq) DO UPDATE SET status = 'taken'")
+      for (const seq of seqs) put.run(jobID, seq)
+    })
+  }
+
+  /**
+   * Events whose run didn't start. Skipped: they wait again as they were. Failed: they are retried, up to
+   * MAX_START_ATTEMPTS, then dropped.
+   */
+  giveBack(jobID: string, seqs: number[], failed: boolean): void {
+    this.tx(() => {
+      for (const seq of seqs) {
+        if (failed) {
+          this.db.run(
+            "UPDATE deliveries SET attempts = attempts + 1, status = CASE WHEN attempts + 1 >= ? THEN 'dropped' ELSE 'retry' END WHERE job = ? AND seq = ?",
+            [MAX_START_ATTEMPTS, jobID, seq])
+        } else {
+          this.db.run("DELETE FROM deliveries WHERE job = ? AND seq = ? AND attempts = 0", [jobID, seq])
+          this.db.run("UPDATE deliveries SET status = 'retry' WHERE job = ? AND seq = ?", [jobID, seq])
+        }
+      }
+    })
+  }
+
+  /** Drop old events whose item is gone from the channel, and old outbox messages. */
+  trim(now = Date.now()): void {
+    this.tx(() => {
+      this.db.run(
+        "DELETE FROM inbox WHERE at < ? AND seen_at < COALESCE((SELECT json_extract(data, '$.lastOkAt') FROM sources WHERE id = inbox.channel), ?)",
+        [now - INBOX_RETENTION_MS, now])
+      this.db.run("DELETE FROM outbox WHERE at < ?", [now - OUTBOX_RETENTION_MS])
+    })
+  }
+
+  // ---------- sticky sessions and memory ----------
+
+  session(jobID: string, key = ""): StickySession | undefined {
+    const r = this.db.query("SELECT session_id, used_at, warm_until FROM sessions WHERE job = ? AND key = ?").get(jobID, key) as Row | null
+    if (!r) return undefined
+    return { id: r.session_id as string, usedAt: r.used_at as number, ...(r.warm_until !== null ? { warmUntil: r.warm_until as number } : {}) }
+  }
+
+  /**
+   * Set an automation's session for a key. Past MAX_SESSIONS keys, the least recently used go with their
+   * memory, except `keep` (keys with a run in progress) and `key` itself.
+   */
+  setSession(jobID: string, key: string, sessionID: string, now = Date.now(), keep: Iterable<string> = []): void {
+    this.tx(() => {
+      this.db.run("INSERT OR REPLACE INTO sessions (job, key, session_id, used_at) VALUES (?, ?, ?, ?)", [jobID, key, sessionID, now])
+      const kept = JSON.stringify([...keep, key])
+      const old = this.db.query(
+        "SELECT key FROM sessions WHERE job = ? AND key NOT IN (SELECT value FROM json_each(?)) ORDER BY used_at " +
+        "LIMIT MAX(0, (SELECT COUNT(*) FROM sessions WHERE job = ?) - ?)",
+      ).all(jobID, kept, jobID, MAX_SESSIONS) as Array<{ key: string }>
+      for (const { key: k } of old) {
+        this.db.run("DELETE FROM sessions WHERE job = ? AND key = ?", [jobID, k])
+        this.db.run("DELETE FROM memory WHERE job = ? AND key = ?", [jobID, k])
+      }
+    })
+  }
+
+  /** A run in a sticky session ended: it counts as used now, and is warm until `warmUntil` if given. */
+  touchSession(jobID: string, key: string, sessionID: string, now: number, warmUntil?: number): void {
+    this.db.run(
+      "UPDATE sessions SET used_at = ?, warm_until = COALESCE(?, warm_until) WHERE job = ? AND key = ? AND session_id = ?",
+      [now, warmUntil ?? null, jobID, key, sessionID])
+  }
+
+  note(jobID: string, key = ""): string | undefined {
+    const r = this.db.query("SELECT note FROM memory WHERE job = ? AND key = ?").get(jobID, key) as { note: string } | null
+    return r?.note
+  }
+
+  setNote(jobID: string, key: string, note: string | undefined): void {
+    if (note === undefined) this.db.run("DELETE FROM memory WHERE job = ? AND key = ?", [jobID, key])
+    else this.db.run("INSERT OR REPLACE INTO memory (job, key, note, updated_at) VALUES (?, ?, ?, ?)", [jobID, key, note, Date.now()])
+  }
+
+  // ---------- outbox ----------
+
+  /** Add a message to the outbox, to be sent through each of `senders`. */
+  enqueue(m: Omit<OutboxMessage, "id" | "at">, senders: string[], now = Date.now()): number {
+    return this.tx(() => {
+      const { id } = this.db.query(
+        "INSERT INTO outbox (at, job, run, title, body, priority, url, url_title) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+      ).get(now, m.job ?? null, m.run ?? null, m.title, m.body, m.priority, m.url ?? null, m.urlTitle ?? null) as { id: number }
+      const put = this.db.prepare("INSERT INTO sends (message, sender, status, next_at) VALUES (?, ?, 'pending', ?)")
+      for (const s of senders) put.run(id, s, now)
+      return id
+    })
+  }
+
+  /** Sends due now, oldest first. */
+  due(now = Date.now()): Send[] {
+    const rows = this.db.query(
+      "SELECT o.*, s.sender, s.attempts FROM sends s JOIN outbox o ON o.id = s.message " +
+      "WHERE s.status = 'pending' AND s.next_at <= ? ORDER BY o.id",
+    ).all(now) as Row[]
+    return rows.map((r) => ({ message: message(r), sender: r.sender as string, attempts: r.attempts as number }))
+  }
+
+  /** Record a send's outcome. Still pending: tried again at `nextAt`. */
+  updateSend(messageID: number, sender: string, status: SendStatus, attempts: number, nextAt: number, error?: string): void {
+    this.db.run("UPDATE sends SET status = ?, attempts = ?, next_at = ?, error = ? WHERE message = ? AND sender = ?",
+      [status, attempts, nextAt, error ?? null, messageID, sender])
+  }
+
+  /** The latest messages, newest first, with each sender's status. */
+  sent(jobID?: string, limit = 10): Array<OutboxMessage & { sends: Array<{ sender: string; status: SendStatus; error?: string }> }> {
+    const rows = (jobID
+      ? this.db.query("SELECT * FROM outbox WHERE job = ? ORDER BY id DESC LIMIT ?").all(jobID, limit)
+      : this.db.query("SELECT * FROM outbox ORDER BY id DESC LIMIT ?").all(limit)) as Row[]
+    const sends = this.db.prepare("SELECT sender, status, error FROM sends WHERE message = ? ORDER BY sender")
+    return rows.map((r) => ({
+      ...message(r),
+      sends: (sends.all(r.id) as Row[]).map((s) => ({ sender: s.sender as string, status: s.status as SendStatus, ...(s.error !== null ? { error: s.error as string } : {}) })),
+    }))
+  }
+
+  // ---------- leader lease ----------
+
+  /** Take or renew the leader lease; true if this store holds it. */
+  lease(ttl: number, now = Date.now()): boolean {
+    return this.tx(() => {
+      this.db.run(
+        "INSERT INTO lease (name, holder, until) VALUES ('leader', ?, ?) " +
+        "ON CONFLICT (name) DO UPDATE SET holder = excluded.holder, until = excluded.until WHERE lease.holder = excluded.holder OR lease.until < ?",
+        [this.holder, now + ttl, now])
+      const r = this.db.query("SELECT holder FROM lease WHERE name = 'leader'").get() as { holder: string }
+      return r.holder === this.holder
+    })
   }
 
   release(): void {
-    const unlock = this.unlockLeader
-    this.unlockLeader = undefined
-    unlock?.()
+    try { this.db.run("DELETE FROM lease WHERE name = 'leader' AND holder = ?", [this.holder]) } catch {}
+  }
+}
+
+function message(r: Row): OutboxMessage {
+  return {
+    id: r.id as number,
+    at: r.at as number,
+    ...(r.job !== null ? { job: r.job as string } : {}),
+    ...(r.run !== null ? { run: r.run as string } : {}),
+    title: r.title as string,
+    body: r.body as string,
+    priority: r.priority as Priority,
+    ...(r.url !== null ? { url: r.url as string } : {}),
+    ...(r.url_title !== null ? { urlTitle: r.url_title as string } : {}),
   }
 }

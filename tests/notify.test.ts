@@ -1,7 +1,11 @@
-import { expect, spyOn, test } from "bun:test"
+import { afterEach, expect, spyOn, test } from "bun:test"
+import { mkdtempSync, rmSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { log } from "../log.ts"
-import { compose, format, longLine, pushoverParts, send, shouldNotify, split, MAX_LINE, PUSHOVER, type Deps, type Message } from "../notify.ts"
-import type { Job, Run } from "../store.ts"
+import { deliver, format, longLine, MAX_PARTS, pushoverParts, split, MAX_LINE, PUSHOVER, type Deps, type Message, type Sender } from "../notify.ts"
+import { compose, Outbox, parseSenders, RETRY_MS } from "../outbox.ts"
+import { Store, type Job, type Run } from "../store.ts"
 
 const job: Job = {
   id: "morning", name: "Morning", prompt: "Check things", schedule: { kind: "every", ms: 60_000 },
@@ -13,29 +17,15 @@ const message: Message = { title: "Morning", body: "All clear", priority: "norma
 
 const noNetwork = async (): Promise<Response> => { throw new Error("unexpected network request") }
 const noExec = async () => { throw new Error("unexpected native notification") }
-
-/** The message of the error given to the first log call. */
-const failure = (spy: { mock: { calls: unknown[][] } }) => {
-  const fields = spy.mock.calls[0][0]
-  const err = typeof fields === "object" && fields !== null && "err" in fields ? fields.err : undefined
-  return String(err instanceof Error ? err.message : undefined)
-}
-
-test("removed notification channels never send requests", async () => {
-  let requests = 0
-  // An old config: these keys are no longer part of the notify options.
-  const old: Record<string, unknown> = { ntfy: { topic: "old-topic" }, bark: { key: "old-key" }, webhook: { url: "https://example.invalid" } }
-  await send(old, message, { platform: "darwin", fetch: async () => { requests++; return new Response("ok") }, exec: noExec })
-  expect(requests).toBe(0)
-})
+const native: Sender = { id: "desktop", type: "native" }
+const pushover: Sender = { id: "phone", type: "pushover", token: "test-token", user: "test-user" }
 
 test("native on macOS sends title and body as arguments, not AppleScript source", async () => {
   const calls: Array<{ command: string; args: string[] }> = []
   const body = 'Output with "quotes" and \\slashes'
-  const result = await send({ native: true }, { ...message, body }, {
+  await deliver(native, { ...message, body }, {
     platform: "darwin", fetch: noNetwork, exec: async (command, args) => { calls.push({ command, args }) },
   })
-  expect(result).toEqual({ sent: ["native"], failed: [] })
   expect(calls).toHaveLength(1)
   expect(calls[0].command).toBe("osascript")
   expect(calls[0].args.slice(-3)).toEqual(["Morning", body, "opencode automations"])
@@ -46,7 +36,7 @@ test.each([
   ["normal", "normal"], ["high", "critical"], ["low", "low"],
 ] as const)("native on Linux sends %s priority with %s urgency", async (priority, urgency) => {
   const calls: Array<{ command: string; args: string[] }> = []
-  await send({ native: true }, { title: "--untrusted-title", body: "$(touch /bad); output", priority }, {
+  await deliver(native, { title: "--untrusted-title", body: "$(touch /bad); output", priority }, {
     platform: "linux", fetch: noNetwork, exec: async (command, args) => { calls.push({ command, args }) },
   })
   expect(calls).toEqual([{
@@ -57,88 +47,64 @@ test.each([
 
 test("native gets plain text with markdown cleaned up and the link appended", async () => {
   const calls: string[][] = []
-  await send({ native: true }, { title: "T", body: "## Summary\n- **two** [MRs](https://x.test/mr)\n- `ci` red", url: "https://x.test" }, {
+  await deliver(native, { title: "T", body: "## Summary\n- **two** [MRs](https://x.test/mr)\n- `ci` red", url: "https://x.test" }, {
     platform: "linux", fetch: noNetwork, exec: async (_c, args) => { calls.push(args) },
   })
   expect(calls[0].at(-1)).toBe("Summary\n• two MRs (https://x.test/mr)\n• ci red\nhttps://x.test")
 })
 
-test("native disabled never invokes an OS backend", async () => {
+test("native macOS sound option is used", async () => {
+  const calls: string[][] = []
+  await deliver({ ...native, sound: "Ping" }, message, { platform: "darwin", fetch: noNetwork, exec: async (_command, args) => { calls.push(args) } })
+  expect(calls[0][3]).toContain('sound name "Ping"')
+})
+
+test("unsupported native platform fails without spawning a process", async () => {
   let calls = 0
-  await send({ native: false }, message, { platform: "linux", fetch: noNetwork, exec: async () => { calls++ } })
+  await expect(deliver(native, message, { platform: "win32", fetch: noNetwork, exec: async () => { calls++ } })).rejects.toThrow("win32")
   expect(calls).toBe(0)
 })
 
-test("native macOS sound options are preserved", async () => {
-  const calls: string[][] = []
-  const deps: Deps = { platform: "darwin", fetch: noNetwork, exec: async (_command, args) => { calls.push(args) } }
-  await send({ native: { sound: "Ping" } }, message, deps)
-  await send({ native: { sound: "" } }, message, deps)
-  expect(calls[0][3]).toContain('sound name "Ping"')
-  expect(calls[1][3]).not.toContain("sound name")
-})
-
-test("missing Linux backend is reported without blocking Pushover", async () => {
-  const errors = spyOn(log, "error").mockImplementation(() => {})
-  const requests: string[] = []
-  try {
-    const result = await send({ native: true, pushover: { token: "test-token", user: "test-user" } }, message, {
-      platform: "linux",
-      fetch: async (url) => { requests.push(url); return new Response("ok") },
-      exec: async () => { throw new Error("spawn notify-send ENOENT") },
-    })
-    expect(result).toEqual({ sent: ["pushover"], failed: ["native"] })
-    expect(requests).toEqual(["https://api.pushover.net/1/messages.json"])
-    expect(errors.mock.calls[0]).toMatchObject([{ via: "native" }, "notification failed"])
-    expect(failure(errors)).toContain("ENOENT")
-  } finally { errors.mockRestore() }
-})
-
-test("unsupported native platform reports failure without spawning a process", async () => {
-  const errors = spyOn(log, "error").mockImplementation(() => {})
-  let calls = 0
-  try {
-    const result = await send({ native: true }, message, { platform: "win32", fetch: noNetwork, exec: async () => { calls++ } })
-    expect(result.failed).toEqual(["native"])
-    expect(calls).toBe(0)
-    expect(failure(errors)).toContain("win32")
-  } finally { errors.mockRestore() }
-})
-
-test("Pushover sends credentials, HTML message, priority and link", async () => {
+test("Pushover sends credentials, HTML message, priority and link; credentials may come from the environment", async () => {
   const calls: Array<{ url: string; input?: RequestInit }> = []
-  const result = await send({ pushover: { token: "test-token", user: "test-user" } }, {
-    title: "CI broke", body: "**main** is red: a < b & c", priority: "high", url: "https://ci.test/1", urlTitle: "Open build",
-  }, { platform: "linux", fetch: async (url, input) => { calls.push({ url, input }); return new Response("ok") }, exec: noExec })
-  expect(result).toEqual({ sent: ["pushover"], failed: [] })
+  process.env.TEST_PUSHOVER_TOKEN = "env-token"
+  try {
+    await deliver({ ...pushover, token: "{env:TEST_PUSHOVER_TOKEN}" }, {
+      title: "CI broke", body: "**main** is red: a < b & c", priority: "high", url: "https://ci.test/1", urlTitle: "Open build",
+    }, { platform: "linux", fetch: async (url, input) => { calls.push({ url, input }); return new Response("ok") }, exec: noExec })
+  } finally { delete process.env.TEST_PUSHOVER_TOKEN }
   expect(calls).toHaveLength(1)
   expect(calls[0].url).toBe("https://api.pushover.net/1/messages.json")
   expect(calls[0].input?.method).toBe("POST")
   expect(JSON.parse(calls[0].input?.body as string)).toEqual({
-    token: "test-token", user: "test-user", title: "CI broke", message: "<b>main</b> is red: a &lt; b &amp; c",
+    token: "env-token", user: "test-user", title: "CI broke", message: "<b>main</b> is red: a &lt; b &amp; c",
     html: 1, priority: 1, url: "https://ci.test/1", url_title: "Open build",
   })
 })
 
-test("Pushover failures include the response body in the log", async () => {
-  const errors = spyOn(log, "error").mockImplementation(() => {})
-  try {
-    const result = await send({ pushover: { token: "t", user: "u" } }, message, {
-      platform: "linux", fetch: async () => new Response('{"errors":["user key is invalid"]}', { status: 400 }), exec: noExec,
-    })
-    expect(result.failed).toEqual(["pushover"])
-    expect(failure(errors)).toContain("user key is invalid")
-  } finally { errors.mockRestore() }
+test("Pushover failures carry the response body", async () => {
+  await expect(deliver(pushover, message, {
+    platform: "linux", fetch: async () => new Response('{"errors":["user key is invalid"]}', { status: 400 }), exec: noExec,
+  })).rejects.toThrow("user key is invalid")
+})
+
+test("a webhook gets the message as JSON, in plain text", async () => {
+  const calls: Array<{ url: string; input?: RequestInit }> = []
+  await deliver({ id: "hook", type: "webhook", url: "https://hook.test/x", headers: { "X-Token": "t" } }, { title: "T", body: "**b**", priority: "low", url: "https://x.test" }, {
+    platform: "linux", fetch: async (url, input) => { calls.push({ url, input }); return new Response("ok") }, exec: noExec,
+  })
+  expect(calls[0].url).toBe("https://hook.test/x")
+  expect(new Headers(calls[0].input?.headers).get("X-Token")).toBe("t")
+  expect(JSON.parse(calls[0].input?.body as string)).toEqual({ title: "T", message: "b", priority: "low", url: "https://x.test" })
 })
 
 test("long messages are split into numbered parts at paragraph boundaries, in order", async () => {
-  const paragraphs = Array.from({ length: 6 }, (_, i) => `Finding ${i + 1}: ` + "detail ".repeat(40).trim())
+  const paragraphs = Array.from({ length: 4 }, (_, i) => `Finding ${i + 1}: ` + "detail ".repeat(40).trim())
   const bodies: Array<{ title: string; message: string; url?: string }> = []
-  const result = await send({ pushover: { token: "t", user: "u" } }, { title: "Audit", body: paragraphs.join("\n\n"), url: "https://x.test" }, {
+  await deliver(pushover, { title: "Audit", body: paragraphs.join("\n\n"), url: "https://x.test" }, {
     platform: "linux", fetch: async (_url, input) => { bodies.push(JSON.parse(input?.body as string)); return new Response("ok") }, exec: noExec,
   })
   expect(bodies.length).toBeGreaterThan(1)
-  expect(result.sent).toEqual([`pushover (${bodies.length} messages)`])
   bodies.forEach((b, i) => {
     expect(b.title).toBe(`Audit (${i + 1}/${bodies.length})`)
     expect(b.message.length).toBeLessThanOrEqual(PUSHOVER.message)
@@ -148,6 +114,13 @@ test("long messages are split into numbered parts at paragraph boundaries, in or
   expect(bodies.map((b) => b.message).join("\n\n")).toBe(paragraphs.join("\n\n"))
   // The link button is on the last part only.
   expect(bodies.map((b) => b.url)).toEqual([...Array(bodies.length - 1).fill(undefined), "https://x.test"])
+})
+
+test("a message too long for Pushover is cut to its part limit", () => {
+  const parts = pushoverParts({ title: "Dump", body: ("word ".repeat(30) + "\n").repeat(60) })
+  expect(parts).toHaveLength(MAX_PARTS)
+  expect(String(parts.at(-1)!.message).endsWith("…")).toBe(true)
+  expect(parts.at(-1)!.title).toBe(`Dump (${MAX_PARTS}/${MAX_PARTS})`)
 })
 
 test("splitting never breaks an HTML tag, a word, or an emoji", () => {
@@ -182,22 +155,83 @@ test("format cleans up markdown for each channel", () => {
   expect(format("[x](https://a.test?q=1&r=2) <script>", "html")).toBe('<a href="https://a.test?q=1&amp;r=2">x</a> &lt;script&gt;')
 })
 
-test("automatic notices: failures by default, never for success", () => {
-  const cfg = { native: true }
-  expect(shouldNotify(cfg, job, "failed")).toBe(true)
-  expect(shouldNotify(cfg, job, "timeout")).toBe(true)
-  expect(shouldNotify(cfg, job, "succeeded")).toBe(false)
-  expect(shouldNotify({ ...cfg, on: ["succeeded"] }, job, "succeeded")).toBe(false)
-  expect(shouldNotify(cfg, { ...job, notify: ["succeeded"] }, "succeeded")).toBe(false)
-  expect(shouldNotify(cfg, { ...job, notify: false }, "failed")).toBe(false)
-  expect(shouldNotify(cfg, { ...job, notify: ["timeout"] }, "failed")).toBe(false)
-  expect(shouldNotify({}, job, "failed")).toBe(false)
-})
-
 test("compose writes a short notice", () => {
   expect(compose(job, { ...run, status: "failed" }).body).toBe("Failed after 2s.")
   expect(compose(job, { ...run, status: "failed", error: "boom" })).toEqual({ title: "Morning failed", body: "boom", priority: "high" })
   expect(compose(job, { ...run, status: "timeout", error: "exceeded 30m" }).body).toBe("Stopped: exceeded 30m.")
+})
+
+// ---------- outbox ----------
+
+const dirs: string[] = []
+afterEach(() => dirs.splice(0).forEach((dir) => rmSync(dir, { recursive: true, force: true })))
+function store() {
+  const dir = mkdtempSync(join(tmpdir(), "automations-outbox-"))
+  dirs.push(dir)
+  return new Store(dir)
+}
+
+test("senders are checked: ids unique, a known type, what each type needs", () => {
+  expect(parseSenders(undefined)).toEqual([])
+  expect(parseSenders({ senders: [native, pushover] })).toHaveLength(2)
+  expect(() => parseSenders({ senders: [native, native] })).toThrow("unique")
+  expect(() => parseSenders({ senders: [{ id: "x", type: "sms" } as unknown as Sender] })).toThrow("type must be one of")
+  expect(() => parseSenders({ senders: [{ id: "p", type: "pushover", token: "t" } as unknown as Sender] })).toThrow("token and user")
+  expect(() => parseSenders({ senders: [{ id: "w", type: "webhook" } as unknown as Sender] })).toThrow("needs url")
+})
+
+test("automatic notices: failures by default, never for success, and only with a sender", () => {
+  const outbox = new Outbox(store(), { senders: [native] })
+  expect(outbox.noticeFor(job, "failed")).toBe(true)
+  expect(outbox.noticeFor(job, "timeout")).toBe(true)
+  expect(outbox.noticeFor(job, "succeeded")).toBe(false)
+  expect(new Outbox(store(), { senders: [native], on: ["succeeded"] }).noticeFor(job, "succeeded")).toBe(false)
+  expect(outbox.noticeFor({ ...job, notify: ["succeeded"] }, "succeeded")).toBe(false)
+  expect(outbox.noticeFor({ ...job, notify: false }, "failed")).toBe(false)
+  expect(outbox.noticeFor({ ...job, notify: ["timeout"] }, "failed")).toBe(false)
+  expect(new Outbox(store(), {}).noticeFor(job, "failed")).toBe(false)
+})
+
+test("the dispatcher sends each message to every sender that takes its priority, and retries failures", async () => {
+  const warn = spyOn(log, "warn").mockImplementation(() => {})
+  const error = spyOn(log, "error").mockImplementation(() => {})
+  try {
+    const s = store()
+    let pushoverUp = false
+    const execs: string[] = []
+    const deps: Deps = {
+      platform: "linux",
+      exec: async (_c, args) => { execs.push(args.at(-2)!) },
+      fetch: async () => (pushoverUp ? new Response("ok") : new Response("down", { status: 503 })),
+    }
+    const outbox = new Outbox(s, { senders: [native, { ...pushover, minPriority: "high" }] }, deps)
+    outbox.add({ title: "FYI", body: "low", priority: "low" }, { job: "morning" })
+    outbox.add({ title: "Urgent", body: "now", priority: "high" }, { job: "morning" })
+    await outbox.dispatch()
+    expect(execs.sort()).toEqual(["FYI", "Urgent"])
+    // Pushover only takes high, and failed: it waits for its retry.
+    const urgent = s.sent("morning").find((m) => m.title === "Urgent")!
+    expect(urgent.sends).toEqual([{ sender: "desktop", status: "sent" }, { sender: "phone", status: "pending", error: "HTTP 503: down" }])
+    expect(s.sent("morning").find((m) => m.title === "FYI")!.sends).toEqual([{ sender: "desktop", status: "sent" }])
+    expect(s.due()).toEqual([])
+    // Once due again, it is sent; nothing already sent goes again.
+    pushoverUp = true
+    expect(s.due(Date.now() + RETRY_MS[0])).toHaveLength(1)
+    s.db.run("UPDATE sends SET next_at = 0 WHERE status = 'pending'")
+    await outbox.dispatch()
+    expect(s.sent("morning").find((m) => m.title === "Urgent")!.sends.map((x) => x.status)).toEqual(["sent", "sent"])
+    expect(execs).toHaveLength(2)
+    // A sender that keeps failing is given up on after its retries.
+    pushoverUp = false
+    outbox.add({ title: "Again", body: "x", priority: "high" })
+    for (let i = 0; i <= RETRY_MS.length; i++) {
+      s.db.run("UPDATE sends SET next_at = 0 WHERE status = 'pending'")
+      await outbox.dispatch()
+    }
+    expect(s.sent().find((m) => m.title === "Again")!.sends.find((x) => x.sender === "phone")!.status).toBe("failed")
+    expect(error.mock.calls[0][1]).toBe("notification failed, giving up")
+    s.close()
+  } finally { warn.mockRestore(); error.mockRestore() }
 })
 
 test("quotes in link URLs can't break the href", async () => {

@@ -1,11 +1,11 @@
 import { afterEach, expect, spyOn, test } from "bun:test"
 import { EventEmitter, on } from "node:events"
-import { mkdtempSync, rmSync, statSync } from "node:fs"
+import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import plugin from "../index.ts"
 import { cacheLifetime } from "../cache.ts"
-import { Store, type Job, type Memory } from "../store.ts"
+import { Store, type Job } from "../store.ts"
 import type { Context, ToolEditor } from "../types.ts"
 
 type Tool = Parameters<ToolEditor["add"]>[0]
@@ -118,7 +118,7 @@ async function start(options: Record<string, unknown> = {}, jobs: Job[] = [], se
       },
     },
   }
-  cleanups.push(async () => { store.release(); rmSync(dataDir, { recursive: true, force: true }) })
+  cleanups.push(async () => { store.close(); rmSync(dataDir, { recursive: true, force: true }) })
   // Only the parts the plugin uses: the rest of opencode's context isn't there.
   const teardown = await plugin.setup(ctx as unknown as Context)
   let stopped = false
@@ -141,6 +141,12 @@ async function start(options: Record<string, unknown> = {}, jobs: Job[] = [], se
   }
   return { store, tools, namespaces, commands, prompts, sessions, compactions, compactMode, removed, events, call, context, compactionSummary, dataDir, stop, ctx }
 }
+
+/** The outbox with one sender, Pushover. */
+const pushover = { senders: [{ id: "phone", type: "pushover", token: "test-token", user: "test-user" }] }
+/** Save the run's memory, as a run is told to before it ends (else it is asked once more). */
+const remember = (app: { call: (name: string, input: unknown, sessionID: string) => Promise<{ content: string }> }, sessionID: string, note = "noted") =>
+  app.call("automation_memory_update", { note }, sessionID)
 
 function job(overrides: Partial<Job> = {}): Job {
   return {
@@ -207,8 +213,9 @@ test("one-shot completion survives reload; the history keeps the outcome, not wh
 test("V2 execution success completes the run without waiting for legacy idle", async () => {
   const fetch = spyOn(globalThis, "fetch").mockResolvedValue(new Response("ok"))
   try {
-    const app = await start({ notify: { on: ["succeeded"], pushover: { token: "test-token", user: "test-user" } } }, [job({ timeoutMinutes: 0.001 })])
+    const app = await start({ outbox: { on: ["succeeded"], ...pushover } }, [job({ timeoutMinutes: 0.001 })])
     await app.call("automation_run", { id: "morning" })
+    await remember(app, "session-1")
     app.events.emit("event", { type: "session.text.ended", data: { sessionID: "session-1", text: "Ok\nNothing worth notifying the user about in this run." } })
     app.events.emit("event", {
       id: "evt-success", type: "session.execution.succeeded", created: Date.now(),
@@ -225,17 +232,6 @@ test("V2 execution success completes the run without waiting for legacy idle", a
     // Success is never notified automatically, even with "succeeded" in `on`.
     expect(fetch.mock.calls).toHaveLength(0)
   } finally { fetch.mockRestore() }
-})
-
-test("the old session name reuse still loads, as sticky", async () => {
-  const app = await start(
-    { jobs: [{ id: "cfg", prompt: "p", every: "1h", directory: process.cwd(), session: "reuse" }] },
-    // Saved before "reuse" was renamed, so not a session mode any more.
-    [JSON.parse(JSON.stringify(job({ session: "sticky" })).replace('"sticky"', '"reuse"'))],
-  )
-  const jobs = app.store.loadJobs()
-  expect(jobs.find((j) => j.id === "morning")?.session).toBe("sticky")
-  expect(jobs.find((j) => j.id === "cfg")?.session).toBe("sticky")
 })
 
 test("defaultModel reaches newly created sessions", async () => {
@@ -263,22 +259,26 @@ test("editing a completed one-shot schedule reactivates it", async () => {
   expect(app.store.loadJobs()[0].nextRunAt).toBeGreaterThan(Date.now())
 })
 
-const pushover = { pushover: { token: "test-token", user: "test-user" } }
 const bodies = (fetch: { mock: { calls: Array<[FetchInput, FetchInit?]> } }) => fetch.mock.calls.map(([, init]) => json(init))
+/** Wait for the outbox to have made `n` requests: it sends in the background. */
+const sent = async (fetch: { mock: { calls: unknown[] } }, n: number) => { for (let i = 0; i < 50 && fetch.mock.calls.length < n; i++) await flush() }
 
 test("the run's agent sends notifications itself; a successful run then sends nothing else", async () => {
   const fetch = spyOn(globalThis, "fetch").mockResolvedValue(new Response("ok"))
   try {
-    const app = await start({ notify: pushover }, [job()])
+    const app = await start({ outbox: pushover }, [job()])
     await app.call("automation_run", { id: "morning" })
-    const sent = await app.call("automation_notify", {
+    const queued = await app.call("automation_notify", {
       title: "2 MRs need you", message: "- **!12** blocked\n- !15 approved", priority: "high", url: "https://mr.test", url_title: "Open",
     }, "session-1")
-    expect(sent.content).toContain("Sent via pushover")
+    expect(queued.content).toContain("Queued for delivery")
+    await sent(fetch, 1)
     expect(bodies(fetch)).toEqual([{
       token: "test-token", user: "test-user", title: "2 MRs need you", message: "• <b>!12</b> blocked\n• !15 approved",
       html: 1, priority: 1, url: "https://mr.test", url_title: "Open",
     }])
+    expect(app.store.sent("morning")[0]).toMatchObject({ title: "2 MRs need you", sends: [{ sender: "phone", status: "sent" }] })
+    await remember(app, "session-1")
     app.events.emit("event", { type: "session.text.ended", data: { sessionID: "session-1", text: "Done, notified." } })
     app.events.emit("event", { type: "session.idle", data: { sessionID: "session-1" } })
     await new Promise((resolve) => setTimeout(resolve, 80))
@@ -291,7 +291,7 @@ test("the run's agent sends notifications itself; a successful run then sends no
 test("failed runs notify automatically even after the agent notified", async () => {
   const fetch = spyOn(globalThis, "fetch").mockResolvedValue(new Response("ok"))
   try {
-    const app = await start({ notify: pushover }, [job()])
+    const app = await start({ outbox: pushover }, [job()])
     await app.call("automation_run", { id: "morning" })
     await app.call("automation_notify", { title: "Started", message: "Looking" }, "session-1")
     app.events.emit("event", { type: "session.execution.failed", data: { sessionID: "session-1", error: "model overloaded" } })
@@ -303,8 +303,9 @@ test("failed runs notify automatically even after the agent notified", async () 
 test("a successful run that says there is nothing to report is silent", async () => {
   const fetch = spyOn(globalThis, "fetch").mockResolvedValue(new Response("ok"))
   try {
-    const app = await start({ notify: pushover }, [job()])
+    const app = await start({ outbox: pushover }, [job()])
     await app.call("automation_run", { id: "morning" })
+    await remember(app, "session-1")
     app.events.emit("event", { type: "session.text.ended", data: { sessionID: "session-1", text: "All clear.\nnothing worth notifying the user about in this run" } })
     app.events.emit("event", { type: "session.idle", data: { sessionID: "session-1" } })
     await new Promise((resolve) => setTimeout(resolve, 80))
@@ -315,7 +316,7 @@ test("a successful run that says there is nothing to report is silent", async ()
 })
 
 test("a run that ends silently without saying why is asked once whether to notify", async () => {
-  const app = await start({ notify: pushover }, [job()])
+  const app = await start({ outbox: pushover }, [job()])
   await app.call("automation_run", { id: "morning" })
   app.events.emit("event", { type: "session.text.ended", data: { sessionID: "session-1", text: "MR !12 is blocked." } })
   app.events.emit("event", { type: "session.execution.succeeded", data: { sessionID: "session-1" } })
@@ -338,8 +339,9 @@ test("a run that ends silently without saying why is asked once whether to notif
 })
 
 test("runs that can't notify are never asked", async () => {
-  const app = await start({ notify: pushover }, [job({ notify: false })])
+  const app = await start({ outbox: pushover }, [job({ notify: false })])
   await app.call("automation_run", { id: "morning" })
+  await remember(app, "session-1")
   app.events.emit("event", { type: "session.text.ended", data: { sessionID: "session-1", text: "Done" } })
   app.events.emit("event", { type: "session.idle", data: { sessionID: "session-1" } })
   await flush()
@@ -347,10 +349,10 @@ test("runs that can't notify are never asked", async () => {
   expect(app.store.history()[0].status).toBe("succeeded")
 })
 
-test("automation_notify is limited per run and rejects text too long to split", async () => {
+test("automation_notify is limited per run and rejects text too long", async () => {
   const fetch = spyOn(globalThis, "fetch").mockResolvedValue(new Response("ok"))
   try {
-    const app = await start({ notify: { maxPerRun: 2, ...pushover } }, [job()])
+    const app = await start({ outbox: { maxPerRun: 2, ...pushover } }, [job()])
     await app.call("automation_run", { id: "morning" })
     const long = await app.call("automation_notify", { title: "Dump", message: ("word ".repeat(30) + "\n").repeat(40) }, "session-1")
     expect(long.content).toContain("error: message is")
@@ -361,6 +363,7 @@ test("automation_notify is limited per run and rejects text too long to split", 
     expect((await app.call("automation_notify", { title: "Link", message: "MR ready:\nhttps://x.test/" + "a".repeat(300) }, "session-1")).content).toContain("1 notifications left")
     expect((await app.call("automation_notify", { title: "B", message: "two" }, "session-1")).content).toContain("0 notifications left")
     expect((await app.call("automation_notify", { title: "C", message: "three" }, "session-1")).content).toContain("limit 2")
+    await sent(fetch, 2)
     expect(fetch.mock.calls).toHaveLength(2)
   } finally { fetch.mockRestore() }
 })
@@ -382,7 +385,10 @@ const monitor = (id: number, modified = "t1", state = "Alert") =>
 /** A fetch that answers channel polls with `monitors()` and anything else (Pushover) with ok. */
 const api = (monitors: () => unknown[]) => mockFetch((url) =>
   url.includes("dd.test") ? new Response(JSON.stringify(monitors())) : new Response("ok"))
-const waiting = (app: { store: Store }, jobID: string) => app.store.loadChannels().queues[jobID]?.pending.map((e) => e.id) ?? []
+const waiting = (app: { store: Store }, jobID: string) => app.store.waiting(jobID).map((e) => e.id)
+/** The session keys an automation has a sticky session for. */
+const keys = (app: { store: Store }, jobID: string) =>
+  (app.store.db.query("SELECT key FROM sessions WHERE job = ? ORDER BY key").all(jobID) as Array<{ key: string }>).map((r) => r.key)
 
 test("items already there are delivered on the first poll, including to automations added later", async () => {
   const fetch = api(() => [monitor(1)])
@@ -407,7 +413,7 @@ test("an automation on a channel runs on new events with an untrusted prompt", a
   let current: unknown[] = []
   const fetch = api(() => current)
   try {
-    const app = await start({ notify: { native: true }, channels: [channel()], jobs: [triage()] })
+    const app = await start({ outbox: pushover, channels: [channel()], jobs: [triage()] })
     expect(app.prompts).toEqual([])
     expect(app.tools.has("channel_list")).toBe(true)
 
@@ -449,7 +455,7 @@ test("sticky on a channel with session keys keeps one session per key and queues
     expect(waiting(app, "triage")).toEqual(["1:t2"])
 
     // Run for monitor 1 finishes (after the one follow-up asking for a note); the waiting event goes to the same session, queued.
-    const usedAt = app.store.loadChannels().queues.triage.sessions["dd:1"].at
+    const usedAt = app.store.session("triage", "dd:1")!.usedAt
     app.events.emit("event", { type: "session.idle", data: { sessionID: "session-1" } })
     await flush()
     expect(app.prompts.at(-1)).toMatchObject({ sessionID: "session-1", metadata: { automation: { reason: "check" } } })
@@ -457,8 +463,8 @@ test("sticky on a channel with session keys keeps one session per key and queues
     await flush()
     await app.call("channel_poll", { id: "dd" })
     // Going to an existing session marks it as used again.
-    expect(app.store.loadChannels().queues.triage.sessions["dd:1"]).toMatchObject({ id: "session-1" })
-    expect(app.store.loadChannels().queues.triage.sessions["dd:1"].at).toBeGreaterThan(usedAt)
+    expect(app.store.session("triage", "dd:1")).toMatchObject({ id: "session-1" })
+    expect(app.store.session("triage", "dd:1")!.usedAt).toBeGreaterThan(usedAt)
     expect(app.sessions).toHaveLength(2)
     const last = app.prompts.at(-1)
     expect(last?.sessionID).toBe("session-1")
@@ -482,7 +488,7 @@ test("sticky without session keys keeps one session; new ignores session keys", 
     // "one" gets both monitors in its single session; "fresh" gets both in one new session, not one per key.
     expect(app.prompts.map((p) => p.metadata.automation.jobID)).toEqual(["one", "fresh"])
     expect(app.prompts.every((p) => p.text.includes('id="1:t1"') && p.text.includes('id="2:t1"'))).toBe(true)
-    expect(app.store.loadJobs().find((j) => j.id === "one")?.sessionID).toBe(app.prompts[0].sessionID)
+    expect(app.store.session("one")?.id).toBe(app.prompts[0].sessionID)
   } finally { fetch.mockRestore() }
 })
 
@@ -508,7 +514,7 @@ test("one automation runs on several channels; same IDs and keys from different 
     expect(app.sessions).toHaveLength(2) // one per channel:key, not one shared "1"
     expect(app.prompts[0].text).toContain('<event channel="Datadog" id="1:t1"')
     expect(app.prompts[1].text).toContain('<event channel="Sentry" id="1:t1"')
-    expect(Object.keys(app.store.loadChannels().queues.triage.sessions).sort()).toEqual(["dd:1", "sentry:1"])
+    expect(keys(app, "triage")).toEqual(["dd:1", "sentry:1"])
     expect((await app.call("channel_list")).content).toContain("triage: 0 waiting")
     expect((await app.call("automation_list")).content).toContain("channels dd, sentry")
   } finally { fetch.mockRestore() }
@@ -551,6 +557,7 @@ test("one channel feeds several automations; a digest waits for its schedule", a
     expect(waiting(app, "digest")).toEqual([])
 
     // Run again with nothing waiting: it says so instead of skipping.
+    await remember(app, app.prompts[1].sessionID)
     app.events.emit("event", { type: "session.idle", data: { sessionID: app.prompts[1].sessionID } })
     await flush()
     await app.call("automation_run", { id: "digest" })
@@ -566,7 +573,7 @@ test("channels nobody listens to aren't polled, and paused automations get no ev
     const app = await start({ channels: [channel()], jobs: [triage({ enabled: false })] })
     expect(polls).toBe(0)
     expect((await app.call("channel_list")).content).toContain("triage (off): 0 waiting")
-    // A manual poll still works, and queues nothing for the disabled automation.
+    // A manual poll still works, and nothing waits for the disabled automation.
     await app.call("channel_poll", { id: "dd" })
     current = [monitor(1)]
     await app.call("channel_poll", { id: "dd" })
@@ -580,9 +587,9 @@ test("a channel that keeps failing notifies once and shows its error", async () 
   const fetch = mockFetch((url) =>
     url.includes("dd.test") ? new Response("bad key", { status: 403 }) : new Response("ok"))
   try {
-    const app = await start({ notify: pushover, channels: [channel()], jobs: [triage()] })
+    const app = await start({ outbox: pushover, channels: [channel()], jobs: [triage()] })
     for (let i = 0; i < 4; i++) await app.call("channel_poll", { id: "dd" })
-    await flush()
+    await sent(fetch, 6)
     const notices = fetch.mock.calls.filter(([url]) => String(url).includes("pushover")).map(([, init]) => json(init))
     expect(notices).toHaveLength(1)
     expect(notices[0].title).toBe("Channel Datadog can't poll")
@@ -615,8 +622,8 @@ test("a poll still running at shutdown starts nothing and is waited for", async 
 
 test("channel state starts in an empty data dir without a pre-made file", async () => {
   const app = await start()
-  expect(await app.store.mutateChannels((s) => { s.sources.x = { seen: ["a"] }; return 1 })).toBe(1)
-  expect(app.store.loadChannels().sources.x.seen).toEqual(["a"])
+  expect(await app.store.mutateChannels((s) => { s.sources.x = { failures: 1 }; return 1 })).toBe(1)
+  expect(app.store.loadChannels().sources.x.failures).toBe(1)
 })
 
 test("channel settings are validated for config and chat-created automations", async () => {
@@ -635,7 +642,7 @@ test("channel settings are validated for config and chat-created automations", a
 })
 
 test("automation_notify is offered, with guidance, only to runs that may notify", async () => {
-  const app = await start({ notify: { native: true } }, [job(), job({ id: "quiet", name: "Quiet", notify: false })])
+  const app = await start({ outbox: pushover }, [job(), job({ id: "quiet", name: "Quiet", notify: false })])
   await app.call("automation_run", { id: "morning" })
   await app.call("automation_run", { id: "quiet" })
 
@@ -652,8 +659,9 @@ test("automation_notify is offered, with guidance, only to runs that may notify"
     expect(c.tools).not.toContain("automation_notify")
     expect(c.tools).toContain("automation_list")
   }
-  // A run that can't notify gets only its run context; a chat that isn't a run gets nothing.
-  expect(app.context("session-2").system).toBe('This run is for the automation "Quiet" (id: quiet). Each run starts in a new session.')
+  // A run that can't notify gets no notification guidance; a chat that isn't a run gets nothing.
+  expect(app.context("session-2").system).toEndWith('This run is for the automation "Quiet" (id: quiet). Each run starts in a new session.')
+  expect(app.context("session-2").system).not.toContain("running unattended")
   expect(app.context("caller").system).toBe("")
   expect((await app.call("automation_notify", { title: "x", message: "y" })).content).toContain("only available inside an automation run")
   expect((await app.call("automation_notify", { title: "x", message: "y" }, "session-2")).content).toContain("error")
@@ -679,7 +687,7 @@ async function another(app: Awaited<ReturnType<typeof start>>) {
 test("a run's tools and guidance work through another instance of the plugin in the same process", async () => {
   const fetch = spyOn(globalThis, "fetch").mockResolvedValue(new Response("ok"))
   try {
-    const app = await start({ notify: pushover }, [job({ session: "sticky" })])
+    const app = await start({ outbox: pushover }, [job({ session: "sticky" })])
     const other = await another(app)
     await app.call("automation_run", { id: "morning" })
 
@@ -693,28 +701,23 @@ test("a run's tools and guidance work through another instance of the plugin in 
     expect(system.join("\n")).toContain("End every run with automation_memory_update")
     expect(new Set(system).size).toBe(system.length)
 
-    expect((await other.call("automation_notify", { title: "Brief", message: "MR !12 blocked" }, "session-1")).content).toContain("Sent via pushover")
+    expect((await other.call("automation_notify", { title: "Brief", message: "MR !12 blocked" }, "session-1")).content).toContain("Queued for delivery")
     expect((await other.call("automation_memory_update", { note: "MR !12 reported." }, "session-1")).content).toContain("Saved")
     await end(app, "session-1")
     // The run that started in the first instance saw both: it ended without asking again.
     expect(app.prompts).toHaveLength(1)
     expect(app.store.history()[0]).toMatchObject({ status: "succeeded", notifications: 1 })
-    expect(app.store.loadJobs()[0].memory?.note).toBe("MR !12 reported.")
+    expect(app.store.note("morning")).toBe("MR !12 reported.")
   } finally { fetch.mockRestore() }
 })
 
 // ---------- sticky memory ----------
 
-/** The memory of a job's sticky session, or of one of its session keys. */
-const memory = (store: Store, jobID: string, key?: string) =>
-  key === undefined ? store.loadJobs().find((j) => j.id === jobID)?.memory : store.loadChannels().queues[jobID]?.sessions[key]
-/** Change it in place: on the job, or on the key's entry in the channel queue. */
-const setMemory = (store: Store, jobID: string, key: string | undefined, fn: (m: Memory) => void) =>
-  key === undefined
-    ? store.mutate((jobs) => { fn(jobs.find((j) => j.id === jobID)!.memory!) })
-    : store.mutateChannels((s) => { fn(s.queues[jobID].sessions[key]) })
+/** Until when a job's (or key's) sticky session is warm. */
+const warmUntil = (store: Store, jobID: string, key = "") => store.session(jobID, key)?.warmUntil
 /** Make a job's (or key's) sticky session look cold: its cache went cold a while ago. */
-const chill = (store: Store, jobID: string, key?: string) => setMemory(store, jobID, key, (m) => { m.warmUntil = Date.now() - 60_000 })
+const chill = (store: Store, jobID: string, key = "") =>
+  store.db.run("UPDATE sessions SET warm_until = ? WHERE job = ? AND key = ?", [Date.now() - 60_000, jobID, key])
 const end = async (app: { events: EventEmitter }, sessionID: string) => {
   app.events.emit("event", { type: "session.execution.succeeded", data: { sessionID } })
   await flush()
@@ -724,7 +727,7 @@ test("a sticky session is continued while warm, and compacted to its memory once
   const app = await start({}, [job({ session: "sticky" })])
   await app.call("automation_run", { id: "morning" })
   expect(app.prompts[0]).toMatchObject({ sessionID: "session-1", text: "Check things" })
-  // Sticky runs are offered the memory tool and told to use it; it saves a note for the job.
+  // Runs are offered the memory tool and told to use it; it saves a note for the job.
   const ctx = app.context("session-1")
   expect(ctx.tools).toContain("automation_memory_update")
   expect(ctx.system).toContain("End every run with automation_memory_update")
@@ -747,7 +750,7 @@ test("a sticky session is continued while warm, and compacted to its memory once
   const run = app.prompts[2]
   expect(run).toMatchObject({ sessionID: "session-1", text: "Check things" })
   expect(app.sessions).toHaveLength(1)
-  expect(app.store.loadJobs()[0].sessionID).toBe("session-1")
+  expect(app.store.session("morning")?.id).toBe("session-1")
 })
 
 test("the compaction's end, even delivered after it returns, doesn't end the run or check it before its turn", async () => {
@@ -764,7 +767,7 @@ test("the compaction's end, even delivered after it returns, doesn't end the run
   await app.call("automation_memory_update", { note: "state 2" }, "session-1")
   await end(app, "session-1")
   expect(app.store.history()[0].status).toBe("succeeded")
-  expect(memory(app.store, "morning")).toMatchObject({ note: "state 2" })
+  expect(app.store.note("morning")).toBe("state 2")
 })
 
 test("a run that saves no memory drops the old one, and one that sent the model nothing doesn't warm the session", async () => {
@@ -773,16 +776,16 @@ test("a run that saves no memory drops the old one, and one that sent the model 
   app.context("session-1") // the run sent the model a request
   await app.call("automation_memory_update", { note: "run 1" }, "session-1")
   await end(app, "session-1")
-  expect(memory(app.store, "morning")).toMatchObject({ note: "run 1" })
-  const warm = memory(app.store, "morning")!.warmUntil
+  expect(app.store.note("morning")).toBe("run 1")
+  const warm = warmUntil(app.store, "morning")
   expect(warm).toBeGreaterThan(Date.now())
 
   // Run 2 sends nothing to the model (it failed at once) and saves no memory, even when asked.
   await app.call("automation_run", { id: "morning" })
   await end(app, "session-1")
   await end(app, "session-1")
-  expect(memory(app.store, "morning")!.note).toBeUndefined()
-  expect(memory(app.store, "morning")!.warmUntil).toBe(warm)
+  expect(app.store.note("morning")).toBeUndefined()
+  expect(warmUntil(app.store, "morning")).toBe(warm)
 
   // Cold, with no memory: the next run continues the whole session rather than compacting to run 1's note.
   await chill(app.store, "morning")
@@ -805,7 +808,7 @@ test("if compaction can't be done, the cold run goes on in its whole session", a
 })
 
 test("a sticky run that saves no note is asked once, with the notify check in the same turn; without a note the session goes on", async () => {
-  const app = await start({ notify: pushover }, [job({ session: "sticky" })])
+  const app = await start({ outbox: pushover }, [job({ session: "sticky" })])
   await app.call("automation_run", { id: "morning" })
   app.events.emit("event", { type: "session.text.ended", data: { sessionID: "session-1", text: "MR !12 is blocked." } })
   await end(app, "session-1")
@@ -830,7 +833,7 @@ test("with session keys, each key's session goes cold and is compacted to its ow
     const app = await start({ channels: [channel()], jobs: [triage({ session: "sticky" })] })
     current = [monitor(1), monitor(2)]
     await app.call("channel_poll", { id: "dd" })
-    const sid = (key: string) => app.store.loadChannels().queues.triage.sessions[key].id
+    const sid = (key: string) => app.store.session("triage", key)!.id
     const one = sid("dd:1"), two = sid("dd:2")
     app.context(one) // each run sent the model a request
     app.context(two)
@@ -874,10 +877,10 @@ test("a session with a one-hour cache stays warm for a gap a default cache would
   await end(app, "session-1")
   await end(app, "session-2")
   // Warm for 90% of the cache lifetime after the run ended.
-  expect(memory(app.store, "morning")!.warmUntil! - Date.now()).toBeGreaterThan(53 * 60_000)
-  expect(memory(app.store, "short")!.warmUntil! - Date.now()).toBeLessThan(5 * 60_000)
+  expect(warmUntil(app.store, "morning")! - Date.now()).toBeGreaterThan(53 * 60_000)
+  expect(warmUntil(app.store, "short")! - Date.now()).toBeLessThan(5 * 60_000)
   // 20 minutes later: the one-hour cache is still warm, the 5-minute one isn't.
-  for (const id of ["morning", "short"]) await setMemory(app.store, id, undefined, (m) => { m.warmUntil! -= 20 * 60_000 })
+  app.store.db.run("UPDATE sessions SET warm_until = warm_until - ?", [20 * 60_000])
   await app.call("automation_run", { id: "morning" })
   await app.call("automation_run", { id: "short" })
   expect(app.prompts.at(-2)).toMatchObject({ sessionID: "session-1", text: "Check things" })
@@ -896,32 +899,47 @@ test("with caching off, a sticky session is compacted whenever there is memory",
   expect(app.compactions).toEqual([{ sessionID: "session-1", summary: "state" }])
 })
 
-test("automation_memory_update is for sticky runs only, and refuses empty or long notes", async () => {
-  const app = await start({}, [job(), job({ id: "s", name: "S", session: "sticky" })])
+test("every automation that runs again keeps a memory; empty or long notes are refused", async () => {
+  const later = Date.now() + 3_600_000
+  const app = await start({}, [job(), job({ id: "once", name: "Once", schedule: { kind: "at", time: later }, nextRunAt: later })])
   await app.call("automation_run", { id: "morning" })
-  await app.call("automation_run", { id: "s" })
-  expect(app.context("session-1").tools).not.toContain("automation_memory_update")
+  await app.call("automation_run", { id: "once" })
+  expect(app.context("session-1").tools).toContain("automation_memory_update")
+  expect(app.context("session-1").system).toContain("End every run with automation_memory_update")
+  // A one-shot has no next run: no memory, and no reminder.
+  expect(app.context("session-2").tools).not.toContain("automation_memory_update")
   expect(app.context("caller").tools).not.toContain("automation_memory_update")
-  expect((await app.call("automation_memory_update", { note: "x" }, "session-1")).content).toContain("only kept for runs of sticky")
-  expect((await app.call("automation_memory_update", { note: "x" })).content).toContain("only kept for runs of sticky")
-  expect((await app.call("automation_memory_update", { note: "  " }, "session-2")).content).toContain("empty")
-  expect((await app.call("automation_memory_update", { note: "x".repeat(4001) }, "session-2")).content).toContain("limit is 4000")
-  expect(memory(app.store, "s")?.note).toBeUndefined()
-  expect(app.context("session-2").tools).toContain("automation_memory_update")
+  expect((await app.call("automation_memory_update", { note: "x" }, "session-2")).content).toContain("runs again")
+  expect((await app.call("automation_memory_update", { note: "x" })).content).toContain("runs again")
+  expect((await app.call("automation_memory_update", { note: "  " }, "session-1")).content).toContain("empty")
+  expect((await app.call("automation_memory_update", { note: "x".repeat(4001) }, "session-1")).content).toContain("limit is 4000")
+  expect(app.store.note("morning")).toBeUndefined()
+  await end(app, "session-2")
+  expect(app.prompts).toHaveLength(2)
+  expect(app.store.history("once")[0].status).toBe("succeeded")
 })
 
-test("the memory lives on the session's record: a new session starts fresh, and so does a new key session", async () => {
-  const app = await start({}, [job({ session: "sticky" })])
+test("a run in a fresh session starts from the previous run's memory", async () => {
+  const app = await start({}, [job(), job({ id: "s", name: "S", session: "sticky" })])
   await app.call("automation_run", { id: "morning" })
-  await app.call("automation_memory_update", { note: "state" }, "session-1")
+  await remember(app, "session-1", "MR !12 reported.")
   await end(app, "session-1")
-  expect(memory(app.store, "morning")).toMatchObject({ note: "state" })
-  // The session is gone: the new one starts without the old session's memory, and nothing is compacted.
-  app.ctx.session.get = async ({ sessionID }) => ({ id: sessionID, time: { archived: Date.now() }, location: { directory: app.dataDir } })
   await app.call("automation_run", { id: "morning" })
-  expect(app.prompts[1]).toMatchObject({ sessionID: "session-2", text: "Check things" })
-  expect(memory(app.store, "morning")).toBeUndefined()
+  expect(app.prompts[1].sessionID).toBe("session-2")
+  expect(app.prompts[1].text).toStartWith("Memory from the previous run of this automation")
+  expect(app.prompts[1].text).toContain("MR !12 reported.")
+  expect(app.prompts[1].text).toEndWith("Check things")
+
+  // A sticky automation whose session is gone: the new one starts from the memory, and nothing is compacted.
+  await app.call("automation_run", { id: "s" })
+  await remember(app, "session-3", "state")
+  await end(app, "session-3")
+  app.ctx.session.get = async ({ sessionID }) => ({ id: sessionID, time: { archived: Date.now() }, location: { directory: app.dataDir } })
+  await app.call("automation_run", { id: "s" })
+  expect(app.prompts.at(-1)?.sessionID).toBe("session-4")
+  expect(app.prompts.at(-1)?.text).toContain("state")
   expect(app.compactions).toEqual([])
+  expect(app.store.session("s")?.id).toBe("session-4")
 })
 
 // ---------- creating channels from chat ----------
@@ -978,7 +996,7 @@ test("a created channel feeds automations like a config one, and can be updated 
     const state = app.store.loadChannels()
     expect(state.defs.dd).toBeUndefined()
     expect(state.sources.dd).toBeUndefined()
-    expect(state.queues.triage.sessions).toEqual({})
+    expect(app.store.session("triage", "dd:1")).toBeUndefined()
   } finally { fetch.mockRestore(); delete process.env.TEST_DD_KEY }
 })
 
@@ -1007,23 +1025,24 @@ test("events from a run that failed to start go back to the queue, up to 3 attem
     app.ctx.session.prompt = async (input) => { if (failing) throw new Error("server busy"); return prompt(input) }
     current = [monitor(1)]
     await app.call("channel_poll", { id: "dd" })
-    expect(app.store.loadChannels().queues.triage.pending).toMatchObject([{ id: "1:t1", attempts: 1 }])
+    expect(app.store.waiting("triage")).toMatchObject([{ id: "1:t1", attempts: 1 }])
     // It starts once the server is back: nothing was lost.
     failing = false
     await app.call("automation_run", { id: "triage" })
     expect(app.prompts.at(-1)?.text).toContain('id="1:t1"')
-    expect(app.store.loadChannels().queues.triage.pending).toEqual([])
+    expect(app.store.waiting("triage")).toEqual([])
 
     // A start that keeps failing gives up after 3 attempts.
+    await remember(app, app.prompts.at(-1)!.sessionID)
     app.events.emit("event", { type: "session.idle", data: { sessionID: app.prompts.at(-1)?.sessionID } })
     await flush()
     failing = true
     current = [monitor(2)]
     await app.call("channel_poll", { id: "dd" }) // attempt 1
-    expect(app.store.loadChannels().queues.triage.pending).toMatchObject([{ id: "2:t1", attempts: 1 }])
+    expect(app.store.waiting("triage")).toMatchObject([{ id: "2:t1", attempts: 1 }])
     await app.call("automation_run", { id: "triage" }) // attempt 2
     await app.call("automation_run", { id: "triage" }) // attempt 3: dropped
-    expect(app.store.loadChannels().queues.triage.pending).toEqual([])
+    expect(app.store.waiting("triage")).toEqual([])
     expect(app.store.history().filter((r) => r.status === "failed").length).toBe(4)
   } finally { fetch.mockRestore() }
 })
@@ -1036,9 +1055,10 @@ test("two deliveries at once hand a chunk over only once", async () => {
     current = [monitor(1)]
     await app.call("channel_poll", { id: "dd" }) // a digest: events wait
     expect(app.prompts).toEqual([])
-    const runs = await Promise.all([app.call("automation_run", { id: "triage" }), app.call("automation_run", { id: "triage" })])
-    expect(app.prompts).toHaveLength(1)
-    expect(runs.map((r) => r.content).join("\n")).toContain("still busy")
+    await Promise.all([app.call("automation_run", { id: "triage" }), app.call("automation_run", { id: "triage" })])
+    // The events go to one run; the other, a manual run, finds nothing waiting and says so.
+    expect(app.prompts.filter((p) => p.text.includes('id="1:t1"'))).toHaveLength(1)
+    expect(app.prompts.filter((p) => p.text.includes("No new events"))).toHaveLength(1)
     expect(app.store.history().filter((r) => r.status === "skipped")).toEqual([])
   } finally { fetch.mockRestore() }
 })
@@ -1067,11 +1087,11 @@ test("a first poll doesn't queue an item twice when its id repeats", async () =>
   const fetch = api(() => [monitor(1), monitor(1)])
   try {
     const app = await start({ channels: [channel()], jobs: [triage({ cron: "0 0 1 1 *" })] })
-    expect(app.store.loadChannels().queues.triage.pending.map((e) => e.id)).toEqual(["1:t1"])
+    expect(waiting(app, "triage")).toEqual(["1:t1"])
   } finally { fetch.mockRestore() }
 })
 
-test("changing or deleting an automation cleans its queue", async () => {
+test("changing or deleting an automation changes what waits for it", async () => {
   let current: unknown[] = []
   const fetch = api(() => current)
   try {
@@ -1080,22 +1100,19 @@ test("changing or deleting an automation cleans its queue", async () => {
     current = [monitor(1)]
     await app.call("channel_poll", { id: "dd" })
     await app.call("channel_poll", { id: "two" })
-    expect(app.store.loadChannels().queues.digest.pending.map((e) => e.channel)).toEqual(["dd", "two"])
+    const channels = () => app.store.waiting("digest").map((e) => e.channel)
+    expect(channels()).toEqual(["dd", "two"])
 
-    // Dropping a channel drops what it held: its events and its first-poll mark.
+    // Dropping a channel drops what waited from it.
     await app.call("automation_update", { id: "digest", channels: ["two"] })
-    const q = app.store.loadChannels().queues.digest
-    expect(q.pending.map((e) => e.channel)).toEqual(["two"])
-    expect(q.started).toEqual(["two"])
-    // No channels left: no queue.
+    expect(channels()).toEqual(["two"])
     await app.call("automation_update", { id: "digest", channels: [] })
-    expect(app.store.loadChannels().queues.digest).toBeUndefined()
-
+    expect(channels()).toEqual([])
+    // Attached again: what the channel's latest poll returned.
     await app.call("automation_update", { id: "digest", channels: ["dd"] })
-    await app.call("channel_poll", { id: "dd" })
-    expect(app.store.loadChannels().queues.digest).toBeDefined()
+    expect(channels()).toEqual(["dd"])
     await app.call("automation_delete", { id: "digest" })
-    expect(app.store.loadChannels().queues.digest).toBeUndefined()
+    expect(app.store.db.query("SELECT COUNT(*) AS n FROM subscriptions WHERE job = 'digest'").get()).toEqual({ n: 0 })
   } finally { fetch.mockRestore() }
 })
 
@@ -1120,13 +1137,17 @@ test("automation_run says when an automation's channels are gone, and such an au
   } finally { fetch.mockRestore(); delete process.env.TEST_DD_KEY }
 })
 
-test("a tick drops queues of automations that no longer exist", async () => {
+test("a tick drops what automations that no longer exist left behind", async () => {
   const dataDir = mkdtempSync(join(tmpdir(), "automations-orphans-"))
   try {
-    // An automation deleted elsewhere (the TUI, or removed from config) left its queue behind.
-    await new Store(dataDir).mutateChannels((s) => { s.queues.ghost = { pending: [{ channel: "dd", id: "1", title: "x" }], sessions: {} } })
+    // An automation deleted elsewhere (the TUI, or removed from config) left its session and memory behind.
+    const old = new Store(dataDir)
+    old.setSession("ghost", "", "s1")
+    old.setNote("ghost", "", "x")
+    old.close()
     const app = await start({ dataDir })
-    expect(app.store.loadChannels().queues.ghost).toBeUndefined()
+    expect(app.store.session("ghost")).toBeUndefined()
+    expect(app.store.note("ghost")).toBeUndefined()
   } finally { rmSync(dataDir, { recursive: true, force: true }) }
 })
 
@@ -1168,7 +1189,7 @@ test("every tool goes through code mode, in two namespaces", async () => {
 
 // ---------- review fixes: update ordering, pause, sessions, saves ----------
 
-test("a rejected automation_update leaves the job's queue untouched", async () => {
+test("a rejected automation_update leaves what waits for the job untouched", async () => {
   let current: unknown[] = []
   const fetch = api(() => current)
   try {
@@ -1176,9 +1197,10 @@ test("a rejected automation_update leaves the job's queue untouched", async () =
     await app.call("automation_create", { name: "Digest", prompt: "p", channels: ["dd"], every: "1h" })
     current = [monitor(1)]
     await app.call("channel_poll", { id: "dd" })
-    const before = app.store.loadChannels().queues.digest
+    const before = waiting(app, "digest")
+    expect(before).toEqual(["1:t1"])
     expect((await app.call("automation_update", { id: "digest", channels: ["two"], cron: "bogus" })).content).toContain("error")
-    expect(app.store.loadChannels().queues.digest).toEqual(before)
+    expect(waiting(app, "digest")).toEqual(before)
     expect(app.store.loadJobs()[0].on).toEqual({ channels: ["dd"] })
   } finally { fetch.mockRestore() }
 })
@@ -1192,7 +1214,7 @@ test("events wait for a paused automation and go in when it resumes", async () =
     current = [monitor(1)]
     await app.call("channel_poll", { id: "dd" }) // triage runs; other is paused
     expect(app.prompts.map((p) => p.metadata.automation.jobID)).toEqual(["triage"])
-    expect(app.store.loadChannels().queues.other.pending.map((e) => e.id)).toEqual(["1:t1"])
+    expect(waiting(app, "other")).toEqual(["1:t1"])
     await app.call("automation_update", { id: "other", enabled: true })
     await app.call("channel_poll", { id: "dd" })
     expect(app.prompts.map((p) => p.metadata.automation.jobID)).toEqual(["triage", "other"])
@@ -1211,32 +1233,18 @@ test("detaching an event-only automation's last channel pauses it, and the pause
   } finally { fetch.mockRestore(); delete process.env.TEST_DD_KEY }
 })
 
-test("a session made for a chunk that someone else took is removed again", async () => {
-  const fetch = api(() => [monitor(1)])
-  try {
-    const app = await start({ channels: [channel()], jobs: [triage({ session: "sticky", cron: "0 0 1 1 *" })] })
-    // Another process takes the events while this one creates the key's session.
-    const create = app.ctx.session.create
-    app.ctx.session.create = async (input) => {
-      await app.store.mutateChannels((s) => { s.queues.triage.pending = [] })
-      return create(input)
-    }
-    expect((await app.call("automation_run", { id: "triage" })).content).toContain("another process already took these events")
-    expect(app.removed).toEqual(["session-1"])
-    expect(app.prompts).toEqual([])
-  } finally { fetch.mockRestore() }
-})
-
 test("a poll whose results can't be saved isn't counted as a failed poll", async () => {
   const fetch = api(() => [monitor(1)])
   try {
     const app = await start({ channels: [channel()], jobs: [triage({ cron: "0 0 1 1 *" })] })
+    // Another process holds a write longer than the 2 s a write waits.
     const holder = Bun.spawn(["bun", "-e", `
-      const lockfile = require("proper-lockfile")
-      const release = lockfile.lockSync(${JSON.stringify(join(app.dataDir, "channels.json"))}, { realpath: false })
+      const { Database } = require("bun:sqlite")
+      const db = new Database(${JSON.stringify(join(app.dataDir, "state.db"))})
+      db.exec("BEGIN IMMEDIATE")
       console.log("locked")
-      setTimeout(() => { release(); process.exit(0) }, 2600)
-    `], { cwd: join(import.meta.dir, ".."), stdout: "pipe" })
+      setTimeout(() => { db.exec("COMMIT"); process.exit(0) }, 2600)
+    `], { stdout: "pipe" })
     await holder.stdout.getReader().read()
     const out = (await app.call("channel_poll", { id: "dd" })).content
     await holder.exited
@@ -1252,27 +1260,23 @@ test("a key's session that can't be created is a failed run, counted and given u
     app.ctx.session.create = async () => { throw new Error("model not found") }
     for (let i = 1; i <= 3; i++) {
       expect((await app.call("automation_run", { id: "triage" })).content).toContain("failed — model not found")
-      expect(app.store.loadChannels().queues.triage.pending.map((e) => e.attempts)).toEqual(i < 3 ? [i] : [])
+      expect(app.store.waiting("triage").map((e) => e.attempts)).toEqual(i < 3 ? [i] : [])
     }
     expect(app.store.history("triage").map((r) => r.status)).toEqual(["failed", "failed", "failed"])
     expect(app.store.loadJobs()[0].lastStatus).toBe("failed")
   } finally { fetch.mockRestore() }
 })
 
-test("a session made for a chunk is removed when its events can't be taken", async () => {
+test("events that can't be handed over keep waiting, and no session is made for them", async () => {
   const fetch = api(() => [monitor(1)])
   try {
     const app = await start({ channels: [channel()], jobs: [triage({ session: "sticky", cron: "0 0 1 1 *" })] })
-    const mutateChannels = Store.prototype.mutateChannels
-    const create = app.ctx.session.create
-    app.ctx.session.create = async (input) => {
-      Store.prototype.mutateChannels = async () => { throw new Error("Lock file is already being held") }
-      return create(input)
-    }
+    const take = Store.prototype.take
+    Store.prototype.take = () => { throw new Error("database is locked") }
     try {
       expect((await app.call("automation_run", { id: "triage" })).content).toContain("retried on the next tick")
-    } finally { Store.prototype.mutateChannels = mutateChannels }
-    expect(app.removed).toEqual(["session-1"])
+    } finally { Store.prototype.take = take }
+    expect(app.sessions).toEqual([])
     expect(waiting(app, "triage")).toEqual(["1:t1"])
   } finally { fetch.mockRestore() }
 })
@@ -1393,8 +1397,14 @@ test("runs still in progress when the plugin stops are closed in the history", a
   expect(app.store.loadJobs()[0].lastStatus).toBe("failed")
 })
 
+/** A sticky session from an earlier run, now cold, with its memory. */
+const coldSession = async (store: Store) => {
+  store.setSession("morning", "", "session-9", 0)
+  store.setNote("morning", "", "state")
+}
+
 test("a compaction that never finishes doesn't hold the run when the plugin stops", async () => {
-  const app = await start({}, [job({ session: "sticky", sessionID: "session-9", memory: { note: "state" } })])
+  const app = await start({}, [job({ session: "sticky" })], coldSession)
   app.ctx.session.wait = () => new Promise(() => {})
   const run = app.call("automation_run", { id: "morning" })
   await flush()
@@ -1413,7 +1423,7 @@ test("a compaction given up on still gets its summary, and its late end doesn't 
   ) as typeof real
   const timers = spyOn(globalThis, "setTimeout").mockImplementation(shortened)
   try {
-    const app = await start({}, [job({ session: "sticky", sessionID: "session-9", memory: { note: "state" } })])
+    const app = await start({}, [job({ session: "sticky" })], coldSession)
     // The compaction is accepted but only happens later (the session is busy).
     app.ctx.session.compact = async ({ sessionID }) => ({ id: "msg_compaction", sessionID, type: "compaction" })
     app.ctx.session.wait = () => new Promise<void>(() => {})
@@ -1451,13 +1461,13 @@ test("automation_history takes an automation's name as well as its id", async ()
   expect((await app.call("automation_history", { id: "nope" })).content).toBe("No runs yet.")
 })
 
-test("a tick that changes nothing doesn't rewrite jobs.json", async () => {
+test("a save that changes nothing doesn't count as a change", async () => {
   const app = await start({ tickSeconds: 5 }, [job()])
-  const path = join(app.dataDir, "jobs.json")
-  const before = statSync(path).mtimeMs
-  await new Promise((r) => setTimeout(r, 30))
-  await app.call("automation_update", { id: "morning" }) // goes through the same locked save as a tick
-  expect(statSync(path).mtimeMs).toBe(before)
+  const other = new Store(app.dataDir)
+  const before = other.version()
+  await app.call("automation_update", { id: "morning" }) // goes through the same save as a tick
+  expect(other.version()).toBe(before)
   await app.call("automation_update", { id: "morning", prompt: "Changed" })
-  expect(statSync(path).mtimeMs).toBeGreaterThan(before)
+  expect(other.version()).not.toBe(before)
+  other.close()
 })
