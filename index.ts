@@ -425,7 +425,7 @@ export default Plugin.define({
             log.warn({ job: job.id, session: sessionID, err: e }, "couldn't compact the session; the run goes on with its whole history")
           } finally { if (!queued) compactions.delete(sessionID) }
         }
-        // Stopped while it was being prepared: nothing was sent, so events it took go back to their queue.
+        // Stopped while it was being prepared: nothing was sent, so the events it took wait again in the inbox.
         if (abort.signal.aborted) return skipped("plugin stopping")
         const run: Run = { ...base, sessionID }
         const entry: Running = { job, run, sent: 0, key: how.key }
