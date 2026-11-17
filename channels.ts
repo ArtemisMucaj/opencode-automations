@@ -2,7 +2,7 @@
 // automation takes the ones from its channels.
 
 import { parseInterval } from "./cron.ts"
-import { errorMessage, httpError, plural, type Fetch } from "./util.ts"
+import { ENV_REF, errorMessage, httpError, plural, withEnv, type Fetch } from "./util.ts"
 
 /** A filter value. null matches an item whose field is null or missing. */
 export type Scalar = string | number | boolean | null
@@ -43,8 +43,6 @@ export interface Channel {
 }
 
 export interface ChannelEvent {
-  /** Its place in the inbox, once it is there. */
-  seq?: number
   /** The channel it came from. IDs and session keys are only unique within a channel. */
   channel: string
   id: string
@@ -53,8 +51,6 @@ export interface ChannelEvent {
   title: string
   body?: string
   url?: string
-  /** Runs that failed to start with it; it is dropped after MAX_START_ATTEMPTS (store.ts). */
-  attempts?: number
 }
 
 /** A channel's poll status. */
@@ -159,23 +155,6 @@ export function render(template: string, item: unknown): string {
   return template.replace(/\{([^{}]*)\}/g, (_, path: string) => show(get(item, path.trim())))
 }
 
-const ENV_REF = /\{env:([A-Za-z_][A-Za-z0-9_]*)\}/g
-
-export function withEnv<T>(value: T, env: Record<string, string | undefined> = process.env): T {
-  if (typeof value === "string") {
-    return value.replace(ENV_REF, (_, name: string) => {
-      const v = env[name]
-      if (v === undefined) throw new Error(`environment variable ${name} is not set`)
-      return v
-    }) as T
-  }
-  if (Array.isArray(value)) return value.map((v) => withEnv(v, env)) as T
-  if (value && typeof value === "object") {
-    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, withEnv(v, env)])) as T
-  }
-  return value
-}
-
 export function extract(ch: Channel, response: unknown): ChannelEvent[] {
   const items = get(response, ch.items)
   // Some APIs leave the array out, or send null, when there is nothing to list.
@@ -207,8 +186,8 @@ export function extract(ch: Channel, response: unknown): ChannelEvent[] {
  * With `byKey`, one chunk per session key (each goes to that key's session); otherwise a single chunk.
  * Events whose session key came out empty share the chunk without a key.
  */
-export function chunks(pending: ChannelEvent[], byKey: boolean, max: number): Array<{ key?: string; events: ChannelEvent[] }> {
-  const out = new Map<string | undefined, ChannelEvent[]>()
+export function chunks<E extends ChannelEvent>(pending: E[], byKey: boolean, max: number): Array<{ key?: string; events: E[] }> {
+  const out = new Map<string | undefined, E[]>()
   for (const e of pending) {
     // Namespaced by channel: monitor 123 and Sentry issue 123 are different sessions.
     const key = byKey && e.sessionKey ? `${e.channel}:${e.sessionKey}` : undefined
@@ -224,8 +203,6 @@ export function chunks(pending: ChannelEvent[], byKey: boolean, max: number): Ar
 const attr = (s: string) => s.replace(/[&"<>]/g, (c) => ({ "&": "&amp;", '"': "&quot;", "<": "&lt;", ">": "&gt;" })[c]!)
 /** Stop event text from closing the tag it sits in. */
 const inner = (s: string) => s.replace(/<(\/?)event/gi, "<$1event​")
-
-export const uid = (e: ChannelEvent) => `${e.channel}\u0000${e.id}`
 
 const quoted = (names: string[]) => names.map((n) => `"${n}"`).join(", ")
 

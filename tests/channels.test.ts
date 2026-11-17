@@ -1,7 +1,8 @@
 import { expect, test } from "bun:test"
 import {
-  chunks, composeEvents, envNames, extract, get, literalSecrets, parseChannel, poll, render, withEnv, type ChannelConfig,
+  chunks, composeEvents, envNames, extract, get, literalSecrets, parseChannel, poll, render, type ChannelConfig,
 } from "../channels.ts"
+import { withEnv } from "../util.ts"
 
 const base: ChannelConfig = {
   id: "dd",

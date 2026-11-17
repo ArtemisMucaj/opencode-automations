@@ -13,6 +13,7 @@ function open(): Store {
   return store
 }
 afterEach(() => {
+  latest = {}
   for (const { store, dir } of stores.splice(0)) { store.close(); rmSync(dir, { recursive: true, force: true }) }
 })
 
@@ -22,12 +23,15 @@ const job = (id: string, channels: string[]): Job => ({
 })
 const ev = (id: string, sessionKey?: string): ChannelEvent => ({ channel: "dd", id, title: `title ${id}`, ...(sessionKey ? { sessionKey } : {}) })
 /** Poll `dd` at `at`: its events go to the inbox, and the poll counts as the channel's latest. */
+let latest: Record<string, number> = {}
 function poll(store: Store, at: number, ...events: ChannelEvent[]) {
-  store.tx(() => {
-    store.saveChannels({ ...store.loadChannels(), sources: { dd: { lastPollAt: at, lastOkAt: at } } })
-    store.ingest("dd", events, at)
-  })
+  store.ingest("dd", events, at)
+  latest = { ...latest, dd: at }
 }
+const subscribe = (store: Store, jobs: Job[]) => store.subscribe(jobs, latest)
+/** How many times runs failed to start with an event. */
+const attempts = (store: Store, jobID: string, seq: number) =>
+  (store.db.query("SELECT attempts FROM deliveries WHERE job = ? AND seq = ?").get(jobID, seq) as { attempts: number } | null)?.attempts ?? 0
 const ids = (store: Store, jobID: string) => store.waiting(jobID).map((e) => e.id)
 
 test("the inbox keeps one event per channel and id; a repeat isn't new", () => {
@@ -42,39 +46,42 @@ test("an automation attached to a channel gets what its latest poll returned, th
   const store = open()
   poll(store, 10, ev("old"))
   poll(store, 20, ev("current"))
-  store.subscribe([job("a", ["dd"])])
+  subscribe(store, [job("a", ["dd"])])
   expect(ids(store, "a")).toEqual(["current"])
   poll(store, 30, ev("current"), ev("new"))
   expect(ids(store, "a")).toEqual(["current", "new"])
   // Attaching again changes nothing: the subscription keeps where it started.
-  store.subscribe([job("a", ["dd"])])
+  subscribe(store, [job("a", ["dd"])])
   expect(ids(store, "a")).toEqual(["current", "new"])
   // A channel never polled: everything its first poll brings.
-  store.subscribe([job("a", ["dd"]), job("b", ["other"])])
+  subscribe(store, [job("a", ["dd"]), job("b", ["other"])])
   store.ingest("other", [{ ...ev("x"), channel: "other" }], 40)
   expect(store.waiting("b").map((e) => e.id)).toEqual(["x"])
 })
 
 test("events taken by a run wait no more; given back, they wait again, and failed starts are retried a few times", () => {
   const store = open()
-  store.subscribe([job("a", ["dd"]), job("b", ["dd"])])
+  subscribe(store, [job("a", ["dd"]), job("b", ["dd"])])
   poll(store, 10, ev("1"), ev("2"))
   const [one, two] = store.waiting("a")
-  store.take("a", [one.seq!, two.seq!])
+  store.take("a", [one.seq, two.seq])
   expect(ids(store, "a")).toEqual([])
   // Every automation takes its own: b still has both.
   expect(ids(store, "b")).toEqual(["1", "2"])
-  store.giveBack("a", [one.seq!], false)
+  store.giveBack("a", [one.seq], false)
   expect(store.waiting("a")).toEqual([{ ...one }])
   for (let i = 1; i <= MAX_START_ATTEMPTS; i++) {
-    store.take("a", [two.seq!])
-    store.giveBack("a", [two.seq!], true)
+    store.take("a", [two.seq])
+    store.giveBack("a", [two.seq], true)
     expect(ids(store, "a")).toEqual(i < MAX_START_ATTEMPTS ? ["1", "2"] : ["1"])
   }
-  expect(store.waiting("a")[0].attempts).toBeUndefined()
-  // Detached, nothing waits; and what an automation that is gone left is dropped.
-  store.subscribe([job("a", [])])
+  expect(attempts(store, "a", one.seq)).toBe(0)
+  expect(attempts(store, "a", two.seq)).toBe(MAX_START_ATTEMPTS)
+  // Detached, nothing waits; and what an automation that is gone left is dropped by the trim.
+  subscribe(store, [job("a", [])])
   expect(ids(store, "a")).toEqual([])
+  store.saveJobs([job("a", [])])
+  store.trim(latest)
   expect(store.db.query("SELECT COUNT(*) AS n FROM deliveries WHERE job = 'b'").get()).toEqual({ n: 0 })
 })
 
@@ -83,7 +90,7 @@ test("trimming drops old events whose item is gone, but never one the channel st
   const day = 24 * 60 * 60_000
   poll(store, 0, ev("gone"), ev("stays"))
   poll(store, 10 * day, ev("stays"))
-  store.trim(10 * day)
+  store.trim(latest, 10 * day)
   expect(store.db.query("SELECT id FROM inbox").all()).toEqual([{ id: "stays" }])
 })
 

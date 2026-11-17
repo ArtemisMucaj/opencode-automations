@@ -9,8 +9,8 @@ import { createMemo, createSignal, For, Index, Show, type JSX } from "solid-js"
 import { describe, nextRun } from "./cron.ts"
 import { DEFAULT_TIMEOUT_MINUTES, defaultDataDir, isActive, listens, newJob, parseScheduleText, runnable, runningJobs, stateOf } from "./jobs.ts"
 import { clock, elapsed, errorMessage, plural, relative } from "./util.ts"
-import { Store, type Job, type OutboxMessage, type Run, type RunStatus, type SendStatus, type SessionMode } from "./store.ts"
-import { channelRows, emptyChannels, requestPoll, type ChannelEvent, type ChannelRow, type ChannelsState } from "./channels.ts"
+import { Store, type InboxEvent, type Job, type Run, type RunStatus, type SentMessage, type SessionMode } from "./store.ts"
+import { channelRows, emptyChannels, requestPoll, type ChannelRow, type ChannelsState } from "./channels.ts"
 
 type Context = Plugin.Context
 
@@ -63,7 +63,6 @@ const channelHints: [string, string][] = [
 
 /** The TUI waits only briefly for a write by the server, so the screen never freezes for long. */
 const BUSY_MS = 250
-type Sent = OutboxMessage & { sends: Array<{ sender: string; status: SendStatus; error?: string }> }
 export function createState(ctx: Context, dataDir: string) {
   const store = new Store(dataDir, { busyMs: BUSY_MS })
   const [jobs, setJobs] = createSignal<Job[]>(store.loadJobs())
@@ -71,13 +70,17 @@ export function createState(ctx: Context, dataDir: string) {
   const [now, setNow] = createSignal(Date.now())
   const loadChannels = () => { try { return store.loadChannels() } catch { return emptyChannels() } }
   const [channels, setChannels] = createSignal<ChannelsState>(loadChannels())
-  /** Per automation on channels: the inbox events waiting for it. */
+  /** Per automation on channels: how many events wait for it per channel, and the first few. */
   const loadWaiting = () => {
-    try { return new Map(jobs().filter((j) => j.on).map((j) => [j.id, store.waiting(j.id)])) } catch { return new Map<string, ChannelEvent[]>() }
+    try {
+      return { counts: store.waitingCounts(), first: new Map(jobs().filter((j) => j.on).map((j) => [j.id, store.waiting(j.id, 20)])) }
+    } catch { return { counts: new Map<string, Map<string, number>>(), first: new Map<string, InboxEvent[]>() } }
   }
   const [waiting, setWaiting] = createSignal(loadWaiting())
-  /** The latest messages in the outbox, with each sender's status. */
-  const loadSent = (): Sent[] => { try { return store.sent(undefined, 100) } catch { return [] } }
+  /** Per automation: its latest messages in the outbox, with each sender's status. */
+  const loadSent = () => {
+    try { return new Map(jobs().map((j) => [j.id, store.sent(j.id, 5)])) } catch { return new Map<string, SentMessage[]>() }
+  }
   const [sent, setSent] = createSignal(loadSent())
   // Kept here, not in the view: the dialog is re-created after nested prompts and must reopen on the same job and tab.
   const [selectedID, setSelectedID] = createSignal<string>()
@@ -127,8 +130,11 @@ export function createState(ctx: Context, dataDir: string) {
   const act = (fn: (jobs: Job[]) => void) => attempt(() => store.mutate(fn))
   const actChannels = (fn: (s: ChannelsState) => void) => attempt(() => store.mutateChannels(fn))
 
+  /** Move "in 12m" labels on; what changed is re-read as it changes. */
+  const tick = () => setNow(Date.now())
+
   return {
-    store, jobs, runs, now, refresh, act, selectedID, setSelectedID, channels, actChannels, waiting, sent,
+    store, jobs, runs, now, refresh, tick, act, selectedID, setSelectedID, channels, actChannels, waiting, sent,
     selectedChannel, setSelectedChannel, tab, setTab,
   }
 }
@@ -146,7 +152,7 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
   const index = createMemo(() => Math.max(0, sorted().findIndex((j) => j.id === selectedID())))
   const selected = createMemo(() => sorted()[index()])
   const jobRuns = createMemo(() => state.runs().filter((r) => r.jobID === selected()?.id).slice(0, 8))
-  const jobSent = createMemo(() => state.sent().filter((m) => m.job === selected()?.id).slice(0, 5))
+  const jobSent = createMemo(() => state.sent().get(selected()?.id ?? "") ?? [])
 
   // ---- channels tab ----
   const onChannels = () => state.tab() === "channels"
@@ -514,12 +520,8 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
                     {(c) => {
                       const src = () => state.channels().sources[c().id]
                       const users = () => listeners(c().id)
-                      const waiting = createMemo(() => {
-                        const out = new Map<string, ChannelEvent[]>()
-                        for (const j of users()) out.set(j.id, (state.waiting().get(j.id) ?? []).filter((e) => e.channel === c().id))
-                        return out
-                      })
-                      const queue = (id: string) => waiting().get(id) ?? []
+                      const count = (id: string) => state.waiting().counts.get(id)?.get(c().id) ?? 0
+                      const first = (id: string) => (state.waiting().first.get(id) ?? []).filter((e) => e.channel === c().id).slice(0, 3)
                       const status = () => chStatus(c())
                       return (
                         <scrollbox flexGrow={1} minHeight={0}>
@@ -574,10 +576,10 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
                                           <span style={{ fg: isActive(j) ? L().ok : L().muted }}>{isActive(j) ? "●" : "○"}</span> {j.name}
                                           <span style={{ fg: L().muted }}>
                                             {"  "}
-                                            {j.schedule.kind === "event" ? "as events arrive" : describe(j.schedule)} · {queue(j.id).length} waiting
+                                            {j.schedule.kind === "event" ? "as events arrive" : describe(j.schedule)} · {count(j.id)} waiting
                                           </span>
                                         </text>
-                                        <For each={queue(j.id).slice(0, 3)}>
+                                        <For each={first(j.id)}>
                                           {(e) => <text fg={L().muted}>{"  " + e.title.slice(0, 90)}</text>}
                                         </For>
                                       </box>
@@ -780,7 +782,7 @@ export default Plugin.define({
         if (v !== version) { version = v; state.refresh() }
       } catch {}
     }, 500)
-    const ticker = setInterval(state.refresh, 15_000)
+    const ticker = setInterval(state.tick, 15_000)
 
     // Shown as a dialog over the current screen rather than a routed page, which opencode puts in its own tab.
     const open = () => {

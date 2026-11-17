@@ -135,13 +135,13 @@ test("TUI channels tab shows status, mapping and listeners, and queues a poll", 
       name: "Datadog", url: "https://api.example.test/api/v1/monitor", everyMs: 60_000, items: "",
       filter: { overall_state: ["Alert"] }, event: { id: "{id}:{overall_state_modified}", sessionKey: "{id}", title: "{name}" }, env: ["DD_API_KEY"],
     }
-    s.defs.sentry = { id: "sentry", name: "Sentry", every: "5m", request: { url: "https://sentry.example.test/issues?token={env:T}" }, event: { id: "{id}" }, createdAt: 1 }
+    s.defs.sentry = { id: "sentry", name: "Sentry", every: "5m", request: { url: "https://sentry.example.test/issues?token={env:T}" }, event: { id: "{id}" } }
     s.sources.datadog = { lastPollAt: polled, lastOkAt: polled }
     s.sources.sentry = { lastPollAt: Date.now(), lastError: "HTTP 403: bad token", failures: 3 }
   })
   // The latest poll's event waits for the automation attached to the channel.
   store.ingest("datadog", [{ channel: "datadog", id: "1:t", title: "CPU high on web-1" }], polled)
-  store.subscribe(store.loadJobs())
+  store.subscribe(store.loadJobs(), { datadog: polled })
   const testRenderer = await createTestRenderer({ width: 140, height: 50 })
   const host = fakeHost(dataDir, testRenderer.renderer)
   let stop: Awaited<ReturnType<typeof plugin.setup>> | undefined

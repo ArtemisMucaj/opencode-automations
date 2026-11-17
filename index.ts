@@ -8,7 +8,7 @@ import { randomUUID } from "node:crypto"
 import { automationTools } from "./automation-tools.ts"
 import { cacheLifetime } from "./cache.ts"
 import { channelTools } from "./channel-tools.ts"
-import { chunks, composeEvents, parseChannel, poll, summarize, type Channel, type ChannelEvent } from "./channels.ts"
+import { chunks, composeEvents, parseChannel, poll, summarize, type Channel, type ChannelEvent, type ChannelsState } from "./channels.ts"
 import { nextRun } from "./cron.ts"
 import { log } from "./log.ts"
 import {
@@ -17,12 +17,14 @@ import {
 } from "./guides.ts"
 import { checkTimeout, DEFAULT_TIMEOUT_MINUTES, defaultDataDir, find, isActive, listens, parseModel, remembers, toSchedule } from "./jobs.ts"
 import { compose, Outbox } from "./outbox.ts"
-import { Store, type Job, type Run } from "./store.ts"
+import { Store, type InboxEvent, type Job, type Run } from "./store.ts"
 import type { Options, PollResult, Reason, Running, Runtime } from "./types.ts"
 import { errorMessage, Owned, within } from "./util.ts"
 
 const MISSED_GRACE_MS = 2 * 60_000
 const CHANNEL_FAILURE_NOTICE = 3
+/** How often the leader drops old events and messages, and what deleted automations left. */
+const TRIM_EVERY_MS = 10 * 60_000
 
 const WARM_SHARE = 0.9
 /** How long a cold run waits for its compaction's end event, for hosts that send none. */
@@ -55,7 +57,8 @@ export default Plugin.define({
     const defaultTimeout = checkTimeout(opts.defaultTimeoutMinutes) ?? DEFAULT_TIMEOUT_MINUTES
     const dataDir = opts.dataDir ?? defaultDataDir()
     const store = new Store(dataDir)
-    const outbox = new Outbox(store, opts.outbox)
+    // Only the leader sends; elsewhere, what is added waits for the leader's next tick.
+    const outbox = new Outbox(store, opts.outbox, () => leader)
     const running = new Owned<Running>(shared.running) // sessionID -> run started here
     const abort = new AbortController()
     let leader = false
@@ -159,13 +162,23 @@ export default Plugin.define({
       return [...byID.values()]
     }
 
-    /** Change jobs in one transaction (`fn` must be synchronous). Subscriptions to the inbox follow their channels. */
+    /** Each channel's latest poll: what a new subscription to it takes. */
+    const lastOkAt = (sources = store.loadChannels().sources) => Object.fromEntries(Object.entries(sources).map(([id, s]) => [id, s.lastOkAt]))
+    /** What subscriptions depend on: which automations take events, from which channels. */
+    const subscribers = (jobs: Job[]) =>
+      JSON.stringify(jobs.map((j) => [j.id, j.enabled && !j.done, j.on?.channels ?? []]).sort())
+
+    /**
+     * Change jobs in one transaction (`fn` must be synchronous). When that changes who takes which channel's
+     * events (or a config job appears), the inbox subscriptions follow.
+     */
     function mutate<T>(fn: (jobs: Job[]) => T): Promise<T> {
       return store.mutate((jobs) => {
+        const before = subscribers(jobs)
         const merged = load(jobs)
         const out = fn(merged)
         jobs.splice(0, jobs.length, ...merged)
-        store.subscribe(merged)
+        if (subscribers(merged) !== before) store.subscribe(merged, lastOkAt())
         return out
       })
     }
@@ -198,15 +211,16 @@ export default Plugin.define({
      * The session a run goes to, and whether it was just made. `sticky`: the saved one for the key (""
      * without one) if it still exists, else a new one that is saved. `current`: the chat it was made from.
      */
-    async function sessionFor(job: Job, key: string | undefined, title: string): Promise<{ id: string; fresh: boolean }> {
+    async function sessionFor(job: Job, key: string | undefined, title: string): Promise<{ id: string; fresh: boolean; warmUntil?: number }> {
       if (job.session === "current") {
         const id = await alive(job.sessionID)
         if (!id) throw new Error(`session ${job.sessionID} is gone`)
         return { id, fresh: false }
       }
       if (job.session === "sticky") {
-        const id = await alive(store.session(job.id, key ?? "")?.id)
-        if (id) return { id, fresh: false }
+        const saved = store.session(job.id, key ?? "")
+        const id = await alive(saved?.id)
+        if (id) return { id, fresh: false, warmUntil: saved?.warmUntil }
       }
       const id = await createSession(job, title)
       if (job.session === "sticky") store.setSession(job.id, key ?? "", id, Date.now(), keysRunning(job.id))
@@ -267,12 +281,6 @@ export default Plugin.define({
     function notice(job: Job, run: Run) {
       if (!outbox.noticeFor(job, run.status)) return
       try { outbox.add(compose(job, run), { job: job.id, run: run.runID }) } catch (e) { log.error({ job: job.id, err: e }, "couldn't write a notice to the outbox") }
-      dispatch()
-    }
-
-    /** Send what is due now. Only the leader sends; elsewhere the leader picks it up on its next tick. */
-    function dispatch() {
-      if (leader) void track(outbox.dispatch()).catch((e) => log.error({ err: e }, "outbox dispatch failed"))
     }
 
     const isRunning = (jobID: string, key?: string) =>
@@ -291,9 +299,9 @@ export default Plugin.define({
      * keys, several runs may start, and chunks whose session is busy keep waiting. A scheduled digest with
      * nothing waiting doesn't run; a manual run then runs anyway and says there were no new events.
      */
-    async function runAutomation(job: Job, reason: Reason): Promise<Run | string> {
+    async function runAutomation(job: Job, reason: Reason, channels?: Map<string, Channel>): Promise<Run | string> {
       if (!job.on) return startSession(job, reason, { text: job.prompt })
-      const { runs, why } = await processEvents(job, reason)
+      const { runs, why } = await processEvents(job, reason, channels ?? allChannels())
       if (runs.length) return runs[0]
       if (why !== NOTHING_WAITING || reason !== "manual") return why!
       return startSession(job, reason, { text: composeEvents(job.prompt, [], channelNames(job.on.channels)) })
@@ -302,10 +310,10 @@ export default Plugin.define({
     const NOTHING_WAITING = "nothing is waiting"
     const STOPPING = "the plugin is stopping"
 
-    async function processEvents(job: Job, reason: Reason, channels = allChannels()): Promise<{ runs: Run[]; why?: string }> {
+    async function processEvents(job: Job, reason: Reason, channels: Map<string, Channel>): Promise<{ runs: Run[]; why?: string }> {
       const subscribed = (job.on?.channels ?? []).map((id) => channels.get(id)).filter((c): c is Channel => !!c)
       if (!subscribed.length) return { runs: [], why: `none of its channels exist any more (${job.on?.channels.join(", ")})` }
-      let waiting: ChannelEvent[]
+      let waiting: InboxEvent[]
       try { waiting = store.waiting(job.id) } catch (e) {
         log.warn({ job: job.id, err: e }, "couldn't read the inbox, will retry")
         return { runs: [], why: "the inbox couldn't be read; it is retried on the next tick" }
@@ -336,8 +344,8 @@ export default Plugin.define({
      * taken before the prompt is sent, so a crash can't deliver them twice. If the run doesn't start, they go
      * back: always when skipped, up to MAX_START_ATTEMPTS when the start failed.
      */
-    async function startChunk(job: Job, reason: Reason, key: string | undefined, events: ChannelEvent[], names: Record<string, string>): Promise<Run | string> {
-      const seqs = events.map((e) => e.seq!)
+    async function startChunk(job: Job, reason: Reason, key: string | undefined, events: InboxEvent[], names: Record<string, string>): Promise<Run | string> {
+      const seqs = events.map((e) => e.seq)
       try { store.take(job.id, seqs) } catch (e) {
         log.warn({ job: job.id, err: e }, "couldn't hand over events, will retry")
         return "the events couldn't be handed over; they're retried on the next tick"
@@ -388,11 +396,11 @@ export default Plugin.define({
       try {
         const key = how.key ?? ""
         const title = how.title ?? `⏰ ${job.name}${job.session === "new" ? ` · ${new Date().toLocaleString()}` : ""}`
-        const { id: sessionID, fresh } = await sessionFor(job, how.key, title)
+        const { id: sessionID, fresh, warmUntil } = await sessionFor(job, how.key, title)
         const note = store.note(job.id, key)
         const text = fresh ? withMemory(how.text, note) : how.text
         // Compact before tracking the run, so the compaction's events aren't taken for the run's.
-        const cold = job.session === "sticky" && !fresh && Date.now() >= (store.session(job.id, key)?.warmUntil ?? 0)
+        const cold = job.session === "sticky" && !fresh && Date.now() >= (warmUntil ?? 0)
         if (cold && note) {
           // Given up on but still queued ahead of the run: it keeps its entry, so it still gets its summary
           // and its end event, which comes before the run's, isn't taken for the run's.
@@ -452,6 +460,7 @@ export default Plugin.define({
     // ---------- ticker ----------
 
     let ticking = false
+    let trimmedAt = 0
     async function tick() {
       // A slow tick (polls wait up to 20 s each) mustn't overlap the next one.
       if (abort.signal.aborted || ticking) return
@@ -488,14 +497,27 @@ export default Plugin.define({
           if (job.nextRunAt === undefined) job.done = true
         }
       })
+      // Channels, read once for the tick. Unreadable channel state stops the channels, not the automations
+      // that only have a schedule.
+      let state: ChannelsState | undefined
+      let channels: Map<string, Channel> | undefined
+      try {
+        state = store.loadChannels()
+        channels = allChannels(state.defs)
+      } catch (e) { log.error({ err: e }, "channel state can't be read or saved") }
       // The due jobs' next runs are saved already: one that throws mustn't take the others with it.
       for (const [job, reason] of due) {
-        try { await runAutomation(job, reason) } catch (e) { log.error({ job: job.id, err: e }, "run couldn't be started") }
+        try { await runAutomation(job, reason, channels) } catch (e) { log.error({ job: job.id, err: e }, "run couldn't be started") }
       }
-      // Unreadable channel state stops the channels, not the automations that only have a schedule.
-      try { await tickChannels(now) } catch (e) { log.error({ err: e }, "channel state can't be read or saved") }
-      try { store.trim(now) } catch (e) { log.warn({ err: e }, "couldn't trim the inbox and outbox") }
-      await outbox.dispatch()
+      if (state && channels) {
+        try { await tickChannels(now, state.sources, channels) } catch (e) { log.error({ err: e }, "channel state can't be read or saved") }
+      }
+      if (now - trimmedAt >= TRIM_EVERY_MS) {
+        trimmedAt = now
+        try { store.trim(lastOkAt(state?.sources)) } catch (e) { log.warn({ err: e }, "couldn't trim the state") }
+      }
+      // Retries that came due.
+      outbox.kick()
     }
 
     // ---------- channel polling ----------
@@ -508,7 +530,8 @@ export default Plugin.define({
       void p.finally(() => work.delete(p)).catch(() => {})
       return p
     }
-    const subscribers = (channelID: string, jobs = load()) => jobs.filter((j) => listens(j, channelID) && isActive(j))
+    /** Active automations on a channel. */
+    const listeners = (channelID: string, jobs = load()) => jobs.filter((j) => listens(j, channelID) && isActive(j))
 
     type Polled = { ch: Channel; events?: ChannelEvent[]; error?: string }
 
@@ -559,19 +582,17 @@ export default Plugin.define({
         }
         for (const p of polled) if (p.error) log.warn({ channel: p.ch.id, error: p.error }, "poll failed")
         for (const n of notices) {
-          if (!subscribers(n.ch.id, jobs).some((j) => outbox.canNotify(j))) continue
+          if (!listeners(n.ch.id, jobs).some((j) => outbox.canNotify(j))) continue
           try {
             outbox.add({ title: `Channel ${n.ch.name} can't poll`, body: `${n.failures} failed polls in a row. Last error: ${n.error}`, priority: "normal" })
           } catch (e) { log.error({ channel: n.ch.id, err: e }, "couldn't write a notice to the outbox") }
         }
-        if (notices.length) dispatch()
         return results
       } finally { for (const ch of list) polling.delete(ch.id) }
     }
 
     /** Start runs for the automations that take events as they arrive (on `channelID`, or on any channel). */
-    async function processArrivals(jobs = load(), channelID?: string): Promise<number> {
-      const channels = allChannels()
+    async function processArrivals(jobs = load(), channelID?: string, channels = allChannels()): Promise<number> {
       let started = 0
       for (const job of jobs) {
         if (job.schedule.kind !== "event" || !isActive(job) || (channelID && !listens(job, channelID))) continue
@@ -580,18 +601,17 @@ export default Plugin.define({
       return started
     }
 
-    async function tickChannels(now: number) {
+    async function tickChannels(now: number, sources: ChannelsState["sources"], channels: Map<string, Channel>) {
       const jobs = load()
-      const { sources, defs } = store.loadChannels()
-      const due = [...allChannels(defs).values()].filter((ch) => {
+      const due = [...channels.values()].filter((ch) => {
         const src = sources[ch.id]
         const requested = src?.pollRequestedAt !== undefined
-        if (polling.has(ch.id) || (!requested && !subscribers(ch.id, jobs).length)) return false
+        if (polling.has(ch.id) || (!requested && !listeners(ch.id, jobs).length)) return false
         // Half a tick of slack keeps polls close to `every` instead of drifting a whole tick late.
         return requested || !src?.lastPollAt || now - src.lastPollAt >= ch.everyMs - tickMs / 2
       })
       await pollChannels(due, jobs)
-      await processArrivals(jobs)
+      await processArrivals(jobs, undefined, channels)
     }
 
     // ---------- event pump: track runs to completion ----------
@@ -666,7 +686,7 @@ export default Plugin.define({
       runningJobs: () => [...running.values()].map((f) => f.run.jobID),
       isPolling: (channelID) => polling.has(channelID),
       leader: () => leader,
-      load, mutate, checkChannels, allChannels, runAutomation, pollChannels, processArrivals, dispatch, track,
+      load, mutate, checkChannels, allChannels, runAutomation, pollChannels, processArrivals, track,
     }
     await ctx.tool.transform((tools) => {
       for (const ns of NAMESPACES) tools.namespace(ns)
@@ -714,7 +734,7 @@ export default Plugin.define({
         await mutate((jobs) => { for (const f of open) { const j = find(jobs, f.job.id); if (j) j.lastStatus = "failed" } })
           .catch((e) => log.error({ err: e }, "couldn't save the stopped runs' outcome"))
       }
-      await pump.catch(() => {})
+      await Promise.allSettled([pump, outbox.idle()])
       store.close()
     }
   },

@@ -2,8 +2,7 @@
 // What gets sent, to whom and when (the outbox and its dispatcher) is in outbox.ts.
 
 import { spawn } from "node:child_process"
-import { withEnv } from "./channels.ts"
-import { httpError, type Fetch } from "./util.ts"
+import { httpError, withEnv, type Fetch } from "./util.ts"
 
 export type Priority = "low" | "normal" | "high"
 

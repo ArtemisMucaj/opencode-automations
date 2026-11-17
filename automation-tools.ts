@@ -71,7 +71,6 @@ export function automationTools(tools: ToolEditor, rt: Runtime) {
         outbox.add({ title, body: message, priority, url: input.url, urlTitle: input.url_title }, { job: f.job.id, run: f.run.runID })
       } catch (e) { return text(`error: couldn't queue it (${errorMessage(e)}). Try once more.`) }
       f.sent++
-      rt.dispatch()
       return text(`Queued for delivery. ${maxPerRun - f.sent} notifications left for this run.`)
     },
   }))
@@ -141,7 +140,7 @@ export function automationTools(tools: ToolEditor, rt: Runtime) {
         directory = (await ctx.session.get({ sessionID: tc.sessionID })).location.directory ?? directory
       } catch {}
       const job = await mutate((jobs) => {
-        // Again under the jobs lock: channel deletes check for users under it too.
+        // Again in the same transaction: a channel delete checks for users in one too.
         if (on) checkChannels({ on })
         const j = newJob(jobs, {
           name: input.name,

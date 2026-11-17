@@ -64,7 +64,16 @@ export class Outbox {
   private dispatching?: Promise<void>
   private again = false
 
-  constructor(private readonly store: Store, cfg: OutboxConfig | undefined, private readonly deps: Deps = defaultDeps) {
+  /**
+   * `sends`: whether this process sends. Only the leader does; a message added elsewhere waits for the
+   * leader's next tick.
+   */
+  constructor(
+    private readonly store: Store,
+    cfg: OutboxConfig | undefined,
+    private readonly sends: () => boolean = () => true,
+    private readonly deps: Deps = defaultDeps,
+  ) {
     this.senders = parseSenders(cfg)
     this.maxPerRun = cfg?.maxPerRun ?? DEFAULT_MAX_PER_RUN
     this.on = cfg?.on ?? DEFAULT_ON
@@ -81,11 +90,23 @@ export class Outbox {
     return (Array.isArray(job.notify) ? job.notify : this.on).includes(status)
   }
 
-  /** Write a message to the outbox for every sender that takes its priority. */
+  /** Write a message to the outbox for every sender that takes its priority, and start sending it. */
   add(m: Message, from: { job?: string; run?: string } = {}): number {
     const priority = m.priority ?? "normal"
     const to = this.senders.filter((s) => RANK[priority] >= RANK[s.minPriority ?? "low"]).map((s) => s.id)
-    return this.store.enqueue({ ...from, title: m.title, body: m.body, priority, url: m.url, urlTitle: m.urlTitle }, to)
+    const id = this.store.enqueue({ ...from, title: m.title, body: m.body, priority, url: m.url, urlTitle: m.urlTitle }, to)
+    this.kick()
+    return id
+  }
+
+  /** Start sending what is due, without waiting for it (retries come due on the leader's ticks). */
+  kick(): void {
+    if (this.sends()) void this.dispatch().catch((err) => log.error({ err }, "outbox dispatch failed"))
+  }
+
+  /** Resolves once the pass in progress, if any, is over: shutdown waits for it. */
+  idle(): Promise<void> {
+    return this.dispatching ?? Promise.resolve()
   }
 
   /**

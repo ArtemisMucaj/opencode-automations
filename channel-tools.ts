@@ -37,13 +37,14 @@ export function channelTools(tools: ToolEditor, rt: Runtime) {
       const jobs = load()
       const { sources, defs } = store.loadChannels()
       const channels = allChannels(defs)
+      const counts = store.waitingCounts()
       if (!channels.size) return text("No channels. Create one with channel_create.")
       const lines = [...channels.values()].map((ch) => {
         const s = sources[ch.id]
         const host = (() => { try { return new URL(ch.request.url).host } catch { return ch.request.url } })()
         const subs = jobs.filter((j) => listens(j, ch.id))
         const listeners = subs.length
-          ? subs.map((j) => `${j.id}${isActive(j) ? "" : " (off)"}: ${store.waiting(j.id).filter((e) => e.channel === ch.id).length} waiting`).join(", ")
+          ? subs.map((j) => `${j.id}${isActive(j) ? "" : " (off)"}: ${counts.get(j.id)?.get(ch.id) ?? 0} waiting`).join(", ")
           : "no automations, not polled"
         const { missing } = envNames(ch.request)
         return (

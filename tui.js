@@ -70,21 +70,27 @@ export function createState(ctx, dataDir) {
     }
   };
   const [channels, setChannels] = createSignal(loadChannels());
-  /** Per automation on channels: the inbox events waiting for it. */
+  /** Per automation on channels: how many events wait for it per channel, and the first few. */
   const loadWaiting = () => {
     try {
-      return new Map(jobs().filter(j => j.on).map(j => [j.id, store.waiting(j.id)]));
+      return {
+        counts: store.waitingCounts(),
+        first: new Map(jobs().filter(j => j.on).map(j => [j.id, store.waiting(j.id, 20)]))
+      };
     } catch {
-      return new Map();
+      return {
+        counts: new Map(),
+        first: new Map()
+      };
     }
   };
   const [waiting, setWaiting] = createSignal(loadWaiting());
-  /** The latest messages in the outbox, with each sender's status. */
+  /** Per automation: its latest messages in the outbox, with each sender's status. */
   const loadSent = () => {
     try {
-      return store.sent(undefined, 100);
+      return new Map(jobs().map(j => [j.id, store.sent(j.id, 5)]));
     } catch {
-      return [];
+      return new Map();
     }
   };
   const [sent, setSent] = createSignal(loadSent());
@@ -145,12 +151,16 @@ export function createState(ctx, dataDir) {
   }
   const act = fn => attempt(() => store.mutate(fn));
   const actChannels = fn => attempt(() => store.mutateChannels(fn));
+
+  /** Move "in 12m" labels on; what changed is re-read as it changes. */
+  const tick = () => setNow(Date.now());
   return {
     store,
     jobs,
     runs,
     now,
     refresh,
+    tick,
     act,
     selectedID,
     setSelectedID,
@@ -179,7 +189,7 @@ function AutomationsView(props) {
   const index = createMemo(() => Math.max(0, sorted().findIndex(j => j.id === selectedID())));
   const selected = createMemo(() => sorted()[index()]);
   const jobRuns = createMemo(() => state.runs().filter(r => r.jobID === selected()?.id).slice(0, 8));
-  const jobSent = createMemo(() => state.sent().filter(m => m.job === selected()?.id).slice(0, 5));
+  const jobSent = createMemo(() => state.sent().get(selected()?.id ?? "") ?? []);
 
   // ---- channels tab ----
   const onChannels = () => state.tab() === "channels";
@@ -807,12 +817,8 @@ function AutomationsView(props) {
                   children: c => {
                     const src = () => state.channels().sources[c().id];
                     const users = () => listeners(c().id);
-                    const waiting = createMemo(() => {
-                      const out = new Map();
-                      for (const j of users()) out.set(j.id, (state.waiting().get(j.id) ?? []).filter(e => e.channel === c().id));
-                      return out;
-                    });
-                    const queue = id => waiting().get(id) ?? [];
+                    const count = id => state.waiting().counts.get(id)?.get(c().id) ?? 0;
+                    const first = id => (state.waiting().first.get(id) ?? []).filter(e => e.channel === c().id).slice(0, 3);
                     const status = () => chStatus(c());
                     return (() => {
                       var _el$50 = _$createElement("scrollbox"),
@@ -1029,10 +1035,10 @@ function AutomationsView(props) {
                                     var _c$ = _$memo(() => j.schedule.kind === "event");
                                     return () => _c$() ? "as events arrive" : describe(j.schedule);
                                   })(), _el$71);
-                                  _$insert(_el$69, () => queue(j.id).length, _el$72);
+                                  _$insert(_el$69, () => count(j.id), _el$72);
                                   _$insert(_el$65, _$createComponent(For, {
                                     get each() {
-                                      return queue(j.id).slice(0, 3);
+                                      return first(j.id);
                                     },
                                     children: e => (() => {
                                       var _el$73 = _$createElement("text");
@@ -1630,7 +1636,7 @@ export default Plugin.define({
         }
       } catch {}
     }, 500);
-    const ticker = setInterval(state.refresh, 15_000);
+    const ticker = setInterval(state.tick, 15_000);
 
     // Shown as a dialog over the current screen rather than a routed page, which opencode puts in its own tab.
     const open = () => {

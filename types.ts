@@ -83,8 +83,6 @@ export interface Runtime {
   runAutomation(job: Job, reason: Reason): Promise<Run | string>
   pollChannels(list: Channel[], jobs?: Job[]): Promise<Map<string, PollResult>>
   processArrivals(jobs?: Job[], channelID?: string): Promise<number>
-  /** Send what is due in the outbox, if this process is the leader (else the leader does on its tick). */
-  dispatch(): void
   /** Count a promise as work that teardown waits for. */
   track<T>(p: Promise<T>): Promise<T>
 }

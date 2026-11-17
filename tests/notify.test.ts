@@ -204,7 +204,8 @@ test("the dispatcher sends each message to every sender that takes its priority,
       exec: async (_c, args) => { execs.push(args.at(-2)!) },
       fetch: async () => (pushoverUp ? new Response("ok") : new Response("down", { status: 503 })),
     }
-    const outbox = new Outbox(s, { senders: [native, { ...pushover, minPriority: "high" }] }, deps)
+    // Not sending on its own (as off the leader): the test drives each pass.
+    const outbox = new Outbox(s, { senders: [native, { ...pushover, minPriority: "high" }] }, () => false, deps)
     outbox.add({ title: "FYI", body: "low", priority: "low" }, { job: "morning" })
     outbox.add({ title: "Urgent", body: "now", priority: "high" }, { job: "morning" })
     await outbox.dispatch()

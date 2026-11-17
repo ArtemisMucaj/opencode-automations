@@ -1025,7 +1025,7 @@ test("events from a run that failed to start go back to the queue, up to 3 attem
     app.ctx.session.prompt = async (input) => { if (failing) throw new Error("server busy"); return prompt(input) }
     current = [monitor(1)]
     await app.call("channel_poll", { id: "dd" })
-    expect(app.store.waiting("triage")).toMatchObject([{ id: "1:t1", attempts: 1 }])
+    expect(waiting(app, "triage")).toEqual(["1:t1"])
     // It starts once the server is back: nothing was lost.
     failing = false
     await app.call("automation_run", { id: "triage" })
@@ -1039,7 +1039,7 @@ test("events from a run that failed to start go back to the queue, up to 3 attem
     failing = true
     current = [monitor(2)]
     await app.call("channel_poll", { id: "dd" }) // attempt 1
-    expect(app.store.waiting("triage")).toMatchObject([{ id: "2:t1", attempts: 1 }])
+    expect(waiting(app, "triage")).toEqual(["2:t1"])
     await app.call("automation_run", { id: "triage" }) // attempt 2
     await app.call("automation_run", { id: "triage" }) // attempt 3: dropped
     expect(app.store.waiting("triage")).toEqual([])
@@ -1260,7 +1260,8 @@ test("a key's session that can't be created is a failed run, counted and given u
     app.ctx.session.create = async () => { throw new Error("model not found") }
     for (let i = 1; i <= 3; i++) {
       expect((await app.call("automation_run", { id: "triage" })).content).toContain("failed — model not found")
-      expect(app.store.waiting("triage").map((e) => e.attempts)).toEqual(i < 3 ? [i] : [])
+      const [delivery] = app.store.db.query("SELECT attempts, status FROM deliveries WHERE job = 'triage'").all()
+      expect(delivery).toEqual({ attempts: i, status: i < 3 ? "retry" : "dropped" })
     }
     expect(app.store.history("triage").map((r) => r.status)).toEqual(["failed", "failed", "failed"])
     expect(app.store.loadJobs()[0].lastStatus).toBe("failed")
@@ -1470,4 +1471,17 @@ test("a save that changes nothing doesn't count as a change", async () => {
   await app.call("automation_update", { id: "morning", prompt: "Changed" })
   expect(other.version()).not.toBe(before)
   other.close()
+})
+
+test("only the leader starts runs: elsewhere, a manual run is queued for its next tick", async () => {
+  const app = await start({}, [job()])
+  const other = await another(app)
+  expect((await other.call("automation_run", { id: "morning" }, "caller")).content).toContain("Queued")
+  expect(app.prompts).toEqual([])
+  expect(app.store.loadJobs()[0].runRequestedAt).toBeNumber()
+})
+
+test("the old notify option is refused, naming what replaced it", async () => {
+  await expect(start({ notify: { native: true } })).rejects.toThrow("replaced by outbox")
+  await expect(start({ outbox: { senders: [{ id: "x", type: "sms" }] } })).rejects.toThrow("type must be one of")
 })
