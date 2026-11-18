@@ -53,6 +53,8 @@ export interface Run {
 }
 
 export type InboxEvent = ChannelEvent & { seq: number }
+export type DeliveryStatus = "waiting" | "taken" | "dropped"
+export type InboxEntry = InboxEvent & { at: number; seenAt: number; deliveries: Array<{ job: string; status: DeliveryStatus }> }
 
 interface StickySession { id: string; usedAt: number; warmUntil?: number }
 
@@ -291,15 +293,7 @@ export class Store {
       "WHERE s.job = ? AND (i.seq > s.since_seq OR i.seen_at >= s.since_poll) AND (d.status IS NULL OR d.status = 'retry') " +
       "ORDER BY i.seq LIMIT ?",
       jobID, limit,
-    ).map((r) => ({
-      seq: r.seq as number,
-      channel: r.channel as string,
-      id: r.id as string,
-      ...(r.key !== null ? { sessionKey: r.key as string } : {}),
-      title: r.title as string,
-      ...(r.body !== null ? { body: r.body as string } : {}),
-      ...(r.url !== null ? { url: r.url as string } : {}),
-    }))
+    ).map(inboxEvent)
   }
 
   /** Waiting events per automation and channel. */
@@ -315,6 +309,36 @@ export class Store {
       out.set(r.job, perChannel)
     }
     return out
+  }
+
+  /** Deferred, not tx(): one snapshot for the reads, without taking the write lock. */
+  inbox(limit = 100): InboxEntry[] {
+    return this.db.transaction(() => {
+      const rows = this.all<Row>("SELECT seq, channel, id, key, title, body, url, at, seen_at FROM inbox ORDER BY seq DESC LIMIT ?", limit)
+      if (!rows.length) return []
+      const subs = this.all<{ job: string; channel: string; since_seq: number; since_poll: number | null }>(
+        "SELECT job, channel, since_seq, since_poll FROM subscriptions")
+      // Retries are left out: they wait again only while subscribed, which subs already says.
+      const done = Map.groupBy(
+        this.all<{ seq: number; job: string; status: "taken" | "dropped" }>(
+          "SELECT seq, job, status FROM deliveries WHERE seq >= ? AND status != 'retry'", rows.at(-1)!.seq),
+        (d) => d.seq)
+      return rows.map((r) => {
+        const seq = r.seq as number
+        const seen = r.seen_at as number
+        const statuses = new Map<string, DeliveryStatus>()
+        for (const s of subs) {
+          if (s.channel === r.channel && (seq > s.since_seq || (s.since_poll !== null && seen >= s.since_poll))) statuses.set(s.job, "waiting")
+        }
+        for (const d of done.get(seq) ?? []) statuses.set(d.job, d.status)
+        return {
+          ...inboxEvent(r),
+          at: r.at as number,
+          seenAt: seen,
+          deliveries: [...statuses].map(([job, status]) => ({ job, status })).sort((a, b) => a.job.localeCompare(b.job)),
+        }
+      })
+    }).deferred()
   }
 
   /** Mark events as taken; returns the ones that were still free. */
@@ -386,6 +410,12 @@ export class Store {
     return this.get<{ note: string }>("SELECT note FROM memory WHERE job = ? AND key = ?", jobID, key)?.note
   }
 
+  notes(jobID: string): Array<{ key: string; note: string; updatedAt: number }> {
+    return this.all<{ key: string; note: string; updated_at: number }>(
+      "SELECT key, note, updated_at FROM memory WHERE job = ? ORDER BY updated_at DESC, key", jobID,
+    ).map((r) => ({ key: r.key, note: r.note, updatedAt: r.updated_at }))
+  }
+
   setNote(jobID: string, key: string, note: string | undefined): void {
     if (note === undefined) this.run("DELETE FROM memory WHERE job = ? AND key = ?", jobID, key)
     else this.run("INSERT OR REPLACE INTO memory (job, key, note, updated_at) VALUES (?, ?, ?, ?)", jobID, key, note, Date.now())
@@ -445,6 +475,18 @@ export class Store {
 
   release(): void {
     try { this.run("DELETE FROM lease WHERE name = 'leader' AND holder = ?", this.holder) } catch {}
+  }
+}
+
+function inboxEvent(r: Row): InboxEvent {
+  return {
+    seq: r.seq as number,
+    channel: r.channel as string,
+    id: r.id as string,
+    ...(r.key !== null ? { sessionKey: r.key as string } : {}),
+    title: r.title as string,
+    ...(r.body !== null ? { body: r.body as string } : {}),
+    ...(r.url !== null ? { url: r.url as string } : {}),
   }
 }
 

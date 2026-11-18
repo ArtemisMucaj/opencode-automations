@@ -3,11 +3,13 @@
 
 import type { Renderable, RGBA } from "@opentui/core"
 import { Plugin } from "@opencode/plugin/tui"
-import { createMemo, createSignal, For, Index, Show, type JSX } from "solid-js"
+import { createMemo, createSignal, For, Index, Match, Show, Switch, type JSX } from "solid-js"
 import { describe, nextRun } from "./cron.ts"
 import { DEFAULT_TIMEOUT_MINUTES, defaultDataDir, isActive, listens, newJob, parseScheduleText, runnable, runningJobs, stateOf } from "./jobs.ts"
 import { clock, elapsed, errorMessage, plural, relative } from "./util.ts"
-import { Store, type InboxEvent, type Job, type Run, type RunStatus, type SentMessage, type SessionMode } from "./store.ts"
+import {
+  Store, type DeliveryStatus, type InboxEntry, type InboxEvent, type Job, type Run, type RunStatus, type SendStatus, type SentMessage, type SessionMode,
+} from "./store.ts"
 import { channelRows, emptyChannels, requestPoll, type ChannelRow, type ChannelsState } from "./channels.ts"
 
 type Context = Plugin.Context
@@ -38,8 +40,11 @@ function look(ctx: Context, surface?: "dialog") {
   }
 }
 
+type Tab = "jobs" | "channels" | "inbox" | "outbox"
+const tabKeys: Record<Exclude<Tab, "jobs">, string> = { channels: "c", inbox: "i", outbox: "o" }
+const tabs: Tab[] = ["jobs", "channels", "inbox", "outbox"]
+const tabHints = (tab: Tab) => Object.entries(tabKeys).map(([t, k]): [string, string] => [k, t === tab ? "automations" : t])
 const keyHints: [string, string][] = [
-  ["c", "channels"],
   ["↑↓", "select"],
   ["space", "pause"],
   ["r", "run now"],
@@ -52,12 +57,16 @@ const keyHints: [string, string][] = [
   ["esc", "close"],
 ]
 const channelHints: [string, string][] = [
-  ["c", "automations"],
   ["↑↓", "select"],
   ["p", "poll now"],
   ["d", "delete"],
   ["esc", "close"],
 ]
+const listHints: [string, string][] = [
+  ["↑↓", "select"],
+  ["esc", "close"],
+]
+const LIST_LIMIT = 100
 
 const BUSY_MS = 250
 export function createState(ctx: Context, dataDir: string) {
@@ -80,7 +89,11 @@ export function createState(ctx: Context, dataDir: string) {
   // Kept here, not in the view: the dialog is re-created after nested prompts and must reopen on the same job and tab.
   const [selectedID, setSelectedID] = createSignal<string>()
   const [selectedChannel, setSelectedChannel] = createSignal<string>()
-  const [tab, setTab] = createSignal<"jobs" | "channels">("jobs")
+  const [selectedEvent, setSelectedEvent] = createSignal<number>()
+  const [selectedMessage, setSelectedMessage] = createSignal<number>()
+  const [tab, setTab] = createSignal<Tab>("jobs")
+  // For reads made only while shown.
+  const [refreshed, setRefreshed] = createSignal(0)
 
   const notifyMode = (ctx.options.notify ?? "blurred") as "always" | "blurred" | "off"
   const seen = new Set(runs().filter((r) => r.status !== "running").map((r) => r.runID))
@@ -97,6 +110,7 @@ export function createState(ctx: Context, dataDir: string) {
     setSent(loadSent())
     setRuns(next)
     setNow(Date.now())
+    setRefreshed((n) => n + 1)
     for (const r of next) {
       if (r.status === "running" || seen.has(r.runID)) continue
       seen.add(r.runID)
@@ -129,7 +143,8 @@ export function createState(ctx: Context, dataDir: string) {
 
   return {
     store, jobs, runs, now, refresh, tick, act, selectedID, setSelectedID, channels, actChannels, waiting, sent,
-    selectedChannel, setSelectedChannel, tab, setTab,
+    selectedChannel, setSelectedChannel, tab, setTab, refreshed,
+    selectedEvent, setSelectedEvent, selectedMessage, setSelectedMessage,
   }
 }
 
@@ -147,9 +162,16 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
   const selected = createMemo(() => sorted()[index()])
   const jobRuns = createMemo(() => state.runs().filter((r) => r.jobID === selected()?.id).slice(0, 8))
   const jobSent = createMemo(() => state.sent().get(selected()?.id ?? "") ?? [])
+  const jobNotes = createMemo<ReturnType<Store["notes"]>>((shown) => {
+    state.refreshed()
+    const id = selected()?.id
+    if (!id || state.tab() !== "jobs") return []
+    try { return state.store.notes(id) } catch { return shown }
+  }, [])
 
   // ---- channels tab ----
   const onChannels = () => state.tab() === "channels"
+  const onJobs = () => state.tab() === "jobs"
   const chRows = createMemo(() => channelRows(state.channels()))
   const chIndex = createMemo(() => Math.max(0, chRows().findIndex((c) => c.id === state.selectedChannel())))
   const chSelected = createMemo(() => chRows()[chIndex()])
@@ -164,20 +186,31 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
   })
   const listeners = (id: string) => chInfo().get(id)?.users ?? []
   const chStatus = (c: ChannelRow) => chInfo().get(c.id)?.status ?? "idle"
-  const moveChannel = (d: number) => {
-    const next = chRows()[Math.max(0, Math.min(chRows().length - 1, chIndex() + d))]
-    if (next) state.setSelectedChannel(next.id)
-  }
   const running = createMemo(() => runningJobs(state.jobs(), state.runs(), state.now()))
+  const jobByID = createMemo(() => new Map(state.jobs().map((j) => [j.id, j])))
+  const jobName = (id?: string) => (id ? (jobByID().get(id)?.name ?? id) : "chat")
+  const idleNote = (j?: Job) => (j && stateOf(j) !== "active" ? ` · ${stateOf(j)}, so it waits` : "")
+
+  // ---- inbox and outbox tabs ----
+  const inbox = createMemo<InboxEntry[]>((shown) => {
+    state.refreshed()
+    if (state.tab() !== "inbox") return []
+    try { return state.store.inbox(LIST_LIMIT) } catch { return shown }
+  }, [])
+  const evIndex = createMemo(() => Math.max(0, inbox().findIndex((e) => e.seq === state.selectedEvent())))
+  const evSelected = createMemo(() => inbox()[evIndex()])
+  const outbox = createMemo<SentMessage[]>((shown) => {
+    state.refreshed()
+    if (state.tab() !== "outbox") return []
+    try { return state.store.sent(undefined, LIST_LIMIT) } catch { return shown }
+  }, [])
+  const msgIndex = createMemo(() => Math.max(0, outbox().findIndex((m) => m.id === state.selectedMessage())))
+  const msgSelected = createMemo(() => outbox()[msgIndex()])
 
   /** Toast an error message; also takes the promise act() returns, and resolves once it has settled. */
   const toastErr = async (msg?: string | Promise<string | undefined>) => {
     const m = await msg
     if (m) ctx.ui.toast.show({ title: "Automations", message: m, variant: "error" })
-  }
-  const move = (d: number) => {
-    const next = sorted()[Math.max(0, Math.min(sorted().length - 1, index() + d))]
-    if (next) setSelectedID(next.id)
   }
   const withJob = (fn: (j: Job) => void | Promise<void>) => () => {
     const j = selected()
@@ -234,9 +267,20 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
       }))
     }),
   }
-  const jobsOnly = (fn: () => unknown) => () => (onChannels() ? undefined : fn())
+  const jobsOnly = (fn: () => unknown) => () => (onJobs() ? fn() : undefined)
   const channelsOnly = (fn: () => unknown) => () => (onChannels() ? fn() : undefined)
-  const step = (d: number) => (onChannels() ? moveChannel(d) : move(d))
+  const stepIn = <T,>(list: T[], i: number, d: number, pick: (x: T) => void) => {
+    const next = list[Math.max(0, Math.min(list.length - 1, i + d))]
+    if (next) pick(next)
+  }
+  const step = (d: number) => {
+    const tab = state.tab()
+    if (tab === "channels") stepIn(chRows(), chIndex(), d, (c) => state.setSelectedChannel(c.id))
+    else if (tab === "inbox") stepIn(inbox(), evIndex(), d, (e) => state.setSelectedEvent(e.seq))
+    else if (tab === "outbox") stepIn(outbox(), msgIndex(), d, (m) => state.setSelectedMessage(m.id))
+    else stepIn(sorted(), index(), d, (j) => setSelectedID(j.id))
+  }
+  const toggleTab = (tab: Exclude<Tab, "jobs">) => () => state.setTab(state.tab() === tab ? "jobs" : tab)
 
   const actions = {
     togglePause: withJob((j) =>
@@ -348,7 +392,9 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
       { title: "down", bind: "down", run: () => step(1) },
       { bind: "k", run: () => step(-1) },
       { bind: "j", run: () => step(1) },
-      { title: "channels/automations", bind: "c", run: () => state.setTab(onChannels() ? "jobs" : "channels") },
+      { title: "channels/automations", bind: "c", run: toggleTab("channels") },
+      { title: "inbox/automations", bind: "i", run: toggleTab("inbox") },
+      { title: "outbox/automations", bind: "o", run: toggleTab("outbox") },
       { title: "pause/resume", bind: "space", run: jobsOnly(actions.togglePause) },
       { title: "run now", bind: "r", run: jobsOnly(actions.runNow) },
       { title: "poll now", bind: "p", run: channelsOnly(channelActions.poll) },
@@ -356,18 +402,42 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
       { title: "prompt", bind: "e", run: jobsOnly(actions.editPrompt) },
       { title: "schedule", bind: "s", run: jobsOnly(actions.editSchedule) },
       { title: "model", bind: "m", run: jobsOnly(actions.pickModel) },
-      { title: "delete", bind: "d", run: () => (onChannels() ? channelActions.remove() : actions.remove()) },
+      { title: "delete", bind: "d", run: () => (onChannels() ? channelActions.remove() : onJobs() ? actions.remove() : undefined) },
       { title: "open session", bind: "return", run: jobsOnly(actions.openSession) },
     ],
   }))
 
   const L = createMemo(() => look(ctx, "dialog"))
-  const statusLook = (st: "failing" | "polling" | "idle") =>
+  const statusUI = (st: "failing" | "polling" | "idle") =>
     ({
       failing: { fg: L().bad, bg: t.background.feedback.error.base, dot: "✗" },
       polling: { fg: L().ok, bg: t.background.feedback.success.base, dot: "●" },
       idle: { fg: L().muted, bg: L().cap, dot: "○" },
     })[st]
+  const deliveryState = (e: InboxEntry): DeliveryStatus | "unclaimed" =>
+    e.deliveries.some((d) => d.status === "waiting") ? "waiting"
+      : e.deliveries.some((d) => d.status === "dropped") ? "dropped"
+      : e.deliveries.length ? "taken" : "unclaimed"
+  const deliveryUI = (f: DeliveryStatus | "unclaimed") =>
+    ({
+      waiting: { fg: L().warn, dot: "◐" },
+      taken: { fg: L().ok, dot: "✓" },
+      dropped: { fg: L().bad, dot: "✗" },
+      unclaimed: { fg: L().muted, dot: "○" },
+    })[f]
+  const sendState = (m: SentMessage): SendStatus | "none" =>
+    m.sends.some((x) => x.status === "failed") ? "failed"
+      : m.sends.some((x) => x.status === "pending") ? "pending"
+      : m.sends.length ? "sent" : "none"
+  const sendUI = (st: SendStatus | "none") =>
+    ({
+      sent: { fg: L().ok, dot: "✓" },
+      pending: { fg: L().warn, dot: "◐" },
+      failed: { fg: L().bad, dot: "✗" },
+      none: { fg: L().muted, dot: "○" },
+    })[st]
+  const inboxWaiting = createMemo(() => inbox().filter((e) => deliveryState(e) === "waiting").length)
+  const outboxFailed = createMemo(() => outbox().filter((m) => sendState(m) === "failed").length)
   const statusColor = (s?: RunStatus) =>
     s === "succeeded" ? L().ok : s === "running" ? L().warn : s === "skipped" || !s ? L().muted : L().bad
   const badge = (j: Job) => {
@@ -396,6 +466,9 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
     return { left: Math.floor((o.w - width) / 2) - o.x, top: Math.floor((o.h - height) / 2) - o.y, width, height }
   })
   const activeCount = createMemo(() => state.jobs().filter(isActive).length)
+  const headerAndHintRows = 10
+  const fits = createMemo(() => Math.max(5, (panel()?.height ?? 30) - headerAndHintRows))
+  const windowStart = (length: number, i: number) => Math.max(0, Math.min(length - fits(), i - Math.floor(fits() / 2)))
 
   const Heading = (p: { title: string; hue: number }) => (
     <text fg={L().ink(p.hue)}>
@@ -429,6 +502,32 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
       </box>
     )
   }
+  const Empty = (p: { title: string; hint: string }) => (
+    <box backgroundColor={L().panel} padding={2} flexDirection="column" gap={1}>
+      <text fg={L().text}>{p.title}</text>
+      <text fg={L().muted}>{p.hint}</text>
+    </box>
+  )
+  /** The rows around the cursor that fit. <Index> keeps slots, so a row's position is read reactively: slot + start. */
+  const List = <T,>(p: { title: string; items: T[]; index: number; row: (item: T, selected: boolean) => { dot: string; fg: RGBA; name: string; when: string } }) => {
+    const start = createMemo(() => windowStart(p.items.length, p.index))
+    return (
+      <box flexDirection="column" width={38} backgroundColor={L().panel} paddingTop={1} paddingBottom={1}>
+        <box paddingLeft={2} paddingBottom={1}>
+          <text fg={L().muted}>
+            <b>{p.title}</b>
+          </text>
+        </box>
+        <Index each={p.items.slice(start(), start() + fits())}>
+          {(item, slot) => {
+            const selected = () => slot + start() === p.index
+            const r = () => p.row(item(), selected())
+            return <Row selected={selected()} dot={r().dot} dotFg={r().fg} name={r().name} when={r().when} />
+          }}
+        </Index>
+      </box>
+    )
+  }
   const Field = (p: { label: string; value: string; fg?: RGBA }) => (
     <text>
       <span style={{ fg: L().muted }}>{p.label.padEnd(11)}</span>
@@ -459,11 +558,13 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
                   <b>⏰ Automations</b>
                 </text>
                 {/* Tabs as separate <text>s so a color change repaints (see the dot below). */}
-                <text fg={onChannels() ? L().muted : L().ink(0)}>{onChannels() ? " jobs " : "[jobs]"}</text>
-                <text fg={onChannels() ? L().ink(0) : L().muted}>{onChannels() ? "[channels]" : " channels "}</text>
+                <For each={tabs}>
+                  {(tab) => (
+                    <text fg={state.tab() === tab ? L().ink(0) : L().muted}>{state.tab() === tab ? `[${tab}]` : ` ${tab} `}</text>
+                  )}
+                </For>
               </box>
-              <Show
-                when={onChannels()}
+              <Switch
                 fallback={
                   <text fg={L().muted}>
                     {plural(state.jobs().length, "job")} · {activeCount()} active ·{" "}
@@ -471,6 +572,21 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
                   </text>
                 }
               >
+                <Match when={state.tab() === "inbox"}>
+                  <text fg={L().muted}>
+                    {inbox().length >= LIST_LIMIT ? `latest ${LIST_LIMIT}` : plural(inbox().length, "event")} ·{" "}
+                    <span style={{ fg: L().warn }}>{inboxWaiting()} waiting</span>
+                  </text>
+                </Match>
+                <Match when={state.tab() === "outbox"}>
+                  <text fg={L().muted}>
+                    {outbox().length >= LIST_LIMIT ? `latest ${LIST_LIMIT}` : plural(outbox().length, "message")} ·{" "}
+                    <span style={{ fg: outboxFailed() ? L().bad : L().muted }}>
+                      {outboxFailed()} failed
+                    </span>
+                  </text>
+                </Match>
+                <Match when={onChannels()}>
                 <text fg={L().muted}>
                   {plural(chRows().length, "channel")} ·{" "}
                   {chRows().filter((c) => chStatus(c) !== "idle").length} polled ·{" "}
@@ -478,37 +594,27 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
                     {chRows().filter((c) => chStatus(c) === "failing").length} failing
                   </span>
                 </text>
-              </Show>
+                </Match>
+              </Switch>
             </box>
 
             <Show when={onChannels()}>
               <Show
                 when={chRows().length}
-                fallback={
-                  <box backgroundColor={L().panel} padding={2} flexDirection="column" gap={1}>
-                    <text fg={L().text}>No channels yet.</text>
-                    <text fg={L().muted}>Ask in chat: “/channel alert me about Datadog monitors that start alerting”.</text>
-                  </box>
-                }
+                fallback={<Empty title="No channels yet." hint="Ask in chat: “/channel alert me about Datadog monitors that start alerting”." />}
               >
                 <box flexDirection="row" flexGrow={1} flexShrink={1} flexBasis={0} minHeight={0} gap={2}>
-                  <box flexDirection="column" width={38} backgroundColor={L().panel} paddingTop={1} paddingBottom={1}>
-                    <box paddingLeft={2} paddingBottom={1}>
-                      <text fg={L().muted}>
-                        <b>CHANNELS</b>
-                      </text>
-                    </box>
-                    {/* Index, not For: rows are rebuilt on each refresh, and Index keeps the row components. */}
-                    <Index each={chRows()}>
-                      {(c, i) => {
-                        const isSel = () => i === chIndex()
-                        const status = () => chStatus(c())
-                        const src = () => state.channels().sources[c().id]
-                        const when = () => (status() === "idle" ? "idle" : src()?.lastPollAt ? relative(src()!.lastPollAt, state.now()) : "soon")
-                        return <Row selected={isSel()} dot={statusLook(status()).dot} dotFg={statusLook(status()).fg} name={c().name} when={when()} />
-                      }}
-                    </Index>
-                  </box>
+                  <List
+                    title="CHANNELS"
+                    items={chRows()}
+                    index={chIndex()}
+                    row={(c) => {
+                      const status = chStatus(c)
+                      const src = state.channels().sources[c.id]
+                      const when = status === "idle" ? "idle" : src?.lastPollAt ? relative(src.lastPollAt, state.now()) : "soon"
+                      return { ...statusUI(status), name: c.name, when }
+                    }}
+                  />
 
                   <Show when={chSelected()}>
                     {(c) => {
@@ -527,7 +633,7 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
                                 </span>
                                 {"  "}
                                 <span
-                                  style={{ fg: statusLook(status()).fg, bg: statusLook(status()).bg }}
+                                  style={{ fg: statusUI(status()).fg, bg: statusUI(status()).bg }}
                                 >
                                   {` ${status()} `}
                                 </span>
@@ -591,34 +697,152 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
               </Show>
             </Show>
 
-            <Show when={!onChannels()}>
+
+            <Show when={state.tab() === "inbox"}>
+              <Show
+                when={inbox().length}
+                fallback={<Empty title="The inbox is empty." hint="Channels write the events they poll here, for the automations attached to them." />}
+              >
+                <box flexDirection="row" flexGrow={1} flexShrink={1} flexBasis={0} minHeight={0} gap={2}>
+                  <List
+                    title="INBOX"
+                    items={inbox()}
+                    index={evIndex()}
+                    row={(e) => ({ ...deliveryUI(deliveryState(e)), name: e.title, when: relative(e.at, state.now()) })}
+                  />
+
+                  <Show when={evSelected()}>
+                    {(e) => (
+                      <scrollbox flexGrow={1} minHeight={0}>
+                        <box flexDirection="column" gap={1}>
+                          <Block title="Event" hue={0}>
+                            <text fg={L().text}>
+                              <b>{e().title}</b>
+                            </text>
+                            <box flexDirection="column">
+                              <Field label="channel" value={chRows().find((c) => c.id === e().channel)?.name ?? e().channel} />
+                              <Field label="id" value={e().id} />
+                              <Show when={e().sessionKey}>{(k) => <Field label="sessionKey" value={k()} />}</Show>
+                              <Field label="first seen" value={`${clock(e().at)}  (${relative(e().at, state.now())})`} />
+                              <Field label="last seen" value={`${clock(e().seenAt)}  (${relative(e().seenAt, state.now())})`} />
+                              <Show when={e().url}>{(u) => <Field label="url" value={u()} />}</Show>
+                            </box>
+                          </Block>
+
+                          <Show when={e().body}>
+                            {(b) => (
+                              <Block title="Body" hue={1}>
+                                <text fg={L().text}>{b()}</text>
+                              </Block>
+                            )}
+                          </Show>
+
+                          <Block title="Automations" hue={2}>
+                            <Show when={e().deliveries.length} fallback={<text fg={L().muted}>none took it or waits for it</text>}>
+                              <box flexDirection="column">
+                                <For each={e().deliveries}>
+                                  {(d) => (
+                                    <text fg={L().text}>
+                                      <span style={{ fg: deliveryUI(d.status).fg }}>{deliveryUI(d.status).dot}</span> {jobName(d.job)}
+                                      <span style={{ fg: L().muted }}>
+                                        {"  "}
+                                        {d.status}
+                                        {d.status === "waiting" ? idleNote(jobByID().get(d.job)) : ""}
+                                      </span>
+                                    </text>
+                                  )}
+                                </For>
+                              </box>
+                            </Show>
+                          </Block>
+                        </box>
+                      </scrollbox>
+                    )}
+                  </Show>
+                </box>
+              </Show>
+            </Show>
+
+            <Show when={state.tab() === "outbox"}>
+              <Show
+                when={outbox().length}
+                fallback={<Empty title="Nothing has been sent yet." hint="What automations notify you of is kept here, with how each destination took it." />}
+              >
+                <box flexDirection="row" flexGrow={1} flexShrink={1} flexBasis={0} minHeight={0} gap={2}>
+                  <List
+                    title="OUTBOX"
+                    items={outbox()}
+                    index={msgIndex()}
+                    row={(m) => ({ ...sendUI(sendState(m)), name: m.title, when: relative(m.at, state.now()) })}
+                  />
+
+                  <Show when={msgSelected()}>
+                    {(m) => (
+                      <scrollbox flexGrow={1} minHeight={0}>
+                        <box flexDirection="column" gap={1}>
+                          <Block title="Message" hue={0}>
+                            <text fg={L().text}>
+                              <b>{m().title}</b>
+                            </text>
+                            <box flexDirection="column">
+                              <Field label="from" value={jobName(m().job)} />
+                              <Field label="sent" value={`${clock(m().at)}  (${relative(m().at, state.now())})`} />
+                              <Field label="priority" value={m().priority} />
+                              <Show when={m().url}>{(u) => <Field label="url" value={m().urlTitle ? `${m().urlTitle}  ${u()}` : u()} />}</Show>
+                              <Show when={m().run}>{(r) => <Field label="run" value={r()} />}</Show>
+                            </box>
+                          </Block>
+
+                          <Block title="Body" hue={1}>
+                            <text fg={L().text}>{m().body}</text>
+                          </Block>
+
+                          <Block title="Destinations" hue={3}>
+                            <Show when={m().sends.length} fallback={<text fg={L().muted}>no destination takes it</text>}>
+                              <box flexDirection="column">
+                                <For each={m().sends}>
+                                  {(x) => (
+                                    <box flexDirection="column">
+                                      <text fg={L().text}>
+                                        <span style={{ fg: sendUI(x.status).fg }}>{sendUI(x.status).dot}</span> {x.destination}
+                                        <span style={{ fg: L().muted }}>{"  "}{x.status}</span>
+                                      </text>
+                                      <Show when={x.error}>{(err) => <text fg={L().bad}>{"  " + err()}</text>}</Show>
+                                    </box>
+                                  )}
+                                </For>
+                              </box>
+                            </Show>
+                          </Block>
+                        </box>
+                      </scrollbox>
+                    )}
+                  </Show>
+                </box>
+              </Show>
+            </Show>
+
+            <Show when={onJobs()}>
             <Show
               when={sorted().length}
-              fallback={
-                <box backgroundColor={L().panel} padding={2} flexDirection="column" gap={1}>
-                  <text fg={L().text}>No automations yet.</text>
-                  <text fg={L().muted}>Press n to create one, or ask in chat: “every weekday at 8:45, triage my open MRs”.</text>
-                </box>
-              }
+              fallback={<Empty title="No automations yet." hint="Press n to create one, or ask in chat: “every weekday at 8:45, triage my open MRs”." />}
             >
               {/* flexBasis/minHeight 0: a tall detail pane scrolls instead of squeezing the header and hints. */}
               <box flexDirection="row" flexGrow={1} flexShrink={1} flexBasis={0} minHeight={0} gap={2}>
-                <box flexDirection="column" width={38} backgroundColor={L().panel} paddingTop={1} paddingBottom={1}>
-                  <box paddingLeft={2} paddingBottom={1}>
-                    <text fg={L().muted}>
-                      <b>JOBS</b>
-                    </text>
-                  </box>
-                  <For each={sorted()}>
-                    {(j, i) => {
-                      const isSel = () => i() === index()
-                      const dot = () => (running().has(j.id) ? "◐" : isActive(j) ? "●" : "○")
-                      const when = () => (running().has(j.id) ? "running" : isActive(j) ? relative(j.nextRunAt, state.now()) : stateOf(j))
-                      const dotFg = () => (isSel() ? L().ok : running().has(j.id) ? L().warn : L().muted)
-                      return <Row selected={isSel()} dot={dot()} dotFg={dotFg()} name={j.name} when={when()} />
-                    }}
-                  </For>
-                </box>
+                <List
+                  title="JOBS"
+                  items={sorted()}
+                  index={index()}
+                  row={(j, selected) => {
+                    const runs = running().has(j.id)
+                    return {
+                      dot: runs ? "◐" : isActive(j) ? "●" : "○",
+                      fg: selected ? L().ok : runs ? L().warn : L().muted,
+                      name: j.name,
+                      when: runs ? "running" : isActive(j) ? relative(j.nextRunAt, state.now()) : stateOf(j),
+                    }
+                  }}
+                />
 
                 <Show when={selected()}>
                   {(j) => (
@@ -665,11 +889,28 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
                                 {(m) => (
                                   <text fg={L().text}>
                                     {clock(m.at)} {m.title.slice(0, 60)}
-                                    <span style={{ fg: m.sends.some((x) => x.status === "failed") ? L().bad : L().muted }}>
+                                    <span style={{ fg: sendState(m) === "failed" ? L().bad : L().muted }}>
                                       {"  "}
                                       {m.sends.map((x) => `${x.destination} ${x.status}`).join(", ") || "no destination takes it"}
                                     </span>
                                   </text>
+                                )}
+                              </For>
+                            </box>
+                          </Block>
+                        </Show>
+
+                        <Show when={jobNotes().length}>
+                          <Block title="Memory" hue={4}>
+                            <box flexDirection="column" gap={1}>
+                              <For each={jobNotes()}>
+                                {(n) => (
+                                  <box flexDirection="column">
+                                    <text fg={L().muted}>
+                                      {n.key ? `${n.key} · ` : ""}updated {clock(n.updatedAt)} ({relative(n.updatedAt, state.now())})
+                                    </text>
+                                    <text fg={L().text}>{n.note}</text>
+                                  </box>
                                 )}
                               </For>
                             </box>
@@ -707,7 +948,7 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
             </Show>
 
             <box flexDirection="row" flexWrap="wrap" paddingTop={1} paddingBottom={1} columnGap={2} flexShrink={0}>
-              <For each={onChannels() ? channelHints : keyHints}>
+              <For each={[...tabHints(state.tab()), ...(onJobs() ? keyHints : onChannels() ? channelHints : listHints)]}>
                 {([key, label]) => (
                   <text>
                     <span style={{ fg: L().text, bg: L().cap }}> {key} </span>
