@@ -30,8 +30,6 @@ opencode plugin remove github:ArtemisMucaj/opencode-automations
 
 Removing the plugin keeps your automations and their history, in case you install it again.
 
-> **Upgrading from 0.1?** Version 0.2 stores everything differently and doesn't read the old files. Recreate your automations and channels, and move your notification settings to `outbox` (see [Notifications](#notifications)).
-
 ## Create your first automation
 
 Ask for it in chat, in any opencode session:
