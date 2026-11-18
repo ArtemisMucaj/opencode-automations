@@ -197,7 +197,6 @@ export function channelTools(tools: ToolEditor, rt: Runtime) {
       const { id } = input
       if (configChannels.has(id)) throw new Error(`"${id}" is defined in opencode.json(c); remove it there`)
       if (!store.loadChannels().defs[id]) throw new Error(`no channel "${id}" created with channel_create`)
-      // In one transaction, so an automation can't attach the channel between the check and the delete.
       const { users, paused } = await mutate((jobs) => {
         const users = jobs.filter((j) => listens(j, id))
         const fromConfig = users.filter((j) => j.source === "config")

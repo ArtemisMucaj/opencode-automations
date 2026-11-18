@@ -11,10 +11,7 @@ export const listens = (job: Job, channelID: string) => !!job.on?.channels.inclu
 export const runnable = (job: Job) => job.schedule.kind !== "event" || !!job.on?.channels.length
 export const isActive = (job: Job) => job.enabled && !job.paused && !job.done && runnable(job)
 
-/**
- * Whether its runs keep a memory for the next: a one-shot has no next run, and a `current` automation's runs
- * all happen in one chat, which is its memory.
- */
+/** Whether runs keep a memory: not one-shots (no next run) nor `current` ones (the chat is the memory). */
 export const remembers = (job: Job) => job.schedule.kind !== "at" && job.session !== "current"
 
 export const stateOf = (j: Job) => (j.done ? "done" : j.paused ? "paused" : !j.enabled ? "disabled" : "active")

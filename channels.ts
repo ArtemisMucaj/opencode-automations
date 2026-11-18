@@ -1,5 +1,4 @@
-// Channels: event sources polled from HTTP APIs. A poll's events go to the inbox (store.ts), where each
-// automation takes the ones from its channels.
+// Channels: HTTP APIs polled for events, which go to the inbox (store.ts).
 
 import { parseInterval } from "./cron.ts"
 import { ENV_REF, errorMessage, httpError, plural, withEnv, type Fetch } from "./util.ts"
@@ -24,11 +23,7 @@ export interface ChannelConfig {
   items?: string
   /** Keep items whose field (dot path) equals the value, or one of the values. */
   filter?: Record<string, Scalar | Scalar[]>
-  /**
-   * Templates over each item: `{path.to.field}`.
-   * `id` says what counts as a new event. `sessionKey` says which events share a session for an
-   * automation with `session: "sticky"`, e.g. "{id}" for one session per monitor.
-   */
+  /** `{path}` templates per item. `id`: what counts as new. `sessionKey`: which events share a sticky session. */
   event: { id: string; sessionKey?: string; title?: string; body?: string; url?: string }
 }
 
@@ -43,17 +38,14 @@ export interface Channel {
 }
 
 export interface ChannelEvent {
-  /** The channel it came from. IDs and session keys are only unique within a channel. */
   channel: string
   id: string
-  /** From `event.sessionKey`: with `sticky`, events with the same one share a session. */
   sessionKey?: string
   title: string
   body?: string
   url?: string
 }
 
-/** A channel's poll status. */
 export interface SourceState {
   pollRequestedAt?: number
   lastPollAt?: number
@@ -64,16 +56,15 @@ export interface SourceState {
 
 export interface ChannelsState {
   sources: Record<string, SourceState>
-  /** Channels created with channel_create (config channels live in opencode.json). */
+  /** Created with channel_create. */
   defs: Record<string, ChannelConfig>
-  /** What the server's config channels look like, for the TUI (which can't read the server's options). */
+  /** Config channels, for the TUI. */
   config: Record<string, ChannelSummary>
 }
 
-/** A channel without its request headers and body, so without secrets: safe to show and to store. */
+/** A channel without headers, body or query string: no secrets. */
 export interface ChannelSummary {
   name: string
-  /** Origin and path only; the query string is left out. */
   url: string
   everyMs: number
   items: string
@@ -108,7 +99,7 @@ export function channelRows(s: ChannelsState): ChannelRow[] {
 
 export const emptyChannels = (): ChannelsState => ({ sources: {}, defs: {}, config: {} })
 
-/** Ask the leader to poll this channel on its next tick, whether or not an automation uses it. */
+/** Ask the leader to poll it on its next tick. */
 export function requestPoll(state: ChannelsState, id: string) {
   (state.sources[id] ??= {}).pollRequestedAt = Date.now()
 }
@@ -137,7 +128,7 @@ export function parseChannel(c: ChannelConfig): Channel {
 
 // ---------- mapping items to events ----------
 
-/** Value at a dot path ("a.b.0.c"). Empty path: the value itself. */
+/** Value at a dot path ("a.b.0.c"). */
 export function get(value: unknown, path: string): unknown {
   if (!path) return value
   let cur: unknown = value
@@ -181,11 +172,7 @@ export function extract(ch: Channel, response: unknown): ChannelEvent[] {
   return out
 }
 
-/**
- * Waiting events cut into chunks, one run each: oldest first, at most `max` per chunk.
- * With `byKey`, one chunk per session key (each goes to that key's session); otherwise a single chunk.
- * Events whose session key came out empty share the chunk without a key.
- */
+/** Waiting events cut into runs: at most `max` each, one per session key with `byKey`. */
 export function chunks<E extends ChannelEvent>(pending: E[], byKey: boolean, max: number): Array<{ key?: string; events: E[] }> {
   const out = new Map<string | undefined, E[]>()
   for (const e of pending) {
@@ -206,7 +193,7 @@ const inner = (s: string) => s.replace(/<(\/?)event/gi, "<$1event​")
 
 const quoted = (names: string[]) => names.map((n) => `"${n}"`).join(", ")
 
-/** The automation's prompt followed by its events, marked as untrusted data. `names`: channel ID to display name. */
+/** The prompt followed by its events, marked as untrusted data. */
 export function composeEvents(prompt: string, events: ChannelEvent[], names: Record<string, string>): string {
   const from = (ids: string[]) => {
     const list = quoted(ids.map((id) => names[id] ?? id))
@@ -232,10 +219,7 @@ export async function poll(ch: Channel, fetchFn: Fetch = fetch, signal?: AbortSi
   return extract(ch, await fetchJSON(ch, fetchFn, signal))
 }
 
-/**
- * The channel's request, as parsed JSON. What it throws never carries a key: an API that echoes the
- * request back gets the values of the channel's variables replaced by their {env:NAME} reference.
- */
+/** The parsed response. Errors have env values replaced by {env:NAME}, in case the API echoes a key. */
 async function fetchJSON(ch: Channel, fetchFn: Fetch = fetch, signal?: AbortSignal): Promise<unknown> {
   try { return await request(ch, fetchFn, signal) }
   catch (e) { throw new Error(redact(errorMessage(e), envNames(ch.request).names)) }
@@ -267,10 +251,7 @@ export const CHANNEL_ID = /^[a-z0-9][a-z0-9_-]{0,47}$/
 const SECRET_NAME = /auth|key|token|secret|passw|session|cookie|signature|credential/i
 const usesEnv = (v: unknown) => typeof v === "string" && v.search(ENV_REF) >= 0
 
-/**
- * Places where a channel would store a secret as plain text: headers, query parameters and body
- * fields whose names look like credentials, with a value that isn't an {env:NAME} reference.
- */
+/** Credential-like headers, query parameters and body fields not given as {env:NAME}. */
 export function literalSecrets(request: ChannelConfig["request"]): string[] {
   const found: string[] = []
   for (const [name, value] of Object.entries(request.headers ?? {})) {

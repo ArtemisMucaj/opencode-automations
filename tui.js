@@ -8,9 +8,7 @@ import { insertNode as _$insertNode } from "@opentui/solid";
 import { insert as _$insert } from "@opentui/solid";
 import { createElement as _$createElement } from "@opentui/solid";
 // opencode v2 TUI plugin for automations.
-// Reads the same state.db the server plugin writes, and writes *intents* back (pause, edit,
-// delete, run-now). The server leader executes them on its next tick, so there is still
-// exactly one firer and one run history.
+// Reads state.db and writes intents (pause, edit, delete, run now) that the server's leader carries out.
 
 import { Plugin } from "@opencode/plugin/tui";
 import { createMemo, createSignal, For, Index, Show } from "solid-js";
@@ -52,8 +50,6 @@ function look(ctx, surface) {
 }
 const keyHints = [["c", "channels"], ["↑↓", "select"], ["space", "pause"], ["r", "run now"], ["n", "new"], ["e", "prompt"], ["s", "schedule"], ["m", "model"], ["d", "delete"], ["⏎", "open session"], ["esc", "close"]];
 const channelHints = [["c", "automations"], ["↑↓", "select"], ["p", "poll now"], ["d", "delete"], ["esc", "close"]];
-
-/** The TUI waits only briefly for a write by the server, so the screen never freezes for long. */
 const BUSY_MS = 250;
 export function createState(ctx, dataDir) {
   const store = new Store(dataDir, {
@@ -70,7 +66,6 @@ export function createState(ctx, dataDir) {
     }
   };
   const [channels, setChannels] = createSignal(loadChannels());
-  /** Per automation on channels: how many events wait for it per channel, and the first few. */
   const loadWaiting = () => {
     try {
       return {
@@ -85,7 +80,6 @@ export function createState(ctx, dataDir) {
     }
   };
   const [waiting, setWaiting] = createSignal(loadWaiting());
-  /** Per automation: its latest messages in the outbox, with each sender's status. */
   const loadSent = () => {
     try {
       return new Map(jobs().map(j => [j.id, store.sent(j.id, 5)]));
@@ -102,7 +96,7 @@ export function createState(ctx, dataDir) {
   const seen = new Set(runs().filter(r => r.status !== "running").map(r => r.runID));
   function refresh() {
     let next;
-    // Runs from a timer and on every change: state that can't be read now keeps what is shown.
+    // State that can't be read now keeps what is shown.
     try {
       setJobs(store.loadJobs());
       next = store.history(undefined, 300);
@@ -151,8 +145,6 @@ export function createState(ctx, dataDir) {
   }
   const act = fn => attempt(() => store.mutate(fn));
   const actChannels = fn => attempt(() => store.mutateChannels(fn));
-
-  /** Move "in 12m" labels on; what changed is re-read as it changes. */
   const tick = () => setNow(Date.now());
   return {
     store,
@@ -276,7 +268,7 @@ function AutomationsView(props) {
         message: `Delete the channel “${c.name}”? No automation uses it.`
       });
       if (!ok) return;
-      // Checked again in the same transaction: this list may be old, and chat may have attached it since.
+      // Checked again: chat may have attached it since.
       await toastErr(state.act(jobs => {
         const now = jobs.filter(j => listens(j, c.id));
         if (now.length) throw new Error(`Used by ${now.map(j => j.name).join(", ")} now. Detach it from chat: channel_delete with detach.`);
@@ -1625,7 +1617,7 @@ export default Plugin.define({
     const dataDir = typeof ctx.options.dataDir === "string" ? ctx.options.dataDir : defaultDataDir();
     const state = createState(ctx, dataDir);
 
-    // Live updates: re-read when another process commits (a cheap check), plus a slow tick for "in 12m" labels.
+    // Re-read when another process commits; a slow tick moves "in 12m" labels on.
     let version = state.store.version();
     const watcher = setInterval(() => {
       try {

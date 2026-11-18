@@ -37,17 +37,17 @@ export interface ConfigJob extends ScheduleInput {
   notify?: JobNotify
 }
 
-/** A run in progress in this process: its saved record (status "running") and what tracks it until it ends. */
+/** A run in progress in this process. */
 export interface Running {
   job: Job
   run: Run
   lastText?: string
-  /** automation_notify calls, each a message in the outbox. */
+  /** automation_notify calls. */
   sent: number
   timer?: ReturnType<typeof setTimeout>
   /** Session key of a run in its key's session: runs for different keys may overlap. */
   key?: string
-  /** The run ended without notifying or saving its memory, and was asked once to do it. */
+  /** Asked once to notify or save its memory. */
   checked?: boolean
   memoryUpdated?: boolean
   cacheMs?: number
@@ -76,7 +76,7 @@ export interface Runtime {
   /** Whether this process holds the lease, so runs the ticker. */
   leader(): boolean
   load(disk?: Job[]): Job[]
-  /** Change jobs in one transaction; `fn` must be synchronous. Subscriptions follow the jobs' channels. */
+  /** `fn` must be synchronous. */
   mutate<T>(fn: (jobs: Job[]) => T): Promise<T>
   checkChannels(input: { on?: { channel?: string; channels?: string[] }; maxEvents?: number }): string[] | undefined
   allChannels(defs?: Record<string, ChannelConfig>): Map<string, Channel>

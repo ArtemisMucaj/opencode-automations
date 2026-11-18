@@ -80,7 +80,6 @@ export const MEMORY_GUIDE_SHORT =
   `You haven't called ${UPDATE_TOOL}, so the next run won't know the result of this one: it may not see ` +
   `this conversation. Call ${UPDATE_TOOL} now with this run's result and what the next run needs to pick up from here.`
 
-/** A run in a fresh session gets the previous run's memory ahead of its prompt. */
 export const withMemory = (text: string, note: string | undefined) =>
   note ? `Memory from the previous run of this automation (written by it with ${UPDATE_TOOL}):\n\n${note}\n\n---\n\n${text}` : text
 

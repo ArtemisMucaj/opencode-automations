@@ -1,7 +1,5 @@
 // opencode v2 TUI plugin for automations.
-// Reads the same state.db the server plugin writes, and writes *intents* back (pause, edit,
-// delete, run-now). The server leader executes them on its next tick, so there is still
-// exactly one firer and one run history.
+// Reads state.db and writes intents (pause, edit, delete, run now) that the server's leader carries out.
 
 import type { Renderable, RGBA } from "@opentui/core"
 import { Plugin } from "@opencode/plugin/tui"
@@ -61,7 +59,6 @@ const channelHints: [string, string][] = [
   ["esc", "close"],
 ]
 
-/** The TUI waits only briefly for a write by the server, so the screen never freezes for long. */
 const BUSY_MS = 250
 export function createState(ctx: Context, dataDir: string) {
   const store = new Store(dataDir, { busyMs: BUSY_MS })
@@ -70,14 +67,12 @@ export function createState(ctx: Context, dataDir: string) {
   const [now, setNow] = createSignal(Date.now())
   const loadChannels = () => { try { return store.loadChannels() } catch { return emptyChannels() } }
   const [channels, setChannels] = createSignal<ChannelsState>(loadChannels())
-  /** Per automation on channels: how many events wait for it per channel, and the first few. */
   const loadWaiting = () => {
     try {
       return { counts: store.waitingCounts(), first: new Map(jobs().filter((j) => j.on).map((j) => [j.id, store.waiting(j.id, 20)])) }
     } catch { return { counts: new Map<string, Map<string, number>>(), first: new Map<string, InboxEvent[]>() } }
   }
   const [waiting, setWaiting] = createSignal(loadWaiting())
-  /** Per automation: its latest messages in the outbox, with each sender's status. */
   const loadSent = () => {
     try { return new Map(jobs().map((j) => [j.id, store.sent(j.id, 5)])) } catch { return new Map<string, SentMessage[]>() }
   }
@@ -92,7 +87,7 @@ export function createState(ctx: Context, dataDir: string) {
 
   function refresh() {
     let next: Run[]
-    // Runs from a timer and on every change: state that can't be read now keeps what is shown.
+    // State that can't be read now keeps what is shown.
     try {
       setJobs(store.loadJobs())
       next = store.history(undefined, 300)
@@ -130,7 +125,6 @@ export function createState(ctx: Context, dataDir: string) {
   const act = (fn: (jobs: Job[]) => void) => attempt(() => store.mutate(fn))
   const actChannels = (fn: (s: ChannelsState) => void) => attempt(() => store.mutateChannels(fn))
 
-  /** Move "in 12m" labels on; what changed is re-read as it changes. */
   const tick = () => setNow(Date.now())
 
   return {
@@ -232,7 +226,7 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
       }
       const ok = await ctx.ui.dialog.confirm({ title: "Delete channel", message: `Delete the channel “${c.name}”? No automation uses it.` })
       if (!ok) return
-      // Checked again in the same transaction: this list may be old, and chat may have attached it since.
+      // Checked again: chat may have attached it since.
       await toastErr(state.act((jobs) => {
         const now = jobs.filter((j) => listens(j, c.id))
         if (now.length) throw new Error(`Used by ${now.map((j) => j.name).join(", ")} now. Detach it from chat: channel_delete with detach.`)
@@ -774,7 +768,7 @@ export default Plugin.define({
 
     const state = createState(ctx, dataDir)
 
-    // Live updates: re-read when another process commits (a cheap check), plus a slow tick for "in 12m" labels.
+    // Re-read when another process commits; a slow tick moves "in 12m" labels on.
     let version = state.store.version()
     const watcher = setInterval(() => {
       try {

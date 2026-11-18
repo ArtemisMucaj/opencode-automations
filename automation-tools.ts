@@ -72,7 +72,6 @@ export function automationTools(tools: ToolEditor, rt: Runtime) {
         senders = outbox.add({ title, body: message, priority, url: input.url, urlTitle: input.url_title }, { job: f.job.id, run: f.run.runID })
       } catch (e) { return text(`error: couldn't queue it (${errorMessage(e)}). Try once more.`) }
       f.sent++
-      // The user chose not to get these; it is recorded, and that is the run's notifying done.
       const outcome = senders ? "Queued for delivery." : `Recorded, but not delivered: the user only gets notifications above ${priority} priority.`
       return text(`${outcome} ${maxPerRun - f.sent} notifications left for this run.`)
     },
@@ -143,7 +142,6 @@ export function automationTools(tools: ToolEditor, rt: Runtime) {
         directory = (await ctx.session.get({ sessionID: tc.sessionID })).location.directory ?? directory
       } catch {}
       const job = await mutate((jobs) => {
-        // Again in the same transaction: a channel delete checks for users in one too.
         if (on) checkChannels({ on })
         const j = newJob(jobs, {
           name: input.name,
@@ -222,7 +220,6 @@ export function automationTools(tools: ToolEditor, rt: Runtime) {
           if (!ids && j.schedule.kind === "event" && !(input.cron || input.every || input.at)) {
             throw new Error("it runs only on events: give it a schedule (cron/every/at) before removing all channels")
           }
-          // Its subscriptions follow (mutate): a channel added takes what the channel's latest poll returned.
           if (ids) j.on = { channels: ids }
           else delete j.on
         }
@@ -256,7 +253,6 @@ export function automationTools(tools: ToolEditor, rt: Runtime) {
     description: "Delete an automation.",
     input: { type: "object", properties: { id: { type: "string" } }, required: ["id"], additionalProperties: false },
     execute: (input) => orError(async () => {
-      // What it took from the inbox, its sessions and memory go with it (mutate).
       const name = await mutate((jobs) => {
         const j = find(jobs, input.id)
         if (!j) throw new Error(`no job "${input.id}"`)
@@ -276,7 +272,6 @@ export function automationTools(tools: ToolEditor, rt: Runtime) {
     execute: async (input) => {
       const j = find(load(), input.id)
       if (!j) return text(`error: no job "${input.id}"`)
-      // Only the leader starts runs: elsewhere, ask it to.
       if (!rt.leader()) {
         await mutate((jobs) => { const x = find(jobs, j.id); if (x) x.runRequestedAt = Date.now() })
         return text(`Queued: "${j.name}" starts on the leader's next tick, within ${rt.tickMs / 1000}s.`)

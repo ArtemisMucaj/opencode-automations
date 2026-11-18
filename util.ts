@@ -79,10 +79,9 @@ export class Owned<V> {
   find(id: string) { return this.mine.get(id) ?? this.all.get(id) }
 }
 
-/** A reference to an environment variable in a setting: {env:NAME}. */
 export const ENV_REF = /\{env:([A-Za-z_][A-Za-z0-9_]*)\}/g
 
-/** Fill every {env:NAME} in a value (strings, arrays and objects, deeply); a variable that isn't set throws. */
+/** Fill every {env:NAME}, deeply; throws on one that isn't set. */
 export function withEnv<T>(value: T, env: Record<string, string | undefined> = process.env): T {
   if (typeof value === "string") {
     return value.replace(ENV_REF, (_, name: string) => {

@@ -1,7 +1,5 @@
-// opencode v2 plugin: run prompts on a schedule, or on events from a channel.
-// Channels write their events to the inbox, and each automation takes the ones from its channels. What a run
-// tells the user goes to the outbox, which the dispatcher delivers to the configured senders (outbox.ts).
-// The tools are in automation-tools.ts and channel-tools.ts, what the agent is told in guides.ts.
+// opencode v2 plugin: run prompts on a schedule, or on channel events taken from the inbox.
+// What a run tells the user goes through the outbox (outbox.ts).
 
 import { Plugin } from "@opencode/plugin"
 import { randomUUID } from "node:crypto"
@@ -23,24 +21,17 @@ import { errorMessage, Owned, within } from "./util.ts"
 
 const MISSED_GRACE_MS = 2 * 60_000
 const CHANNEL_FAILURE_NOTICE = 3
-/** How often the leader drops old events and messages, and what deleted automations left. */
 const TRIM_EVERY_MS = 10 * 60_000
 
 const WARM_SHARE = 0.9
-/** How long a cold run waits for its compaction's end event, for hosts that send none. */
+/** For hosts that send no compaction end event. */
 const COMPACTION_END_MS = 5_000
-/**
- * Longest a compaction may take before the run goes on without it: a stuck one mustn't hold up the ticker.
- * Short, since the summary is the saved memory: no model is called.
- */
+/** A stuck compaction mustn't hold up the ticker. Short: the summary is the saved memory, no model call. */
 const COMPACTION_MAX_MS = 30_000
-/** A compaction before a run: the summary to give it (the saved memory), and what to call when it ends. */
 type Compaction = { summary: string; ended: () => void }
 /**
- * Runs and compactions in progress in this process, by session, across every instance of the plugin. opencode
- * sets the plugin up once per directory it serves, and a session's tool calls and hooks can go through an
- * instance other than the one that started its run. That one owns the run (its events, its end); the others
- * only look it up, so a run's tools and guidance work whichever instance serves its session.
+ * Runs and compactions in progress, shared by every instance of the plugin in the process: opencode sets one up
+ * per directory, and a session's tools and hooks may go through an instance other than the one that owns its run.
  */
 type Shared = { running: Map<string, Running>; compactions: Map<string, Compaction> }
 const SHARED: unique symbol = Symbol.for("OpencodeAutomations-Running")
@@ -57,9 +48,8 @@ export default Plugin.define({
     const defaultTimeout = checkTimeout(opts.defaultTimeoutMinutes) ?? DEFAULT_TIMEOUT_MINUTES
     const dataDir = opts.dataDir ?? defaultDataDir()
     const store = new Store(dataDir)
-    // Only the leader sends; elsewhere, what is added waits for the leader's next tick.
     const outbox = new Outbox(store, opts.outbox, () => leader)
-    const running = new Owned<Running>(shared.running) // sessionID -> run started here
+    const running = new Owned<Running>(shared.running)
     const abort = new AbortController()
     let leader = false
 
@@ -71,10 +61,7 @@ export default Plugin.define({
       if (configChannels.has(ch.id)) throw new Error(`[automations] channel ids must be unique ("${ch.id}")`)
       configChannels.set(ch.id, ch)
     }
-    /**
-     * What the config channels look like (no headers or body, so no secrets), for the TUI. Only the leader
-     * publishes it, since it is the one that polls: another process with other config mustn't overwrite it.
-     */
+    /** Config channels without secrets, for the TUI. Only the leader publishes them: another process's config may differ. */
     let published = false
     async function publishConfig() {
       if (published) return
@@ -85,10 +72,7 @@ export default Plugin.define({
       } catch (e) { log.error({ err: e }, "channel state can't be read or saved") }
     }
 
-    /**
-     * Config channels plus those created with channel_create, read from disk each time so a channel
-     * created in another process is polled by the leader on its next tick. Config wins on an ID clash.
-     */
+    /** Config channels plus created ones (re-read, so another process's are seen). Config wins on a clash. */
     function allChannels(defs = store.loadChannels().defs): Map<string, Channel> {
       const all = new Map(configChannels)
       for (const [id, def] of Object.entries(defs)) {
@@ -142,7 +126,7 @@ export default Plugin.define({
       }
     })
 
-    /** Disk is the source of truth (other processes may write); re-apply config definitions. */
+    /** Saved jobs with the config definitions re-applied. */
     function load(disk = store.loadJobs()): Job[] {
       const byID = new Map(disk.filter((j) => j.source === "tool").map((j) => [j.id, j]))
       for (const def of configJobs) {
@@ -162,16 +146,11 @@ export default Plugin.define({
       return [...byID.values()]
     }
 
-    /** Each channel's latest poll: what a new subscription to it takes. */
     const lastOkAt = (sources = store.loadChannels().sources) => Object.fromEntries(Object.entries(sources).map(([id, s]) => [id, s.lastOkAt]))
-    /** What subscriptions depend on: which automations take events, from which channels. */
     const subscribers = (jobs: Job[]) =>
       JSON.stringify(jobs.map((j) => [j.id, j.enabled && !j.done, j.on?.channels ?? []]).sort())
 
-    /**
-     * Change jobs in one transaction (`fn` must be synchronous). When that changes who takes which channel's
-     * events (or a config job appears), the inbox subscriptions follow.
-     */
+    /** Change jobs in one transaction; `fn` must be synchronous. Subscriptions follow channel changes. */
     function mutate<T>(fn: (jobs: Job[]) => T): Promise<T> {
       return store.mutate((jobs) => {
         const before = subscribers(jobs)
@@ -204,13 +183,9 @@ export default Plugin.define({
       return s.id
     }
 
-    /** Keys of this job's runs in progress, whose sessions mustn't be evicted. */
     const keysRunning = (jobID: string) => [...running.values()].filter((f) => f.job.id === jobID && f.key !== undefined).map((f) => f.key!)
 
-    /**
-     * The session a run goes to, and whether it was just made. `sticky`: the saved one for the key (""
-     * without one) if it still exists, else a new one that is saved. `current`: the chat it was made from.
-     */
+    /** The session a run goes to, and whether it was just made. */
     async function sessionFor(job: Job, key: string | undefined, title: string): Promise<{ id: string; fresh: boolean; warmUntil?: number }> {
       if (job.session === "current") {
         const id = await alive(job.sessionID)
@@ -236,15 +211,14 @@ export default Plugin.define({
         ...f.run, status, endedAt: Date.now(), error,
         ...(f.sent ? { notifications: f.sent } : {}),
       }
-      // The run is done in memory already (above, synchronously, so a second end event can't finish it twice);
-      // what's saved follows (tracked, so shutdown waits for it).
+      // Removed from `running` synchronously above, so a second end event can't finish it twice.
       void track((async () => {
         try {
           store.appendRun(run)
           if (f.job.session === "sticky") {
             const key = f.key ?? ""
             store.touchSession(f.job.id, key, sessionID, run.endedAt!, f.cacheMs !== undefined ? run.endedAt! + f.cacheMs * WARM_SHARE : undefined)
-            // A cold session is compacted to the memory: one this run didn't write would drop what it found.
+            // A stale note would be the next compaction's summary and drop what this run found.
             if (!f.memoryUpdated) store.setNote(f.job.id, key, undefined)
           }
         } catch (e) { log.error({ job: run.jobID, err: e }, "couldn't save the run's end") }
@@ -254,7 +228,7 @@ export default Plugin.define({
       })())
     }
 
-    /** A turn ended: finish the run, unless it may notify, sent nothing and didn't say why (then ask once). */
+    /** A turn ended: finish the run, or ask once if it neither notified nor saved its memory. */
     function ended(sessionID: string) {
       const f = running.get(sessionID)
       if (!f) return
@@ -277,7 +251,6 @@ export default Plugin.define({
       })
     }
 
-    /** The automatic notice for a run's outcome, if it gets one. */
     function notice(job: Job, run: Run) {
       if (!outbox.noticeFor(job, run.status)) return
       try { outbox.add(compose(job, run), { job: job.id, run: run.runID }) } catch (e) { log.error({ job: job.id, err: e }, "couldn't write a notice to the outbox") }
@@ -285,20 +258,12 @@ export default Plugin.define({
 
     const isRunning = (jobID: string, key?: string) =>
       [...running.values()].some((f) => f.run.jobID === jobID && f.key === key)
-    /**
-     * Runs being started right now, by job and session key: picking the session and compacting it take a
-     * while. Reserved before the first await, so a second start (an overlapping tick, a manual run or poll)
-     * can't take the same events or run in the same session. Only the leader starts runs, so this is enough.
-     */
+    /** Starts in progress, by job and key, reserved before the first await so two can't share a session. */
     const pendingStarts = new Set<string>()
     const slotOf = (jobID: string, key?: string) => `${jobID}\u0000${key ?? ""}`
     const busy = (jobID: string, key?: string) => pendingStarts.has(slotOf(jobID, key)) || isRunning(jobID, key)
 
-    /**
-     * Run a job; returns its run, or why none started. A channel job takes its waiting events: with session
-     * keys, several runs may start, and chunks whose session is busy keep waiting. A scheduled digest with
-     * nothing waiting doesn't run; a manual run then runs anyway and says there were no new events.
-     */
+    /** Run a job; returns its run, or why none started. A manual run with nothing waiting runs anyway. */
     async function runAutomation(job: Job, reason: Reason, channels?: Map<string, Channel>): Promise<Run | string> {
       if (!job.on) return startSession(job, reason, { text: job.prompt })
       const { runs, why } = await processEvents(job, reason, channels ?? allChannels())
@@ -321,7 +286,6 @@ export default Plugin.define({
       if (!waiting.length) return { runs: [], why: NOTHING_WAITING }
       const names = channelNames(job.on!.channels, channels)
       const max = job.maxEvents ?? (job.schedule.kind === "event" ? 10 : 50)
-      // `sticky` with channels that set session keys: one session per key (per channel).
       const byKey = job.session === "sticky" && subscribed.some((c) => !!c.event.sessionKey)
       const runs: Run[] = []
       let why: string | undefined
@@ -339,18 +303,14 @@ export default Plugin.define({
       return { runs, why: runs.length ? undefined : why }
     }
 
-    /**
-     * Hand one chunk of events to a run; returns the run, or why it didn't start. The events are marked as
-     * taken before the prompt is sent, so a crash can't deliver them twice. If the run doesn't start, they go
-     * back: always when skipped, up to MAX_START_ATTEMPTS when the start failed.
-     */
+    /** Hand one chunk of events to a run. Taken before the prompt is sent; given back if the run doesn't start. */
     async function startChunk(job: Job, reason: Reason, key: string | undefined, events: InboxEvent[], names: Record<string, string>): Promise<Run | string> {
       let got: Set<number>
       try { got = store.take(job.id, events.map((e) => e.seq)) } catch (e) {
         log.warn({ job: job.id, err: e }, "couldn't hand over events, will retry")
         return "the events couldn't be handed over; they're retried on the next tick"
       }
-      // Only the leader starts runs, but a leader that lost its lease mid-tick may have taken some.
+      // A leader that lost its lease mid-tick may have taken some.
       events = events.filter((e) => got.has(e.seq))
       if (!events.length) return "another process already took these events"
       const seqs = events.map((e) => e.seq)
@@ -367,17 +327,9 @@ export default Plugin.define({
       return run
     }
 
-    /**
-     * Sessions being compacted before a run: the summary its compaction takes (the saved memory), and
-     * what to call once the compaction's end event comes through.
-     */
     const compactions = new Owned<Compaction>(shared.compactions)
 
-    /**
-     * Start a run: pick the session, record it, send the prompt, and arm the timeout. A fresh session gets
-     * the previous run's memory ahead of the prompt; a cold sticky one is compacted to it.
-     * `held`: the caller reserved the job's slot in pendingStarts already.
-     */
+    /** Start a run. `held`: the caller already reserved the slot in pendingStarts. */
     async function startSession(
       job: Job,
       reason: Reason,
@@ -387,7 +339,6 @@ export default Plugin.define({
       const base: Run = { jobID: job.id, runID, startedAt: Date.now(), status: "running" }
       const skipped = (error: string): Run => ({ ...base, status: "skipped", endedAt: Date.now(), error })
 
-      // Shutting down: nothing would track the run, and another process may take over.
       if (abort.signal.aborted) return skipped("plugin stopping")
       const slot = slotOf(job.id, how.key)
       if (how.held ? isRunning(job.id, how.key) : busy(job.id, how.key)) {
@@ -395,7 +346,6 @@ export default Plugin.define({
         store.appendRun(run)
         return run
       }
-      // Held until the run is tracked: a manual run and a scheduled one mustn't both start in one session.
       if (!how.held) pendingStarts.add(slot)
       try {
         const key = how.key ?? ""
@@ -406,11 +356,9 @@ export default Plugin.define({
         // Compact before tracking the run, so the compaction's events aren't taken for the run's.
         const cold = job.session === "sticky" && !fresh && Date.now() >= (warmUntil ?? 0)
         if (cold && note) {
-          // Given up on but still queued ahead of the run: it keeps its entry, so it still gets its summary
-          // and its end event, which comes before the run's, isn't taken for the run's.
+          // Given up on but still queued: it keeps its entry, so its late end event isn't taken for the run's.
           let queued = false
           try {
-            // Its end event can come through after compact() and wait() return; tracked by then, it would end the run.
             const ended = new Promise<void>((r) => compactions.set(sessionID, { summary: note, ended: r }))
             const done = await within((async () => {
               await ctx.session.compact({ sessionID, delivery: "queue" })
@@ -425,7 +373,6 @@ export default Plugin.define({
             log.warn({ job: job.id, session: sessionID, err: e }, "couldn't compact the session; the run goes on with its whole history")
           } finally { if (!queued) compactions.delete(sessionID) }
         }
-        // Stopped while it was being prepared: nothing was sent, so the events it took wait again in the inbox.
         if (abort.signal.aborted) return skipped("plugin stopping")
         const run: Run = { ...base, sessionID }
         const entry: Running = { job, run, sent: 0, key: how.key }
@@ -441,7 +388,6 @@ export default Plugin.define({
         await ctx.session.prompt({
           sessionID,
           text,
-          // Don't barge into a session that's mid-turn; wait our turn.
           delivery: job.session === "new" ? null : "queue",
           metadata: {
             automation: {
@@ -466,7 +412,6 @@ export default Plugin.define({
     let ticking = false
     let trimmedAt = 0
     async function tick() {
-      // A slow tick (polls wait up to 20 s each) mustn't overlap the next one.
       if (abort.signal.aborted || ticking) return
       ticking = true
       try { await tickOnce() } finally { ticking = false }
@@ -486,10 +431,9 @@ export default Plugin.define({
             due.push([{ ...job }, "manual"])
             continue
           }
-          if (job.schedule.kind === "event" || !isActive(job)) continue // event jobs run from tickChannels
+          if (job.schedule.kind === "event" || !isActive(job)) continue
           if (job.nextRunAt === undefined) {
             job.nextRunAt = nextRun(job.schedule, now, job.createdAt)
-            // Nothing left to run (a one-shot whose time passed before it was ever scheduled): done, not "active".
             if (job.nextRunAt === undefined) job.done = true
             continue
           }
@@ -501,20 +445,18 @@ export default Plugin.define({
           if (job.nextRunAt === undefined) job.done = true
         }
       })
-      // Channels, read once for the tick. Unreadable channel state stops the channels, not the automations
-      // that only have a schedule.
+      // Unreadable channel state stops the channels, not the scheduled automations.
       let state: ChannelsState | undefined
       let channels: Map<string, Channel> | undefined
       try {
         state = store.loadChannels()
         channels = allChannels(state.defs)
       } catch (e) { log.error({ err: e }, "channel state can't be read or saved") }
-      // The due jobs' next runs are saved already: one that throws mustn't take the others with it.
       for (const [job, reason] of due) {
         try { await runAutomation(job, reason, channels) } catch (e) { log.error({ job: job.id, err: e }, "run couldn't be started") }
       }
       if (state && channels) {
-        // Also catches changes that didn't go through mutate() here (the TUI's, another process's).
+        // Catches changes made outside mutate() here (the TUI's).
         try { store.subscribe(load(), lastOkAt(state.sources)) } catch (e) { log.error({ err: e }, "couldn't update the inbox subscriptions") }
         try { await tickChannels(now, state.sources, channels) } catch (e) { log.error({ err: e }, "channel state can't be read or saved") }
       }
@@ -522,29 +464,24 @@ export default Plugin.define({
         trimmedAt = now
         try { store.trim(lastOkAt(state?.sources)) } catch (e) { log.warn({ err: e }, "couldn't trim the state") }
       }
-      // Retries that came due.
       outbox.kick()
     }
 
     // ---------- channel polling ----------
 
     const polling = new Set<string>()
-    /** Ticks and polls in progress; teardown waits for them. */
+    /** Work teardown waits for. */
     const work = new Set<Promise<unknown>>()
     function track<T>(p: Promise<T>): Promise<T> {
       work.add(p)
       void p.finally(() => work.delete(p)).catch(() => {})
       return p
     }
-    /** Active automations on a channel. */
     const listeners = (channelID: string, jobs = load()) => jobs.filter((j) => listens(j, channelID) && isActive(j))
 
     type Polled = { ch: Channel; events?: ChannelEvent[]; error?: string }
 
-    /**
-     * Poll channels in parallel (one slow API doesn't hold up the others) and save all the results in one
-     * transaction: their events go to the inbox. Returns each channel's result.
-     */
+    /** Poll channels in parallel, then write all their events to the inbox in one transaction. */
     async function pollChannels(list: Channel[], jobs = load()): Promise<Map<string, PollResult>> {
       const results = new Map<string, PollResult>()
       if (!list.length) return results
@@ -580,7 +517,7 @@ export default Plugin.define({
             }
           })
         } catch (e) {
-          // The APIs answered; only saving failed (the database stayed busy). Not failed polls: the next ones catch up.
+          // Only saving failed, not the polls: the next ones catch up.
           const error = `couldn't save the poll: ${errorMessage(e)}`
           log.warn({ channels: polled.map((p) => p.ch.id), err: e }, "couldn't save the poll")
           for (const p of polled) results.set(p.ch.id, { fresh: 0, error: p.error ?? error })
@@ -597,7 +534,7 @@ export default Plugin.define({
       } finally { for (const ch of list) polling.delete(ch.id) }
     }
 
-    /** Start runs for the automations that take events as they arrive (on `channelID`, or on any channel). */
+    /** Start runs for the automations without a schedule. */
     async function processArrivals(jobs = load(), channelID?: string, channels = allChannels()): Promise<number> {
       let started = 0
       for (const job of jobs) {
@@ -613,7 +550,7 @@ export default Plugin.define({
         const src = sources[ch.id]
         const requested = src?.pollRequestedAt !== undefined
         if (polling.has(ch.id) || (!requested && !listeners(ch.id, jobs).length)) return false
-        // Half a tick of slack keeps polls close to `every` instead of drifting a whole tick late.
+        // Half a tick of slack, so polls don't drift a whole tick late.
         return requested || !src?.lastPollAt || now - src.lastPollAt >= ch.everyMs - tickMs / 2
       })
       await pollChannels(due, jobs)
@@ -644,14 +581,14 @@ export default Plugin.define({
               case "session.execution.failed":
                 finish(sid, "failed", JSON.stringify(ev.data.error))
                 break
-              case "session.execution.interrupted": // stopped by the user; a timeout finishes the run before it interrupts
+              case "session.execution.interrupted": // by the user: a timeout finishes the run first
                 finish(sid, "failed", "interrupted")
                 break
-              case "session.execution.succeeded": // V2 execution completed
+              case "session.execution.succeeded":
                 running.get(sid)!.v2 = true
                 ended(sid)
                 break
-              case "session.idle": // compatibility with hosts emitting legacy idle
+              case "session.idle": // legacy hosts
                 if (!running.get(sid)!.v2) ended(sid)
                 break
             }
@@ -727,9 +664,8 @@ export default Plugin.define({
     return async () => {
       abort.abort()
       clearInterval(ticker)
-      // Let in-flight ticks and polls (aborted above) settle before another process can take the lease.
       await Promise.allSettled([...work])
-      // Nothing tracks these runs any more: close their records, or they'd show as running forever.
+      // Close their records, or they'd show as running forever.
       const open = [...running.values()]
       running.clear()
       for (const f of open) {

@@ -1,6 +1,4 @@
-// All state, in one SQLite database (bun:sqlite, built into Bun: no dependency, no build step).
-// Definitions and small records are JSON documents (jobs, channels, poll status, runs); what is queried by
-// field gets columns: the inbox, what each automation took from it, sticky sessions, memory and the outbox.
+// All state, in one SQLite database. Small records are JSON documents; what is queried by field gets columns.
 
 import { Database } from "bun:sqlite"
 import { mkdirSync } from "node:fs"
@@ -10,10 +8,7 @@ import type { Schedule } from "./cron.ts"
 import type { JobNotify, Priority } from "./outbox.ts"
 import type { ChannelEvent, ChannelsState } from "./channels.ts"
 
-/**
- * `sticky`: runs keep going to the same session. With a channel that sets `event.sessionKey`,
- * one sticky session per session key.
- */
+/** `sticky`: runs share one session, or one per `event.sessionKey`. */
 export type SessionMode = "new" | "sticky" | "current"
 export type RunStatus = "running" | "succeeded" | "failed" | "timeout" | "skipped"
 export interface Job {
@@ -34,7 +29,7 @@ export interface Job {
   done?: boolean
   runRequestedAt?: number
   notify?: JobNotify
-  /** Takes these channels' events from the inbox: as they arrive (schedule kind "event") or on the schedule, as a digest. */
+  /** Channels whose events it takes: as they arrive (no schedule) or as a digest. */
   on?: { channels: string[] }
   /** Most events in one run. Default 10, or 50 for a digest. */
   maxEvents?: number
@@ -51,13 +46,12 @@ export interface Run {
   startedAt: number
   endedAt?: number
   status: RunStatus
-  /** Why it failed, timed out or was skipped. What the run said isn't kept here: it is in its session. */
+  /** Why it failed, timed out or was skipped. */
   error?: string
   /** automation_notify calls the agent made. */
   notifications?: number
 }
 
-/** An inbox event, with its place in the inbox. */
 export type InboxEvent = ChannelEvent & { seq: number }
 
 interface StickySession { id: string; usedAt: number; warmUntil?: number }
@@ -74,17 +68,12 @@ export interface OutboxMessage {
   urlTitle?: string
 }
 export type SendStatus = "pending" | "sent" | "failed"
-/** An outbox message with each sender's status. */
 export type SentMessage = OutboxMessage & { sends: Array<{ sender: string; status: SendStatus; error?: string }> }
 
-/** How long inbox events are kept once their item is gone from the channel. */
 const INBOX_RETENTION_MS = 7 * 24 * 60 * 60_000
 const OUTBOX_RETENTION_MS = 30 * 24 * 60 * 60_000
-/** Starts that may fail for an event before it is dropped (each failure is recorded and notified). */
 export const MAX_START_ATTEMPTS = 3
-/** Most events looked at for one automation at once; the rest wait for the next pass. */
 const MAX_WAITING = 500
-/** Most sticky sessions one automation keeps (one per session key); the least recently used go. */
 export const MAX_SESSIONS = 200
 
 const SCHEMA = 1
@@ -119,7 +108,6 @@ CREATE TABLE IF NOT EXISTS sends (
 CREATE INDEX IF NOT EXISTS sends_due ON sends (next_at) WHERE status = 'pending';
 CREATE TABLE IF NOT EXISTS lease (name TEXT PRIMARY KEY, holder TEXT NOT NULL, until INTEGER NOT NULL);
 `
-/** Tables that hold rows per automation, cleared once it is gone. */
 const PER_JOB = ["subscriptions", "deliveries", "sessions", "memory"]
 
 type Row = Record<string, string | number | null>
@@ -127,35 +115,31 @@ type Value = string | number | null
 
 export class Store {
   readonly db: Database
-  /** Who holds the lease: this store, not this process (the plugin is set up once per directory it serves). */
+  /** Per store, not per process: the plugin is set up once per directory. */
   private readonly holder = randomUUID()
 
-  /** `busyMs`: how long a write waits for another process's (the TUI waits less, so it never feels stuck). */
+  /** `busyMs`: how long a write waits for another process's. */
   constructor(dataDir: string, { busyMs = 2000 }: { busyMs?: number } = {}) {
     mkdirSync(dataDir, { recursive: true, mode: 0o700 })
     const path = join(dataDir, "state.db")
     this.db = new Database(path)
-    // WAL lets the TUI and the other instances read while one process writes; NORMAL is its usual pairing.
     this.db.exec(`PRAGMA busy_timeout = ${Math.floor(busyMs)}; PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;`)
     const version = this.get<{ user_version: number }>("PRAGMA user_version")!.user_version
     if (version > SCHEMA) throw new Error(`[automations] ${path} is from a newer version of the plugin`)
     if (version < SCHEMA) this.tx(() => { this.db.exec(TABLES); this.db.exec(`PRAGMA user_version = ${SCHEMA}`) })
   }
 
-  // Statements are cached by their text (db.query), so the ones run on every tick are compiled once.
+  // db.query caches statements by text.
   private run(sql: string, ...params: Value[]) { return this.db.query(sql).run(...params) }
   private get<T>(sql: string, ...params: Value[]) { return this.db.query(sql).get(...params) as T | null }
   private all<T>(sql: string, ...params: Value[]) { return this.db.query(sql).all(...params) as T[] }
 
-  /**
-   * Run `fn` in a write transaction (nested calls join it). `fn` must be synchronous and quick: a writer in
-   * another process waits for it, blocking its event loop meanwhile.
-   */
+  /** A write transaction (nested calls join it). Keep `fn` synchronous and quick: other writers block meanwhile. */
   tx<T>(fn: () => T): T {
     return this.db.transaction(fn).immediate()
   }
 
-  /** Changes when another connection commits: the TUI polls it to know when to re-read. */
+  /** Changes when another connection commits. */
   version(): number {
     return this.get<{ data_version: number }>("PRAGMA data_version")!.data_version
   }
@@ -171,12 +155,12 @@ export class Store {
     return new Map(this.all<{ id: string; data: string }>(`SELECT id, data FROM ${table} ORDER BY rowid`).map((r) => [r.id, JSON.parse(r.data) as T]))
   }
 
-  /** Make a table hold exactly these documents. Unchanged ones aren't written, so a no-op write wakes nobody. */
+  /** Make a table hold exactly these documents, writing only what changed. */
   private sync(table: string, docs: Map<string, unknown>): void {
     const saved = new Map(this.all<{ id: string; data: string }>(`SELECT id, data FROM ${table}`).map((r) => [r.id, r.data]))
     for (const [id, doc] of docs) {
       const data = JSON.stringify(doc)
-      // An upsert keeps the row (and its place in the order); INSERT OR REPLACE would move it to the end.
+      // An upsert keeps the row's place in the order.
       if (saved.get(id) !== data) this.run(`INSERT INTO ${table} (id, data) VALUES (?, ?) ON CONFLICT (id) DO UPDATE SET data = excluded.data`, id, data)
     }
     for (const id of saved.keys()) if (!docs.has(id)) this.run(`DELETE FROM ${table} WHERE id = ?`, id)
@@ -190,10 +174,7 @@ export class Store {
     this.tx(() => this.sync("jobs", new Map(jobs.map((j) => [j.id, j]))))
   }
 
-  /**
-   * Change jobs in one transaction. `fn` must be synchronous (see tx). What a deleted job took from the
-   * inbox, its sessions and its memory go with it: a new job with the same id starts clean.
-   */
+  /** Change jobs in one transaction (`fn` synchronous). A deleted job's state goes with it. */
   async mutate<T>(fn: (jobs: Job[]) => T): Promise<T> {
     return this.tx(() => {
       const jobs = this.loadJobs()
@@ -226,7 +207,7 @@ export class Store {
     })
   }
 
-  /** Change channel definitions and poll state in one transaction. `fn` must be synchronous (see tx). */
+  /** Change channel definitions and poll state in one transaction (`fn` synchronous). */
   async mutateChannels<T>(fn: (state: ChannelsState) => T): Promise<T> {
     return this.tx(() => {
       const state = this.loadChannels()
@@ -236,20 +217,18 @@ export class Store {
     })
   }
 
-  /** Delete a channel created from chat: its poll state, its events, and the sessions and memory of its keys. */
+  /** Delete a created channel with its poll state, events, and its keys' sessions and memory. */
   removeChannel(id: string): void {
     this.tx(() => {
       for (const table of ["channel_defs", "sources"]) this.run(`DELETE FROM ${table} WHERE id = ?`, id)
       this.run("DELETE FROM subscriptions WHERE channel = ?", id)
       this.run("DELETE FROM inbox WHERE channel = ?", id)
-      // Session keys are "channel:key".
       for (const table of ["sessions", "memory"]) this.run(`DELETE FROM ${table} WHERE substr(key, 1, length(?) + 1) = ? || ':'`, id, id)
     })
   }
 
   // ---------- runs ----------
 
-  /** Record a run; a later record of the same run replaces it. */
   appendRun(run: Run): void {
     this.run("INSERT OR REPLACE INTO runs (id, job, started_at, data) VALUES (?, ?, ?, ?)", run.runID, run.jobID, run.startedAt, JSON.stringify(run))
   }
@@ -264,10 +243,7 @@ export class Store {
 
   // ---------- inbox ----------
 
-  /**
-   * Write a poll's events to the inbox and return how many are new. Every event of the poll is marked as seen
-   * at `at`: an item still there isn't dropped by retention, and a new subscriber gets it (see subscribe).
-   */
+  /** Write a poll's events to the inbox; returns how many are new. All are marked as seen at `at`. */
   ingest(channel: string, events: ChannelEvent[], at: number): number {
     return this.tx(() => {
       let fresh = 0
@@ -282,9 +258,8 @@ export class Store {
   }
 
   /**
-   * Make each automation's subscriptions match its channels. A new subscription takes what the channel's
-   * latest poll returned (`lastOkAt`: what is alerting right now), and everything after. A paused automation
-   * keeps its subscription, so its events wait; a disabled or finished one doesn't.
+   * Match subscriptions to the jobs' channels. A new one takes the channel's latest poll (`lastOkAt`) and
+   * everything after. Paused jobs keep theirs; disabled and finished ones don't.
    */
   subscribe(jobs: Job[], lastOkAt: Record<string, number | undefined>): void {
     this.tx(() => {
@@ -301,7 +276,6 @@ export class Store {
       for (const s of this.all<{ job: string; channel: string }>("SELECT job, channel FROM subscriptions")) {
         if (wanted.has(`${s.job}\u0000${s.channel}`)) continue
         this.run("DELETE FROM subscriptions WHERE job = ? AND channel = ?", s.job, s.channel)
-        // The sticky sessions and memory of that channel's keys ("channel:key") go with it.
         for (const table of ["sessions", "memory"]) {
           this.run(`DELETE FROM ${table} WHERE job = ? AND substr(key, 1, length(?) + 1) = ? || ':'`, s.job, s.channel, s.channel)
         }
@@ -309,7 +283,7 @@ export class Store {
     })
   }
 
-  /** Inbox events waiting for an automation, oldest first: on its channels, not taken yet or to be retried. */
+  /** Events waiting for an automation, oldest first. */
   waiting(jobID: string, limit = MAX_WAITING): InboxEvent[] {
     return this.all<Row>(
       "SELECT i.seq, i.channel, i.id, i.key, i.title, i.body, i.url FROM subscriptions s " +
@@ -328,7 +302,7 @@ export class Store {
     }))
   }
 
-  /** How many events wait for each automation, per channel. */
+  /** Waiting events per automation and channel. */
   waitingCounts(): Map<string, Map<string, number>> {
     const rows = this.all<{ job: string; channel: string; n: number }>(
       "SELECT s.job, s.channel, COUNT(*) AS n FROM subscriptions s " +
@@ -343,19 +317,16 @@ export class Store {
     return out
   }
 
-  /** Mark events as handed to a run, and return the ones it got: those not taken meanwhile by someone else. */
+  /** Mark events as taken; returns the ones that were still free. */
   take(jobID: string, seqs: number[]): Set<number> {
-    // `WHERE true`: SQLite needs it to tell an upsert's ON CONFLICT from a join's ON after a SELECT.
+    // `WHERE true` disambiguates an upsert after a SELECT.
     const rows = this.all<{ seq: number }>(
       "INSERT INTO deliveries (job, seq, status) SELECT ?, value, 'taken' FROM json_each(?) WHERE true " +
       "ON CONFLICT (job, seq) DO UPDATE SET status = 'taken' WHERE deliveries.status = 'retry' RETURNING seq", jobID, JSON.stringify(seqs))
     return new Set(rows.map((r) => r.seq))
   }
 
-  /**
-   * Events whose run didn't start. Skipped: they wait again. Failed: they are retried, up to
-   * MAX_START_ATTEMPTS, then dropped.
-   */
+  /** Events whose run didn't start wait again; failed ones are dropped after MAX_START_ATTEMPTS. */
   giveBack(jobID: string, seqs: number[], failed: boolean): void {
     const these = "job = ? AND seq IN (SELECT value FROM json_each(?))"
     if (!failed) this.run(`UPDATE deliveries SET status = 'retry' WHERE ${these}`, jobID, JSON.stringify(seqs))
@@ -366,14 +337,9 @@ export class Store {
     }
   }
 
-  /**
-   * Housekeeping: drop old events whose item is gone from its channel (`lastOkAt`: each channel's latest poll)
-   * and that every automation on it has taken, old outbox messages, and what automations that are gone left
-   * behind (one removed from config, say).
-   */
+  /** Drop old events nobody still has to take, old outbox messages, and state of jobs that are gone. */
   trim(lastOkAt: Record<string, number | undefined>, now = Date.now()): void {
     this.tx(() => {
-      // Never one an automation on the channel still has to take: a paused one, or a digest that runs monthly.
       for (const c of this.all<{ channel: string }>("SELECT DISTINCT channel FROM inbox")) {
         this.run(
           "DELETE FROM inbox WHERE channel = ? AND at < ? AND seen_at < ? AND NOT EXISTS (" +
@@ -394,10 +360,7 @@ export class Store {
     return { id: r.session_id as string, usedAt: r.used_at as number, ...(r.warm_until !== null ? { warmUntil: r.warm_until as number } : {}) }
   }
 
-  /**
-   * Set an automation's session for a key. Past MAX_SESSIONS keys, the least recently used go with their
-   * memory, except `keep` (keys with a run in progress) and `key` itself.
-   */
+  /** Set a key's session. Past MAX_SESSIONS, the least recently used go, except `keep` and `key`. */
   setSession(jobID: string, key: string, sessionID: string, now = Date.now(), keep: Iterable<string> = []): void {
     this.tx(() => {
       this.run("INSERT OR REPLACE INTO sessions (job, key, session_id, used_at) VALUES (?, ?, ?, ?)", jobID, key, sessionID, now)
@@ -412,7 +375,7 @@ export class Store {
     })
   }
 
-  /** A run in a sticky session ended: it counts as used now, and is warm until `warmUntil` if given. */
+  /** A run in the session ended. */
   touchSession(jobID: string, key: string, sessionID: string, now: number, warmUntil?: number): void {
     this.run(
       "UPDATE sessions SET used_at = ?, warm_until = COALESCE(?, warm_until) WHERE job = ? AND key = ? AND session_id = ?",
@@ -430,7 +393,6 @@ export class Store {
 
   // ---------- outbox ----------
 
-  /** Add a message to the outbox, to be sent through each of `senders`. */
   enqueue(m: Omit<OutboxMessage, "id" | "at">, senders: string[], now = Date.now()): number {
     return this.tx(() => {
       const { id } = this.get<{ id: number }>(
@@ -441,7 +403,6 @@ export class Store {
     })
   }
 
-  /** Sends due now, oldest first. */
   due(now = Date.now()): Array<{ message: OutboxMessage; sender: string; attempts: number }> {
     return this.all<Row>(
       "SELECT o.*, s.sender, s.attempts FROM sends s JOIN outbox o ON o.id = s.message " +
@@ -449,13 +410,11 @@ export class Store {
     ).map((r) => ({ message: message(r), sender: r.sender as string, attempts: r.attempts as number }))
   }
 
-  /** Record a send's outcome. Still pending: tried again at `nextAt`. */
   updateSend(messageID: number, sender: string, status: SendStatus, attempts: number, nextAt: number, error?: string): void {
     this.run("UPDATE sends SET status = ?, attempts = ?, next_at = ?, error = ? WHERE message = ? AND sender = ?",
       status, attempts, nextAt, error ?? null, messageID, sender)
   }
 
-  /** The latest messages, newest first, with each sender's status. */
   sent(jobID?: string, limit = 10): SentMessage[] {
     const rows = this.all<Row>(
       "SELECT o.*, s.sender, s.status, s.error FROM (SELECT * FROM outbox WHERE ?1 IS NULL OR job = ?1 ORDER BY id DESC LIMIT ?2) o " +
@@ -471,10 +430,7 @@ export class Store {
 
   // ---------- leader lease ----------
 
-  /**
-   * Take or renew the leader lease; true if this store holds it. Renewed only once half of it is used, so a
-   * tick doesn't write (and wake the TUI) every time.
-   */
+  /** Take or renew the leader lease. Renewed only past half its time, so most ticks don't write. */
   lease(ttl: number, now = Date.now()): boolean {
     const r = this.get<{ holder: string; until: number }>("SELECT holder, until FROM lease WHERE name = 'leader'")
     if (r?.holder === this.holder && r.until - now > ttl / 2) return true
