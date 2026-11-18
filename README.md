@@ -87,18 +87,18 @@ Cron schedules follow daylight-saving changes in their timezone. If opencode was
 
 ## Notifications
 
-Everything the plugin tells you goes through an **outbox**. The agent running an automation writes a message (a title, a short plain-text body, and how urgent it is), and the plugin delivers it to every **sender** you configured: your desktop or your phone through Pushover. The agent never picks a destination. You set them up once, under `outbox.senders` in the plugin options (see [Configuration](#configuration)):
+Everything the plugin tells you goes through an **outbox**. The agent running an automation writes a message (a title, a short plain-text body, and how urgent it is), and the plugin delivers it to every **destination** you configured: your desktop or your phone through Pushover. The agent never picks a destination. You set them up once, under `outbox.destinations` in the plugin options (see [Configuration](#configuration)):
 
 ```jsonc
 "outbox": {
-  "senders": [
+  "destinations": [
     { "id": "desktop", "type": "native" },
     { "id": "phone", "type": "pushover", "token": "{env:PUSHOVER_TOKEN}", "user": "{env:PUSHOVER_USER}", "minPriority": "normal" }
   ]
 }
 ```
 
-- `minPriority` (`low`, `normal` or `high`) keeps a sender for what matters: with `"high"`, your phone only buzzes for things that need action soon.
+- `minPriority` (`low`, `normal` or `high`) keeps a destination for what matters: with `"high"`, your phone only buzzes for things that need action soon.
 - Settings can reference environment variables as `{env:NAME}`, so tokens stay out of the file.
 - A delivery that fails (Pushover down, no network) is retried after 1, 5 and 30 minutes, then logged and given up on.
 
@@ -169,7 +169,7 @@ Automations created from chat or the dialog need no configuration at all. The op
         "defaultTimeoutMinutes": 30,
         "defaultModel": "anthropic/claude-sonnet-4-5",
         "outbox": {
-          "senders": [
+          "destinations": [
             { "id": "desktop", "type": "native" },
             { "id": "phone", "type": "pushover", "token": "{env:PUSHOVER_TOKEN}", "user": "{env:PUSHOVER_USER}" }
           ]
@@ -199,7 +199,7 @@ Configuration reloads on save. Run `/reload` if opencode is already open. `examp
 | `defaultModel` | the agent's | `provider/model`, applied when a run's session is created |
 | `defaultAgent` | | Agent for runs that don't name one |
 | `tickSeconds` | 30 | How often the plugin checks schedules and polls channels |
-| `outbox` | | `senders` (see [Notifications](#notifications)), `on` (outcomes that get an automatic notice, default `["failed", "timeout"]`), `maxPerRun` (default 5) |
+| `outbox` | | `destinations` (see [Notifications](#notifications)), `on` (outcomes that get an automatic notice, default `["failed", "timeout"]`), `maxPerRun` (default 5) |
 | `jobs` | | Automations defined in config (below) |
 | `channels` | | Channels defined in config; see `examples/opencode.jsonc` |
 | `dataDir` | see below | Where automations and history are stored |
@@ -230,11 +230,11 @@ Everything is in one SQLite database, `state.db`, in `~/.local/share/opencode/pl
 - `channel_defs`, `sources`: channels created from chat, and each channel's poll status
 - `inbox`, `subscriptions`, `deliveries`: the events channels brought in, and which automation took which
 - `sessions`, `memory`: sticky sessions and each automation's memory
-- `outbox`, `sends`: what was sent to you, and its delivery status per sender
+- `outbox`, `sends`: what was sent to you, and its delivery status per destination
 
 To look inside: `sqlite3 state.db "SELECT title, at FROM outbox ORDER BY id DESC LIMIT 5"`.
 
-**Upgrading from 0.1.** This version doesn't read the old `jobs.json`, `channels.json` and `history.jsonl`, and the `notify` option is replaced by `outbox`. Recreate your automations and channels, and move your notification settings to `outbox.senders`. The old files can be deleted.
+**Upgrading from 0.1.** This version doesn't read the old `jobs.json`, `channels.json` and `history.jsonl`, and the `notify` option is replaced by `outbox`. Recreate your automations and channels, and move your notification settings to `outbox.destinations`. The old files can be deleted.
 
 The server part logs problems to opencode's stderr as JSON lines, one per problem, with the automation or channel it concerns. Problems include a poll that fails, state it can't save, and a notification that isn't delivered. Set `AUTOMATIONS_LOG_LEVEL` where the opencode server runs to change what is logged (`warn`, `error`, `silent`; default `info`).
 

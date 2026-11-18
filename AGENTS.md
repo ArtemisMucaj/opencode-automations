@@ -26,7 +26,7 @@ The `.ts` files (the server plugin and everything it and the TUI import) need no
 - `guides.ts`: everything the agent is told (tool names, namespaces, command and run guides).
 - `jobs.ts`: job helpers without state (schedule and model parsing, IDs, what counts as active or running). `cron.ts`: schedules.
 - `channels.ts`: channel definitions, polling, the event prompt. `store.ts`: all state, in one SQLite database (`bun:sqlite`): jobs, runs, the inbox and what each automation took from it, sticky sessions, memory, the outbox.
-- `outbox.ts`: what is sent to the user and the dispatcher that delivers it to the configured senders. `notify.ts`: formatting a message and delivering it through one sender.
+- `outbox.ts`: what is sent to the user and the dispatcher that delivers it to the configured destinations. `notify.ts`: formatting a message and delivering it through one destination.
 - `log.ts`: the pino logger. It writes JSON lines to stderr, never stdout. Log with fields (`log.warn({ job, err }, "what happened")`), not `console`.
 - `util.ts`: small helpers with no knowledge of jobs or channels (bounded waits, error text, time and count formatting, the tools' error wrapper).
 - `tui.tsx`: the whole TUI view. It stays one file: only `tui.tsx` is compiled to `tui.js`, so JSX can't live anywhere else. Logic without JSX goes in a `.ts` file.

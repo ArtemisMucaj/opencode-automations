@@ -43,7 +43,7 @@ export default Plugin.define({
   id: "automations",
   setup: async (ctx) => {
     const opts = (ctx.options ?? {}) as Options
-    if ("notify" in opts) throw new Error("[automations] the notify option was replaced by outbox (senders under outbox.senders); see the README")
+    if ("notify" in opts) throw new Error("[automations] the notify option was replaced by outbox.destinations; see the README")
     const tickMs = Math.max(5, opts.tickSeconds ?? 30) * 1000
     const defaultTimeout = checkTimeout(opts.defaultTimeoutMinutes) ?? DEFAULT_TIMEOUT_MINUTES
     const dataDir = opts.dataDir ?? defaultDataDir()

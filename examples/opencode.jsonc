@@ -9,12 +9,12 @@
         "defaultTimeoutMinutes": 30,
         "defaultModel": "anthropic/claude-sonnet-4-5",
         // Everything the plugin tells you goes through the outbox, delivered by the server (no TUI needed)
-        // to every sender below. The run's agent writes messages with automation_notify (at most maxPerRun
+        // to every destination below. The run's agent writes messages with automation_notify (at most maxPerRun
         // per run); `on` adds automatic notices for these outcomes.
         "outbox": {
           "on": ["failed", "timeout"],
           "maxPerRun": 5,
-          "senders": [
+          "destinations": [
             { "id": "desktop", "type": "native" },
             // Phone notifications via Pushover, only for what matters.
             // { "id": "phone", "type": "pushover", "token": "{env:PUSHOVER_TOKEN}", "user": "{env:PUSHOVER_USER}", "minPriority": "normal" },

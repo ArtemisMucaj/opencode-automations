@@ -1,12 +1,12 @@
-// Formatting a message for each kind of sink, and delivering it through one sender.
+// Formatting a message for each kind of sink, and delivering it through one destination.
 
 import { spawn } from "node:child_process"
 import { httpError, withEnv, type Fetch } from "./util.ts"
 
 export type Priority = "low" | "normal" | "high"
 
-/** Configured under `outbox.senders`. */
-export type Sender = { id: string; minPriority?: Priority } & (
+/** Configured under `outbox.destinations`. */
+export type Destination = { id: string; minPriority?: Priority } & (
   | { type: "native"; sound?: string }
   | { type: "pushover"; token: string; user: string }
 )
@@ -181,16 +181,16 @@ const ok = async (r: Response) => {
 }
 const timeout = () => AbortSignal.timeout(10_000)
 
-/** Deliver through one sender; throws on failure. */
-export async function deliver(sender: Sender, m: Message, deps: Deps = defaultDeps): Promise<void> {
+/** Deliver through one destination; throws on failure. */
+export async function deliver(destination: Destination, m: Message, deps: Deps = defaultDeps): Promise<void> {
   const plain = format(m.body, "plain") || m.title
   const high = m.priority === "high"
-  switch (sender.type) {
+  switch (destination.type) {
     case "native": {
       const body = m.url ? `${plain}\n${m.url}` : plain
       if (deps.platform === "darwin") {
         // An empty sound is silent.
-        const sound = sender.sound ?? (high ? "Basso" : "Glass")
+        const sound = destination.sound ?? (high ? "Basso" : "Glass")
         return deps.exec("osascript", [
           "-e", "on run argv",
           "-e", `display notification (item 2 of argv) with title (item 1 of argv) subtitle (item 3 of argv)${sound ? ` sound name "${sound.replace(/"/g, "")}"` : ""}`,
@@ -208,7 +208,7 @@ export async function deliver(sender: Sender, m: Message, deps: Deps = defaultDe
       throw new Error(`native notifications are not supported on ${deps.platform}`)
     }
     case "pushover": {
-      const creds = { token: withEnv(sender.token), user: withEnv(sender.user) }
+      const creds = { token: withEnv(destination.token), user: withEnv(destination.user) }
       // In order, so parts arrive 1/n … n/n.
       for (const part of pushoverParts(m)) {
         await deps.fetch("https://api.pushover.net/1/messages.json", {

@@ -142,8 +142,8 @@ async function start(options: Record<string, unknown> = {}, jobs: Job[] = [], se
   return { store, tools, namespaces, commands, prompts, sessions, compactions, compactMode, removed, events, call, context, compactionSummary, dataDir, stop, ctx }
 }
 
-/** The outbox with one sender, Pushover. */
-const pushover = { senders: [{ id: "phone", type: "pushover", token: "test-token", user: "test-user" }] }
+/** The outbox with one destination, Pushover. */
+const pushover = { destinations: [{ id: "phone", type: "pushover", token: "test-token", user: "test-user" }] }
 /** Save the run's memory, as a run is told to before it ends (else it is asked once more). */
 const remember = (app: { call: (name: string, input: unknown, sessionID: string) => Promise<{ content: string }> }, sessionID: string, note = "noted") =>
   app.call("automation_memory_update", { note }, sessionID)
@@ -277,7 +277,7 @@ test("the run's agent sends notifications itself; a successful run then sends no
       token: "test-token", user: "test-user", title: "2 MRs need you", message: "• <b>!12</b> blocked\n• !15 approved",
       html: 1, priority: 1, url: "https://mr.test", url_title: "Open",
     }])
-    expect(app.store.sent("morning")[0]).toMatchObject({ title: "2 MRs need you", sends: [{ sender: "phone", status: "sent" }] })
+    expect(app.store.sent("morning")[0]).toMatchObject({ title: "2 MRs need you", sends: [{ destination: "phone", status: "sent" }] })
     await remember(app, "session-1")
     app.events.emit("event", { type: "session.text.ended", data: { sessionID: "session-1", text: "Done, notified." } })
     app.events.emit("event", { type: "session.idle", data: { sessionID: "session-1" } })
@@ -1483,11 +1483,11 @@ test("only the leader starts runs: elsewhere, a manual run is queued for its nex
 
 test("the old notify option is refused, naming what replaced it", async () => {
   await expect(start({ notify: { native: true } })).rejects.toThrow("replaced by outbox")
-  await expect(start({ outbox: { senders: [{ id: "x", type: "sms" }] } })).rejects.toThrow("type must be one of")
+  await expect(start({ outbox: { destinations: [{ id: "x", type: "sms" }] } })).rejects.toThrow("type must be one of")
 })
 
-test("a notification no sender takes is recorded, and the run is told it isn't delivered", async () => {
-  const app = await start({ outbox: { senders: [{ ...pushover.senders[0], minPriority: "high" }] } }, [job()])
+test("a notification no destination takes is recorded, and the run is told it isn't delivered", async () => {
+  const app = await start({ outbox: { destinations: [{ ...pushover.destinations[0], minPriority: "high" }] } }, [job()])
   await app.call("automation_run", { id: "morning" })
   expect((await app.call("automation_notify", { title: "FYI", message: "low stakes" }, "session-1")).content).toContain("not delivered")
   expect(app.store.sent("morning")[0]).toMatchObject({ title: "FYI", sends: [] })

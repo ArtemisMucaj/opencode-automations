@@ -68,7 +68,7 @@ export interface OutboxMessage {
   urlTitle?: string
 }
 export type SendStatus = "pending" | "sent" | "failed"
-export type SentMessage = OutboxMessage & { sends: Array<{ sender: string; status: SendStatus; error?: string }> }
+export type SentMessage = OutboxMessage & { sends: Array<{ destination: string; status: SendStatus; error?: string }> }
 
 const INBOX_RETENTION_MS = 7 * 24 * 60 * 60_000
 const OUTBOX_RETENTION_MS = 30 * 24 * 60 * 60_000
@@ -103,8 +103,8 @@ CREATE TABLE IF NOT EXISTS outbox (
   title TEXT NOT NULL, body TEXT NOT NULL, priority TEXT NOT NULL, url TEXT, url_title TEXT);
 CREATE INDEX IF NOT EXISTS outbox_by_job ON outbox (job, id);
 CREATE TABLE IF NOT EXISTS sends (
-  message INTEGER NOT NULL REFERENCES outbox (id) ON DELETE CASCADE, sender TEXT NOT NULL,
-  status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL, error TEXT, PRIMARY KEY (message, sender));
+  message INTEGER NOT NULL REFERENCES outbox (id) ON DELETE CASCADE, destination TEXT NOT NULL,
+  status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL, error TEXT, PRIMARY KEY (message, destination));
 CREATE INDEX IF NOT EXISTS sends_due ON sends (next_at) WHERE status = 'pending';
 CREATE TABLE IF NOT EXISTS lease (name TEXT PRIMARY KEY, holder TEXT NOT NULL, until INTEGER NOT NULL);
 `
@@ -393,36 +393,36 @@ export class Store {
 
   // ---------- outbox ----------
 
-  enqueue(m: Omit<OutboxMessage, "id" | "at">, senders: string[], now = Date.now()): number {
+  enqueue(m: Omit<OutboxMessage, "id" | "at">, destinations: string[], now = Date.now()): number {
     return this.tx(() => {
       const { id } = this.get<{ id: number }>(
         "INSERT INTO outbox (at, job, run, title, body, priority, url, url_title) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
         now, m.job ?? null, m.run ?? null, m.title, m.body, m.priority, m.url ?? null, m.urlTitle ?? null)!
-      for (const s of senders) this.run("INSERT INTO sends (message, sender, status, next_at) VALUES (?, ?, 'pending', ?)", id, s, now)
+      for (const s of destinations) this.run("INSERT INTO sends (message, destination, status, next_at) VALUES (?, ?, 'pending', ?)", id, s, now)
       return id
     })
   }
 
-  due(now = Date.now()): Array<{ message: OutboxMessage; sender: string; attempts: number }> {
+  due(now = Date.now()): Array<{ message: OutboxMessage; destination: string; attempts: number }> {
     return this.all<Row>(
-      "SELECT o.*, s.sender, s.attempts FROM sends s JOIN outbox o ON o.id = s.message " +
+      "SELECT o.*, s.destination, s.attempts FROM sends s JOIN outbox o ON o.id = s.message " +
       "WHERE s.status = 'pending' AND s.next_at <= ? ORDER BY o.id", now,
-    ).map((r) => ({ message: message(r), sender: r.sender as string, attempts: r.attempts as number }))
+    ).map((r) => ({ message: message(r), destination: r.destination as string, attempts: r.attempts as number }))
   }
 
-  updateSend(messageID: number, sender: string, status: SendStatus, attempts: number, nextAt: number, error?: string): void {
-    this.run("UPDATE sends SET status = ?, attempts = ?, next_at = ?, error = ? WHERE message = ? AND sender = ?",
-      status, attempts, nextAt, error ?? null, messageID, sender)
+  updateSend(messageID: number, destination: string, status: SendStatus, attempts: number, nextAt: number, error?: string): void {
+    this.run("UPDATE sends SET status = ?, attempts = ?, next_at = ?, error = ? WHERE message = ? AND destination = ?",
+      status, attempts, nextAt, error ?? null, messageID, destination)
   }
 
   sent(jobID?: string, limit = 10): SentMessage[] {
     const rows = this.all<Row>(
-      "SELECT o.*, s.sender, s.status, s.error FROM (SELECT * FROM outbox WHERE ?1 IS NULL OR job = ?1 ORDER BY id DESC LIMIT ?2) o " +
-      "LEFT JOIN sends s ON s.message = o.id ORDER BY o.id DESC, s.sender", jobID ?? null, limit)
+      "SELECT o.*, s.destination, s.status, s.error FROM (SELECT * FROM outbox WHERE ?1 IS NULL OR job = ?1 ORDER BY id DESC LIMIT ?2) o " +
+      "LEFT JOIN sends s ON s.message = o.id ORDER BY o.id DESC, s.destination", jobID ?? null, limit)
     const out = new Map<number, SentMessage>()
     for (const r of rows) {
       const m = out.get(r.id as number) ?? { ...message(r), sends: [] }
-      if (r.sender !== null) m.sends.push({ sender: r.sender as string, status: r.status as SendStatus, ...(r.error !== null ? { error: r.error as string } : {}) })
+      if (r.destination !== null) m.sends.push({ destination: r.destination as string, status: r.status as SendStatus, ...(r.error !== null ? { error: r.error as string } : {}) })
       out.set(m.id, m)
     }
     return [...out.values()]

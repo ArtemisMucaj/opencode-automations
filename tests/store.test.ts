@@ -158,13 +158,13 @@ test("each automation keeps a note per key", () => {
   expect(store.note("a")).toBeUndefined()
 })
 
-test("outbox messages wait per sender until sent, or until a retry is due", () => {
+test("outbox messages wait per destination until sent, or until a retry is due", () => {
   const store = open()
   const id = store.enqueue({ job: "a", title: "T", body: "B", priority: "high" }, ["phone", "desktop"], 100)
-  expect(store.due(100).map((s) => s.sender).sort()).toEqual(["desktop", "phone"])
+  expect(store.due(100).map((s) => s.destination).sort()).toEqual(["desktop", "phone"])
   store.updateSend(id, "phone", "sent", 1, 100)
   store.updateSend(id, "desktop", "pending", 1, 500, "boom")
   expect(store.due(200)).toEqual([])
-  expect(store.due(500)).toEqual([{ message: { id, at: 100, job: "a", title: "T", body: "B", priority: "high" }, sender: "desktop", attempts: 1 }])
-  expect(store.sent("a")[0].sends).toEqual([{ sender: "desktop", status: "pending", error: "boom" }, { sender: "phone", status: "sent" }])
+  expect(store.due(500)).toEqual([{ message: { id, at: 100, job: "a", title: "T", body: "B", priority: "high" }, destination: "desktop", attempts: 1 }])
+  expect(store.sent("a")[0].sends).toEqual([{ destination: "desktop", status: "pending", error: "boom" }, { destination: "phone", status: "sent" }])
 })

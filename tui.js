@@ -1330,7 +1330,7 @@ function AutomationsView(props) {
                                 _$insert(_el$92, () => clock(m.at), _el$93);
                                 _$insert(_el$92, () => m.title.slice(0, 60), _el$94);
                                 _$insertNode(_el$94, _el$95);
-                                _$insert(_el$94, () => m.sends.map(x => `${x.sender} ${x.status}`).join(", ") || "no sender takes it", null);
+                                _$insert(_el$94, () => m.sends.map(x => `${x.destination} ${x.status}`).join(", ") || "no destination takes it", null);
                                 _$effect(_p$ => {
                                   var _v$36 = L().text,
                                     _v$37 = {

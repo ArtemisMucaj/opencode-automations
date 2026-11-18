@@ -667,7 +667,7 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
                                     {clock(m.at)} {m.title.slice(0, 60)}
                                     <span style={{ fg: m.sends.some((x) => x.status === "failed") ? L().bad : L().muted }}>
                                       {"  "}
-                                      {m.sends.map((x) => `${x.sender} ${x.status}`).join(", ") || "no sender takes it"}
+                                      {m.sends.map((x) => `${x.destination} ${x.status}`).join(", ") || "no destination takes it"}
                                     </span>
                                   </text>
                                 )}

@@ -67,12 +67,12 @@ export function automationTools(tools: ToolEditor, rt: Runtime) {
         )
       }
       const priority: Priority = input.priority ?? "normal"
-      let senders: number
+      let destinations: number
       try {
-        senders = outbox.add({ title, body: message, priority, url: input.url, urlTitle: input.url_title }, { job: f.job.id, run: f.run.runID })
+        destinations = outbox.add({ title, body: message, priority, url: input.url, urlTitle: input.url_title }, { job: f.job.id, run: f.run.runID })
       } catch (e) { return text(`error: couldn't queue it (${errorMessage(e)}). Try once more.`) }
       f.sent++
-      const outcome = senders ? "Queued for delivery." : `Recorded, but not delivered: the user only gets notifications above ${priority} priority.`
+      const outcome = destinations ? "Queued for delivery." : `Recorded, but not delivered: the user only gets notifications above ${priority} priority.`
       return text(`${outcome} ${maxPerRun - f.sent} notifications left for this run.`)
     },
   }))

@@ -3,8 +3,8 @@ import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { log } from "../log.ts"
-import { deliver, format, longLine, MAX_PARTS, pushoverParts, split, MAX_LINE, PUSHOVER, type Deps, type Message, type Sender } from "../notify.ts"
-import { compose, Outbox, parseSenders, RETRY_MS } from "../outbox.ts"
+import { deliver, format, longLine, MAX_PARTS, pushoverParts, split, MAX_LINE, PUSHOVER, type Deps, type Message, type Destination } from "../notify.ts"
+import { compose, Outbox, parseDestinations, RETRY_MS } from "../outbox.ts"
 import { Store, type Job, type Run } from "../store.ts"
 
 const job: Job = {
@@ -17,8 +17,8 @@ const message: Message = { title: "Morning", body: "All clear", priority: "norma
 
 const noNetwork = async (): Promise<Response> => { throw new Error("unexpected network request") }
 const noExec = async () => { throw new Error("unexpected native notification") }
-const native: Sender = { id: "desktop", type: "native" }
-const pushover: Sender = { id: "phone", type: "pushover", token: "test-token", user: "test-user" }
+const native: Destination = { id: "desktop", type: "native" }
+const pushover: Destination = { id: "phone", type: "pushover", token: "test-token", user: "test-user" }
 
 test("native on macOS sends title and body as arguments, not AppleScript source", async () => {
   const calls: Array<{ command: string; args: string[] }> = []
@@ -164,27 +164,27 @@ function store() {
   return new Store(dir)
 }
 
-test("senders are checked: ids unique, a known type, what Pushover needs", () => {
-  expect(parseSenders(undefined)).toEqual([])
-  expect(parseSenders({ senders: [native, pushover] })).toHaveLength(2)
-  expect(() => parseSenders({ senders: [native, native] })).toThrow("unique")
-  expect(() => parseSenders({ senders: [{ id: "x", type: "sms" } as unknown as Sender] })).toThrow("type must be one of")
-  expect(() => parseSenders({ senders: [{ id: "p", type: "pushover", token: "t" } as unknown as Sender] })).toThrow("token and user")
+test("destinations are checked: ids unique, a known type, what Pushover needs", () => {
+  expect(parseDestinations(undefined)).toEqual([])
+  expect(parseDestinations({ destinations: [native, pushover] })).toHaveLength(2)
+  expect(() => parseDestinations({ destinations: [native, native] })).toThrow("unique")
+  expect(() => parseDestinations({ destinations: [{ id: "x", type: "sms" } as unknown as Destination] })).toThrow("type must be one of")
+  expect(() => parseDestinations({ destinations: [{ id: "p", type: "pushover", token: "t" } as unknown as Destination] })).toThrow("token and user")
 })
 
-test("automatic notices: failures by default, never for success, and only with a sender", () => {
-  const outbox = new Outbox(store(), { senders: [native] })
+test("automatic notices: failures by default, never for success, and only with a destination", () => {
+  const outbox = new Outbox(store(), { destinations: [native] })
   expect(outbox.noticeFor(job, "failed")).toBe(true)
   expect(outbox.noticeFor(job, "timeout")).toBe(true)
   expect(outbox.noticeFor(job, "succeeded")).toBe(false)
-  expect(new Outbox(store(), { senders: [native], on: ["succeeded"] }).noticeFor(job, "succeeded")).toBe(false)
+  expect(new Outbox(store(), { destinations: [native], on: ["succeeded"] }).noticeFor(job, "succeeded")).toBe(false)
   expect(outbox.noticeFor({ ...job, notify: ["succeeded"] }, "succeeded")).toBe(false)
   expect(outbox.noticeFor({ ...job, notify: false }, "failed")).toBe(false)
   expect(outbox.noticeFor({ ...job, notify: ["timeout"] }, "failed")).toBe(false)
   expect(new Outbox(store(), {}).noticeFor(job, "failed")).toBe(false)
 })
 
-test("the dispatcher sends each message to every sender that takes its priority, and retries failures", async () => {
+test("the dispatcher sends each message to every destination that takes its priority, and retries failures", async () => {
   const warn = spyOn(log, "warn").mockImplementation(() => {})
   const error = spyOn(log, "error").mockImplementation(() => {})
   try {
@@ -197,15 +197,15 @@ test("the dispatcher sends each message to every sender that takes its priority,
       fetch: async () => (pushoverUp ? new Response("ok") : new Response("down", { status: 503 })),
     }
     // Not sending on its own (as off the leader): the test drives each pass.
-    const outbox = new Outbox(s, { senders: [native, { ...pushover, minPriority: "high" }] }, () => false, deps)
+    const outbox = new Outbox(s, { destinations: [native, { ...pushover, minPriority: "high" }] }, () => false, deps)
     outbox.add({ title: "FYI", body: "low", priority: "low" }, { job: "morning" })
     outbox.add({ title: "Urgent", body: "now", priority: "high" }, { job: "morning" })
     await outbox.dispatch()
     expect(execs.sort()).toEqual(["FYI", "Urgent"])
     // Pushover only takes high, and failed: it waits for its retry.
     const urgent = s.sent("morning").find((m) => m.title === "Urgent")!
-    expect(urgent.sends).toEqual([{ sender: "desktop", status: "sent" }, { sender: "phone", status: "pending", error: "HTTP 503: down" }])
-    expect(s.sent("morning").find((m) => m.title === "FYI")!.sends).toEqual([{ sender: "desktop", status: "sent" }])
+    expect(urgent.sends).toEqual([{ destination: "desktop", status: "sent" }, { destination: "phone", status: "pending", error: "HTTP 503: down" }])
+    expect(s.sent("morning").find((m) => m.title === "FYI")!.sends).toEqual([{ destination: "desktop", status: "sent" }])
     expect(s.due()).toEqual([])
     // Once due again, it is sent; nothing already sent goes again.
     pushoverUp = true
@@ -214,14 +214,14 @@ test("the dispatcher sends each message to every sender that takes its priority,
     await outbox.dispatch()
     expect(s.sent("morning").find((m) => m.title === "Urgent")!.sends.map((x) => x.status)).toEqual(["sent", "sent"])
     expect(execs).toHaveLength(2)
-    // A sender that keeps failing is given up on after its retries.
+    // A destination that keeps failing is given up on after its retries.
     pushoverUp = false
     outbox.add({ title: "Again", body: "x", priority: "high" })
     for (let i = 0; i <= RETRY_MS.length; i++) {
       s.db.run("UPDATE sends SET next_at = 0 WHERE status = 'pending'")
       await outbox.dispatch()
     }
-    expect(s.sent().find((m) => m.title === "Again")!.sends.find((x) => x.sender === "phone")!.status).toBe("failed")
+    expect(s.sent().find((m) => m.title === "Again")!.sends.find((x) => x.destination === "phone")!.status).toBe("failed")
     expect(error.mock.calls[0][1]).toBe("notification failed, giving up")
     s.close()
   } finally { warn.mockRestore(); error.mockRestore() }
