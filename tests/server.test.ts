@@ -148,6 +148,7 @@ const pushover = { destinations: [{ id: "phone", type: "Notification.PushOver", 
 const remember = (app: { call: (name: string, input: unknown, sessionID: string) => Promise<{ content: string }> }, sessionID: string, note = "noted") =>
   app.call("automation_memory_update", { note }, sessionID)
 
+/** Tests about something else than notifying pass `notify: false`, or a run that ends is asked whether to notify. */
 function job(overrides: Partial<Job> = {}): Job {
   return {
     id: "morning", name: "Morning", prompt: "Check things", schedule: { kind: "every", ms: 60_000 },
@@ -200,7 +201,7 @@ test("config jobs preserve TUI pause and manual run intent", async () => {
 })
 
 test("one-shot completion survives reload; the history keeps the outcome, not what the run said", async () => {
-  const app = await start({}, [job({ schedule: { kind: "at", time: Date.now() - 1000 }, nextRunAt: Date.now() - 1000 })])
+  const app = await start({}, [job({ notify: false, schedule: { kind: "at", time: Date.now() - 1000 }, nextRunAt: Date.now() - 1000 })])
   expect(app.prompts).toHaveLength(1)
   app.events.emit("event", { type: "session.text.ended", data: { sessionID: "session-1", text: "All clear" } })
   app.events.emit("event", { type: "session.idle", data: { sessionID: "session-1" } })
@@ -316,7 +317,7 @@ test("a successful run that says there is nothing to report is silent", async ()
 })
 
 test("a run that ends silently without saying why is asked once whether to notify", async () => {
-  const app = await start({ outbox: pushover }, [job()])
+  const app = await start({}, [job()])
   await app.call("automation_run", { id: "morning" })
   app.events.emit("event", { type: "session.text.ended", data: { sessionID: "session-1", text: "MR !12 is blocked." } })
   app.events.emit("event", { type: "session.execution.succeeded", data: { sessionID: "session-1" } })
@@ -339,7 +340,7 @@ test("a run that ends silently without saying why is asked once whether to notif
 })
 
 test("runs that can't notify are never asked", async () => {
-  const app = await start({ outbox: pushover }, [job({ notify: false })])
+  const app = await start({}, [job({ notify: false })])
   await app.call("automation_run", { id: "morning" })
   await remember(app, "session-1")
   app.events.emit("event", { type: "session.text.ended", data: { sessionID: "session-1", text: "Done" } })
@@ -413,7 +414,7 @@ test("an automation on a channel runs on new events with an untrusted prompt", a
   let current: unknown[] = []
   const fetch = api(() => current)
   try {
-    const app = await start({ outbox: pushover, channels: [channel()], jobs: [triage()] })
+    const app = await start({ channels: [channel()], jobs: [triage()] })
     expect(app.prompts).toEqual([])
     expect(app.tools.has("channel_list")).toBe(true)
 
@@ -541,7 +542,7 @@ test("one channel feeds several automations; a digest waits for its schedule", a
   try {
     const app = await start({
       channels: [channel()],
-      jobs: [triage(), triage({ id: "digest", name: "Digest", prompt: "Summarise today's alerts.", every: "1h" })],
+      jobs: [triage({ notify: false }), triage({ notify: false, id: "digest", name: "Digest", prompt: "Summarise today's alerts.", every: "1h" })],
     })
     current = [monitor(1), monitor(2)]
     await app.call("channel_poll", { id: "dd" })
@@ -642,7 +643,7 @@ test("channel settings are validated for config and chat-created automations", a
 })
 
 test("automation_notify is offered, with guidance, only to runs that may notify", async () => {
-  const app = await start({ outbox: pushover }, [job(), job({ id: "quiet", name: "Quiet", notify: false })])
+  const app = await start({}, [job(), job({ id: "quiet", name: "Quiet", notify: false })])
   await app.call("automation_run", { id: "morning" })
   await app.call("automation_run", { id: "quiet" })
 
@@ -724,7 +725,7 @@ const end = async (app: { events: EventEmitter }, sessionID: string) => {
 }
 
 test("a sticky session is continued while warm, and compacted to its memory once cold", async () => {
-  const app = await start({}, [job({ session: "sticky" })])
+  const app = await start({}, [job({ notify: false, session: "sticky" })])
   await app.call("automation_run", { id: "morning" })
   expect(app.prompts[0]).toMatchObject({ sessionID: "session-1", text: "Check things" })
   // Runs are offered the memory tool and told to use it; it saves a note for the job.
@@ -754,7 +755,7 @@ test("a sticky session is continued while warm, and compacted to its memory once
 })
 
 test("the compaction's end, even delivered after it returns, doesn't end the run or check it before its turn", async () => {
-  const app = await start({}, [job({ session: "sticky" })])
+  const app = await start({}, [job({ notify: false, session: "sticky" })])
   await app.call("automation_run", { id: "morning" })
   await app.call("automation_memory_update", { note: "state" }, "session-1")
   await end(app, "session-1")
@@ -771,7 +772,7 @@ test("the compaction's end, even delivered after it returns, doesn't end the run
 })
 
 test("a run that saves no memory drops the old one, and one that sent the model nothing doesn't warm the session", async () => {
-  const app = await start({}, [job({ session: "sticky" })])
+  const app = await start({}, [job({ notify: false, session: "sticky" })])
   await app.call("automation_run", { id: "morning" })
   app.context("session-1") // the run sent the model a request
   await app.call("automation_memory_update", { note: "run 1" }, "session-1")
@@ -795,7 +796,7 @@ test("a run that saves no memory drops the old one, and one that sent the model 
 })
 
 test("if compaction can't be done, the cold run goes on in its whole session", async () => {
-  const app = await start({}, [job({ session: "sticky" })])
+  const app = await start({}, [job({ notify: false, session: "sticky" })])
   await app.call("automation_run", { id: "morning" })
   await app.call("automation_memory_update", { note: "state" }, "session-1")
   await end(app, "session-1")
@@ -808,7 +809,7 @@ test("if compaction can't be done, the cold run goes on in its whole session", a
 })
 
 test("a sticky run that saves no note is asked once, with the notify check in the same turn; without a note the session goes on", async () => {
-  const app = await start({ outbox: pushover }, [job({ session: "sticky" })])
+  const app = await start({}, [job({ session: "sticky" })])
   await app.call("automation_run", { id: "morning" })
   app.events.emit("event", { type: "session.text.ended", data: { sessionID: "session-1", text: "MR !12 is blocked." } })
   await end(app, "session-1")
@@ -830,7 +831,7 @@ test("with session keys, each key's session goes cold and is compacted to its ow
   let current: unknown[] = []
   const fetch = api(() => current)
   try {
-    const app = await start({ channels: [channel()], jobs: [triage({ session: "sticky" })] })
+    const app = await start({ channels: [channel()], jobs: [triage({ notify: false, session: "sticky" })] })
     current = [monitor(1), monitor(2)]
     await app.call("channel_poll", { id: "dd" })
     const sid = (key: string) => app.store.session("triage", key)!.id
@@ -867,7 +868,7 @@ test("the cache lifetime is read from the run's requests, 5 minutes when they do
 })
 
 test("a session with a one-hour cache stays warm for a gap a default cache wouldn't survive", async () => {
-  const app = await start({}, [job({ session: "sticky" }), job({ id: "short", name: "Short", session: "sticky" })])
+  const app = await start({}, [job({ notify: false, session: "sticky" }), job({ notify: false, id: "short", name: "Short", session: "sticky" })])
   await app.call("automation_run", { id: "morning" })
   await app.call("automation_run", { id: "short" })
   app.context("session-1", { cache: { ttl: "1h" } })
@@ -889,7 +890,7 @@ test("a session with a one-hour cache stays warm for a gap a default cache would
 })
 
 test("with caching off, a sticky session is compacted whenever there is memory", async () => {
-  const app = await start({}, [job({ session: "sticky" })])
+  const app = await start({}, [job({ notify: false, session: "sticky" })])
   await app.call("automation_run", { id: "morning" })
   app.context("session-1", { cache: "none" })
   await app.call("automation_memory_update", { note: "state" }, "session-1")
@@ -901,7 +902,7 @@ test("with caching off, a sticky session is compacted whenever there is memory",
 
 test("every automation that runs again keeps a memory; empty or long notes are refused", async () => {
   const later = Date.now() + 3_600_000
-  const app = await start({}, [job(), job({ id: "once", name: "Once", schedule: { kind: "at", time: later }, nextRunAt: later })])
+  const app = await start({}, [job({ notify: false }), job({ notify: false, id: "once", name: "Once", schedule: { kind: "at", time: later }, nextRunAt: later })])
   await app.call("automation_run", { id: "morning" })
   await app.call("automation_run", { id: "once" })
   expect(app.context("session-1").tools).toContain("automation_memory_update")
@@ -920,7 +921,7 @@ test("every automation that runs again keeps a memory; empty or long notes are r
 })
 
 test("a run in a fresh session starts from the previous run's memory", async () => {
-  const app = await start({}, [job(), job({ id: "s", name: "S", session: "sticky" })])
+  const app = await start({}, [job({ notify: false }), job({ notify: false, id: "s", name: "S", session: "sticky" })])
   await app.call("automation_run", { id: "morning" })
   await remember(app, "session-1", "MR !12 reported.")
   await end(app, "session-1")
@@ -1019,7 +1020,7 @@ test("events from a run that failed to start go back to the queue, up to 3 attem
   let current: unknown[] = []
   const fetch = api(() => current)
   try {
-    const app = await start({ channels: [channel()], jobs: [triage()] })
+    const app = await start({ channels: [channel()], jobs: [triage({ notify: false })] })
     let failing = true
     const prompt = app.ctx.session.prompt
     app.ctx.session.prompt = async (input) => { if (failing) throw new Error("server busy"); return prompt(input) }
@@ -1424,7 +1425,7 @@ test("a compaction given up on still gets its summary, and its late end doesn't 
   ) as typeof real
   const timers = spyOn(globalThis, "setTimeout").mockImplementation(shortened)
   try {
-    const app = await start({}, [job({ session: "sticky" })], coldSession)
+    const app = await start({}, [job({ notify: false, session: "sticky" })], coldSession)
     // The compaction is accepted but only happens later (the session is busy).
     app.ctx.session.compact = async ({ sessionID }) => ({ id: "msg_compaction", sessionID, type: "compaction" })
     app.ctx.session.wait = () => new Promise<void>(() => {})
@@ -1491,6 +1492,11 @@ test("a notification no destination takes is recorded, and the run is told it is
   await app.call("automation_run", { id: "morning" })
   expect((await app.call("automation_notify", { title: "FYI", message: "low stakes" }, "session-1")).content).toContain("not delivered")
   expect(app.store.sent("morning")[0]).toMatchObject({ title: "FYI", sends: [] })
+
+  const unconfigured = await start({}, [job()])
+  await unconfigured.call("automation_run", { id: "morning" })
+  expect((await unconfigured.call("automation_notify", { title: "Brief", message: "MR !12 blocked" }, "session-1")).content).toContain("no destination")
+  expect(unconfigured.store.sent("morning")[0]).toMatchObject({ title: "Brief", sends: [] })
 })
 
 test("a current automation keeps no memory: its chat is its memory", async () => {
@@ -1498,6 +1504,7 @@ test("a current automation keeps no memory: its chat is its memory", async () =>
   await app.call("automation_create", { name: "Here", prompt: "Check", every: "1h", session: "current" })
   await app.call("automation_run", { id: "here" })
   expect(app.context("caller").tools).not.toContain("automation_memory_update")
+  await app.call("automation_notify", { title: "Done", message: "Checked" }, "caller")
   await end(app, "caller")
   expect(app.prompts).toHaveLength(1)
   expect(app.store.history("here")[0].status).toBe("succeeded")

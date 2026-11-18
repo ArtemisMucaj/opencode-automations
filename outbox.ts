@@ -71,9 +71,9 @@ export class Outbox {
     this.on = cfg?.on ?? DEFAULT_ON
   }
 
-  /** Whether a job may notify at all. */
+  /** Whether a job may notify at all. Destinations only decide where its messages go. */
   canNotify(job: Job): boolean {
-    return job.notify !== false && this.destinations.length > 0
+    return job.notify !== false
   }
 
   /** Whether a run's outcome gets an automatic notice (never success). */

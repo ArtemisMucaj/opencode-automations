@@ -110,6 +110,8 @@ If a notification can't be delivered (no network, Pushover down), it's tried aga
 
 The dialog shows what each automation sent you and whether it arrived.
 
+With no destination set up, notifications are still written and shown in the dialog, but nothing is sent. Adding a destination later doesn't send the old ones.
+
 ## Memory and sessions
 
 Automations that run more than once remember what they found last time. At the end of each run, the agent writes a short note: what it saw, what it told you, what to keep an eye on. The next run starts from that note. That's how "tell me only what changed" works.

@@ -172,7 +172,7 @@ test("destinations are checked: ids unique, a known type, what Pushover needs", 
   expect(() => parseDestinations({ destinations: [{ id: "p", type: "Notification.PushOver", options: { token: "t" } } as unknown as Destination] })).toThrow("options.token and options.user")
 })
 
-test("automatic notices: failures by default, never for success, and only with a destination", () => {
+test("automatic notices: failures by default, never for success, with or without a destination", () => {
   const outbox = new Outbox(store(), { destinations: [native] })
   expect(outbox.noticeFor(job, "failed")).toBe(true)
   expect(outbox.noticeFor(job, "timeout")).toBe(true)
@@ -181,7 +181,7 @@ test("automatic notices: failures by default, never for success, and only with a
   expect(outbox.noticeFor({ ...job, notify: ["succeeded"] }, "succeeded")).toBe(false)
   expect(outbox.noticeFor({ ...job, notify: false }, "failed")).toBe(false)
   expect(outbox.noticeFor({ ...job, notify: ["timeout"] }, "failed")).toBe(false)
-  expect(new Outbox(store(), {}).noticeFor(job, "failed")).toBe(false)
+  expect(new Outbox(store(), {}).noticeFor(job, "failed")).toBe(true)
 })
 
 test("the dispatcher sends each message to every destination that takes its priority, and retries failures", async () => {
