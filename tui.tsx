@@ -425,12 +425,12 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
       polling: { fg: L().ok, bg: t.background.feedback.success.base, dot: "●" },
       idle: { fg: L().muted, bg: L().cap, dot: "○" },
     })[st]
-  /** An inbox event's overall fate: waiting if any automation still waits for it. */
-  const fate = (e: InboxEntry): DeliveryStatus | "unclaimed" =>
+  /** An inbox event's overall delivery state: waiting if any automation still waits for it. */
+  const deliveryState = (e: InboxEntry): DeliveryStatus | "unclaimed" =>
     e.deliveries.some((d) => d.status === "waiting") ? "waiting"
       : e.deliveries.some((d) => d.status === "dropped") ? "dropped"
       : e.deliveries.length ? "taken" : "unclaimed"
-  const fateLook = (f: DeliveryStatus | "unclaimed") =>
+  const deliveryUI = (f: DeliveryStatus | "unclaimed") =>
     ({
       waiting: { fg: L().warn, dot: "◐" },
       taken: { fg: L().ok, dot: "✓" },
@@ -442,14 +442,14 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
     m.sends.some((x) => x.status === "failed") ? "failed"
       : m.sends.some((x) => x.status === "pending") ? "pending"
       : m.sends.length ? "sent" : "none"
-  const sendLook = (st: SendStatus | "none") =>
+  const sendUI = (st: SendStatus | "none") =>
     ({
       sent: { fg: L().ok, dot: "✓" },
       pending: { fg: L().warn, dot: "◐" },
       failed: { fg: L().bad, dot: "✗" },
       none: { fg: L().muted, dot: "○" },
     })[st]
-  const inboxWaiting = createMemo(() => inbox().filter((e) => fate(e) === "waiting").length)
+  const inboxWaiting = createMemo(() => inbox().filter((e) => deliveryState(e) === "waiting").length)
   const outboxFailed = createMemo(() => outbox().filter((m) => sendState(m) === "failed").length)
   const statusColor = (s?: RunStatus) =>
     s === "succeeded" ? L().ok : s === "running" ? L().warn : s === "skipped" || !s ? L().muted : L().bad
@@ -718,8 +718,8 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
                     </box>
                     <Index each={inbox().slice(evStart(), evStart() + fits())}>
                       {(e, slot) => {
-                        const look = () => fateLook(fate(e()))
-                        return <Row selected={slot + evStart() === evIndex()} dot={look().dot} dotFg={look().fg} name={e().title} when={relative(e().at, state.now())} />
+                        const ui = () => deliveryUI(deliveryState(e()))
+                        return <Row selected={slot + evStart() === evIndex()} dot={ui().dot} dotFg={ui().fg} name={e().title} when={relative(e().at, state.now())} />
                       }}
                     </Index>
                   </box>
@@ -756,7 +756,7 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
                                 <For each={e().deliveries}>
                                   {(d) => (
                                     <text fg={L().text}>
-                                      <span style={{ fg: fateLook(d.status).fg }}>{fateLook(d.status).dot}</span> {jobName(d.job)}
+                                      <span style={{ fg: deliveryUI(d.status).fg }}>{deliveryUI(d.status).dot}</span> {jobName(d.job)}
                                       <span style={{ fg: L().muted }}>
                                         {"  "}
                                         {d.status}
@@ -795,8 +795,8 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
                     </box>
                     <Index each={outbox().slice(msgStart(), msgStart() + fits())}>
                       {(m, slot) => {
-                        const look = () => sendLook(sendState(m()))
-                        return <Row selected={slot + msgStart() === msgIndex()} dot={look().dot} dotFg={look().fg} name={m().title} when={relative(m().at, state.now())} />
+                        const ui = () => sendUI(sendState(m()))
+                        return <Row selected={slot + msgStart() === msgIndex()} dot={ui().dot} dotFg={ui().fg} name={m().title} when={relative(m().at, state.now())} />
                       }}
                     </Index>
                   </box>
@@ -829,7 +829,7 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
                                   {(x) => (
                                     <box flexDirection="column">
                                       <text fg={L().text}>
-                                        <span style={{ fg: sendLook(x.status).fg }}>{sendLook(x.status).dot}</span> {x.destination}
+                                        <span style={{ fg: sendUI(x.status).fg }}>{sendUI(x.status).dot}</span> {x.destination}
                                         <span style={{ fg: L().muted }}>{"  "}{x.status}</span>
                                       </text>
                                       <Show when={x.error}>{(err) => <text fg={L().bad}>{"  " + err()}</text>}</Show>

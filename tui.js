@@ -558,9 +558,9 @@ function AutomationsView(props) {
       dot: "○"
     }
   })[st];
-  /** An inbox event's overall fate: waiting if any automation still waits for it. */
-  const fate = e => e.deliveries.some(d => d.status === "waiting") ? "waiting" : e.deliveries.some(d => d.status === "dropped") ? "dropped" : e.deliveries.length ? "taken" : "unclaimed";
-  const fateLook = f => ({
+  /** An inbox event's overall delivery state: waiting if any automation still waits for it. */
+  const deliveryState = e => e.deliveries.some(d => d.status === "waiting") ? "waiting" : e.deliveries.some(d => d.status === "dropped") ? "dropped" : e.deliveries.length ? "taken" : "unclaimed";
+  const deliveryUI = f => ({
     waiting: {
       fg: L().warn,
       dot: "◐"
@@ -580,7 +580,7 @@ function AutomationsView(props) {
   })[f];
   /** A message's overall delivery: failed if any destination failed, pending while any is still trying. */
   const sendState = m => m.sends.some(x => x.status === "failed") ? "failed" : m.sends.some(x => x.status === "pending") ? "pending" : m.sends.length ? "sent" : "none";
-  const sendLook = st => ({
+  const sendUI = st => ({
     sent: {
       fg: L().ok,
       dot: "✓"
@@ -598,7 +598,7 @@ function AutomationsView(props) {
       dot: "○"
     }
   })[st];
-  const inboxWaiting = createMemo(() => inbox().filter(e => fate(e) === "waiting").length);
+  const inboxWaiting = createMemo(() => inbox().filter(e => deliveryState(e) === "waiting").length);
   const outboxFailed = createMemo(() => outbox().filter(m => sendState(m) === "failed").length);
   const statusColor = s => s === "succeeded" ? L().ok : s === "running" ? L().warn : s === "skipped" || !s ? L().muted : L().bad;
   const badge = j => {
@@ -1338,16 +1338,16 @@ function AutomationsView(props) {
                     return inbox().slice(evStart(), evStart() + fits());
                   },
                   children: (e, slot) => {
-                    const look = () => fateLook(fate(e()));
+                    const ui = () => deliveryUI(deliveryState(e()));
                     return _$createComponent(Row, {
                       get selected() {
                         return slot + evStart() === evIndex();
                       },
                       get dot() {
-                        return look().dot;
+                        return ui().dot;
                       },
                       get dotFg() {
-                        return look().fg;
+                        return ui().fg;
                       },
                       get name() {
                         return e().title;
@@ -1481,7 +1481,7 @@ function AutomationsView(props) {
                                 _$insertNode(_el$109, _el$110);
                                 _$insertNode(_el$109, _el$111);
                                 _$insertNode(_el$109, _el$112);
-                                _$insert(_el$110, () => fateLook(d.status).dot);
+                                _$insert(_el$110, () => deliveryUI(d.status).dot);
                                 _$insert(_el$109, () => jobName(d.job), _el$112);
                                 _$insertNode(_el$112, _el$113);
                                 _$insert(_el$112, () => d.status, null);
@@ -1489,7 +1489,7 @@ function AutomationsView(props) {
                                 _$effect(_p$ => {
                                   var _v$39 = L().text,
                                     _v$40 = {
-                                      fg: fateLook(d.status).fg
+                                      fg: deliveryUI(d.status).fg
                                     },
                                     _v$41 = {
                                       fg: L().muted
@@ -1594,16 +1594,16 @@ function AutomationsView(props) {
                     return outbox().slice(msgStart(), msgStart() + fits());
                   },
                   children: (m, slot) => {
-                    const look = () => sendLook(sendState(m()));
+                    const ui = () => sendUI(sendState(m()));
                     return _$createComponent(Row, {
                       get selected() {
                         return slot + msgStart() === msgIndex();
                       },
                       get dot() {
-                        return look().dot;
+                        return ui().dot;
                       },
                       get dotFg() {
-                        return look().fg;
+                        return ui().fg;
                       },
                       get name() {
                         return m().title;
@@ -1729,7 +1729,7 @@ function AutomationsView(props) {
                                 _$insertNode(_el$129, _el$130);
                                 _$insertNode(_el$129, _el$131);
                                 _$insertNode(_el$129, _el$132);
-                                _$insert(_el$130, () => sendLook(x.status).dot);
+                                _$insert(_el$130, () => sendUI(x.status).dot);
                                 _$insert(_el$129, () => x.destination, _el$132);
                                 _$insertNode(_el$132, _el$133);
                                 _$insert(_el$132, () => x.status, null);
@@ -1747,7 +1747,7 @@ function AutomationsView(props) {
                                 _$effect(_p$ => {
                                   var _v$45 = L().text,
                                     _v$46 = {
-                                      fg: sendLook(x.status).fg
+                                      fg: sendUI(x.status).fg
                                     },
                                     _v$47 = {
                                       fg: L().muted
