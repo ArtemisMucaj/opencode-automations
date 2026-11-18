@@ -10,8 +10,6 @@ export type { Priority, Destination }
 export interface OutboxConfig {
   /** Run outcomes that get an automatic notice. Default: failed, timeout. */
   on?: RunStatus[]
-  /** Default 5. */
-  maxPerRun?: number
   destinations?: Destination[]
 }
 
@@ -19,7 +17,6 @@ export interface OutboxConfig {
 export type JobNotify = boolean | RunStatus[]
 
 const DEFAULT_ON: RunStatus[] = ["failed", "timeout"]
-export const DEFAULT_MAX_PER_RUN = 5
 export const RETRY_MS = [60_000, 5 * 60_000, 30 * 60_000]
 const RANK: Record<Priority, number> = { low: 0, normal: 1, high: 2 }
 const TYPES = new Set(["Notification.Native", "Notification.PushOver"])
@@ -54,7 +51,6 @@ export function compose(job: Job, run: Run): Message {
 
 export class Outbox {
   readonly destinations: Destination[]
-  readonly maxPerRun: number
   private readonly on: RunStatus[]
   private dispatching?: Promise<void>
   private again = false
@@ -67,7 +63,6 @@ export class Outbox {
     private readonly deps: Deps = defaultDeps,
   ) {
     this.destinations = parseDestinations(cfg)
-    this.maxPerRun = cfg?.maxPerRun ?? DEFAULT_MAX_PER_RUN
     this.on = cfg?.on ?? DEFAULT_ON
   }
 

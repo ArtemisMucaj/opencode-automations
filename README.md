@@ -102,7 +102,7 @@ Add them to the plugin's options (see [Configuration](#configuration) for where 
 - `{env:PUSHOVER_TOKEN}` reads the value from an environment variable, so your keys don't sit in the file.
 - `minPriority` filters what reaches that place. With `"high"`, your phone only buzzes for things that need you soon. The choices are `low`, `normal` and `high`.
 
-**What you get.** The agent writes each notification itself: a title, a few short lines with the most important thing first, and how urgent it is. It sends at most 5 per run. If a run had nothing worth telling you, you get nothing.
+**What you get.** The agent writes each notification itself: a title, a few short lines with the most important thing first, and how urgent it is. If a run had nothing worth telling you, you get nothing.
 
 **What you always get.** If a run fails or takes too long, you get a notice even if the agent never wrote one. You also hear about it once if a channel stops working. You can turn notifications off for a single automation.
 
@@ -196,7 +196,6 @@ Changes apply when you save. If opencode is already open, run `/reload`. For a f
 | `defaultAgent` | | Agent for runs that don't name one |
 | `defaultTimeoutMinutes` | 30 | A run that takes longer is stopped and reported |
 | `outbox.destinations` | | Where notifications go (see [Notifications](#notifications)) |
-| `outbox.maxPerRun` | 5 | Most notifications one run can send |
 | `outbox.on` | `["failed", "timeout"]` | Which outcomes send an automatic notice |
 | `jobs` | | Automations kept in the file (below) |
 | `channels` | | Channels kept in the file. See `examples/opencode.jsonc` |

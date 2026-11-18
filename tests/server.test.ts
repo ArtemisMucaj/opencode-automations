@@ -350,10 +350,10 @@ test("runs that can't notify are never asked", async () => {
   expect(app.store.history()[0].status).toBe("succeeded")
 })
 
-test("automation_notify is limited per run and rejects text too long", async () => {
+test("automation_notify rejects text too long", async () => {
   const fetch = spyOn(globalThis, "fetch").mockResolvedValue(new Response("ok"))
   try {
-    const app = await start({ outbox: { maxPerRun: 2, ...pushover } }, [job()])
+    const app = await start({ outbox: pushover }, [job()])
     await app.call("automation_run", { id: "morning" })
     const long = await app.call("automation_notify", { title: "Dump", message: ("word ".repeat(30) + "\n").repeat(40) }, "session-1")
     expect(long.content).toContain("error: message is")
@@ -361,9 +361,8 @@ test("automation_notify is limited per run and rejects text too long", async () 
     expect(wall.content).toContain("too long to read on a phone")
     expect(fetch.mock.calls).toHaveLength(0)
     // Long links alone don't make a line too long.
-    expect((await app.call("automation_notify", { title: "Link", message: "MR ready:\nhttps://x.test/" + "a".repeat(300) }, "session-1")).content).toContain("1 notifications left")
-    expect((await app.call("automation_notify", { title: "B", message: "two" }, "session-1")).content).toContain("0 notifications left")
-    expect((await app.call("automation_notify", { title: "C", message: "three" }, "session-1")).content).toContain("limit 2")
+    expect((await app.call("automation_notify", { title: "Link", message: "MR ready:\nhttps://x.test/" + "a".repeat(300) }, "session-1")).content).toContain("Outbox message queued")
+    expect((await app.call("automation_notify", { title: "B", message: "two" }, "session-1")).content).toContain("Outbox message queued")
     await sent(fetch, 2)
     expect(fetch.mock.calls).toHaveLength(2)
   } finally { fetch.mockRestore() }
@@ -650,7 +649,7 @@ test("automation_notify is offered, with guidance, only to runs that may notify"
   const run = app.context("session-1")
   expect(run.tools).toContain("automation_notify")
   expect(run.system).toContain("running unattended as an automation")
-  expect(run.system).toEndWith('This run is for the automation "Morning" (id: morning). Each run starts in a new session. You can send up to 5 notifications in this run.')
+  expect(run.system).toEndWith('This run is for the automation "Morning" (id: morning). Each run starts in a new session.')
   expect(run.system).toContain("not sent anywhere")
   expect(run.system).toContain("no markdown")
   expect(app.tools.get("automation_notify")?.description).toContain("full URLs")
