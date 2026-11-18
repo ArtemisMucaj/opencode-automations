@@ -78,3 +78,21 @@ export class Owned<V> {
   /** This instance's entry, else another instance's. */
   find(id: string) { return this.mine.get(id) ?? this.all.get(id) }
 }
+
+export const ENV_REF = /\{env:([A-Za-z_][A-Za-z0-9_]*)\}/g
+
+/** Fill every {env:NAME}, deeply; throws on one that isn't set. */
+export function withEnv<T>(value: T, env: Record<string, string | undefined> = process.env): T {
+  if (typeof value === "string") {
+    return value.replace(ENV_REF, (_, name: string) => {
+      const v = env[name]
+      if (v === undefined) throw new Error(`environment variable ${name} is not set`)
+      return v
+    }) as T
+  }
+  if (Array.isArray(value)) return value.map((v) => withEnv(v, env)) as T
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, withEnv(v, env)])) as T
+  }
+  return value
+}

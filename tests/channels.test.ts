@@ -1,10 +1,8 @@
 import { expect, test } from "bun:test"
 import {
-  envNames, literalSecrets, requeue,
-  assign, chunks, composeEvents, emptyQueue, emptySource, enqueue, extract, get, ingest, MAX_QUEUE, parseChannel, poll,
-  render, touch, withEnv,
-  type ChannelConfig,
+  chunks, composeEvents, envNames, extract, get, literalSecrets, parseChannel, poll, render, type ChannelConfig,
 } from "../channels.ts"
+import { withEnv } from "../util.ts"
 
 const base: ChannelConfig = {
   id: "dd",
@@ -50,23 +48,6 @@ test("items are filtered and mapped to events", () => {
   expect(() => extract(parseChannel({ ...base, items: "data" }), { data: {} })).toThrow("not an array")
 })
 
-test("the first poll returns everything there; later polls return only new IDs", () => {
-  const ch = parseChannel(base)
-  const source = emptySource()
-  expect(ingest(source, extract(ch, monitors)).map((e) => e.id)).toEqual(["1:t1", "3:t2"])
-  // Same items again: nothing new. A re-alert (new modified time) is new.
-  expect(ingest(source, extract(ch, monitors))).toEqual([])
-  const realert = [{ ...monitors[0], overall_state_modified: "t9" }, monitors[2]]
-  expect(ingest(source, extract(ch, realert)).map((e) => e.id)).toEqual(["1:t9"])
-})
-
-test("queues drop the oldest events beyond their cap", () => {
-  const queue = emptyQueue()
-  enqueue(queue, Array.from({ length: MAX_QUEUE + 5 }, (_, i) => ({ channel: "dd", id: `e${i}`, sessionKey: "k", title: "t" })))
-  expect(queue.pending.length).toBe(MAX_QUEUE)
-  expect(queue.pending[0].id).toBe("e5")
-})
-
 test("events are chunked by channel and session key when asked, and each chunk is capped", () => {
   const e = (id: string, sessionKey: string, channel = "dd") => ({ channel, id, sessionKey, title: id })
   const pending = [e("a1", "a"), e("b1", "b"), e("a2", "a"), e("x1", "a", "sentry")]
@@ -78,58 +59,6 @@ test("events are chunked by channel and session key when asked, and each chunk i
   ])
   expect(chunks(pending, false, 10)).toEqual([{ events: pending }])
   expect(chunks([], false, 10)).toEqual([])
-})
-
-test("assigned sessions are capped, dropping the least recently used", () => {
-  const queue = emptyQueue()
-  for (let i = 0; i < 205; i++) assign(queue, `k${i}`, `s${i}`, i)
-  expect(Object.keys(queue.sessions).length).toBe(200)
-  expect(queue.sessions.k0).toBeUndefined()
-  expect(queue.sessions.k204).toEqual({ id: "s204", at: 204 })
-})
-
-test("a key's session counts as used when touched (a run ended), not on every assign", () => {
-  const queue = emptyQueue()
-  assign(queue, "busy", "s-busy", 0)
-  assign(queue, "busy", "s-busy", 300) // same mapping: keeps its time
-  expect(queue.sessions.busy.at).toBe(0)
-  touch(queue, "busy", "s-busy", 500)
-  touch(queue, "busy", "other-session", 900) // no longer this key's session: ignored
-  expect(queue.sessions.busy).toEqual({ id: "s-busy", at: 500 })
-  for (let i = 0; i < 199; i++) assign(queue, `k${i}`, `s${i}`, 10 + i)
-  assign(queue, "newest", "s-new", 600) // one key too many: the least recently used goes
-  expect(queue.sessions.busy).toBeDefined()
-  expect(queue.sessions.k0).toBeUndefined()
-})
-
-test("keys with a run in progress are never evicted", () => {
-  const queue = emptyQueue()
-  assign(queue, "running", "s-run", 0)
-  for (let i = 0; i < 199; i++) assign(queue, `k${i}`, `s${i}`, 10 + i)
-  assign(queue, "newest", "s-new", 600, ["running"])
-  expect(queue.sessions.running).toBeDefined()
-  expect(queue.sessions.k0).toBeUndefined()
-})
-
-test("eviction goes by age even for numeric keys, which objects sort first", () => {
-  const queue = emptyQueue()
-  for (let i = 0; i < 200; i++) assign(queue, String(1000 + i), `s${i}`, 10 + i)
-  // A low monitor ID, newest of all: it must stay, and the oldest (1000) must go.
-  assign(queue, "5", "new", 999)
-  expect(queue.sessions["5"]).toEqual({ id: "new", at: 999 })
-  expect(queue.sessions["1000"]).toBeUndefined()
-  expect(queue.sessions["1001"]).toBeDefined()
-})
-
-test("trimming seen IDs never forgets one still in the response", () => {
-  const source = emptySource()
-  const ev = (id: string) => ({ channel: "dd", id, title: id })
-  ingest(source, [ev("still-alerting")])
-  // 1500 other IDs come and go while the first alert stays in every response.
-  for (let i = 0; i < 1500; i++) ingest(source, [ev("still-alerting"), ev(`other-${i}`)])
-  expect(source.seen).toContain("still-alerting")
-  expect(source.seen.length).toBeLessThanOrEqual(1000)
-  expect(ingest(source, [ev("still-alerting")])).toEqual([])
 })
 
 test("the prompt marks event text as untrusted and it can't close its own tag", () => {
@@ -174,14 +103,4 @@ test("secrets must be {env:NAME} references in headers, query parameters and bod
 
 test("env references are listed with the ones not set", () => {
   expect(envNames({ url: "https://x.test/?k={env:A}", headers: { h: "{env:B}" } }, { A: "1" })).toEqual({ names: ["A", "B"], missing: ["B"] })
-})
-
-test("putting events back into a full queue drops the oldest, like adding does", () => {
-  const ev = (id: string) => ({ channel: "dd", id, title: id })
-  const queue = emptyQueue()
-  enqueue(queue, Array.from({ length: MAX_QUEUE }, (_, i) => ev(`new-${i}`)))
-  requeue(queue, [ev("old-1"), ev("old-2")])
-  expect(queue.pending.length).toBe(MAX_QUEUE)
-  expect(queue.pending.at(-1)!.id).toBe(`new-${MAX_QUEUE - 1}`) // the newest stay
-  expect(queue.pending.some((e) => e.id.startsWith("old-"))).toBe(false) // the events put back are the oldest: they go
 })

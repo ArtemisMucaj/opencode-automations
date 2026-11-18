@@ -2,7 +2,7 @@
 
 import { describe } from "./cron.ts"
 import {
-  CHANNEL_ID, envNames, literalSecrets, parseChannel, removeChannel, requestPoll, type Channel, type ChannelConfig, type Scalar,
+  CHANNEL_ID, envNames, literalSecrets, parseChannel, requestPoll, type Channel, type ChannelConfig, type Scalar,
 } from "./channels.ts"
 import { CODE_MODE } from "./guides.ts"
 import { isActive, listens, runnable } from "./jobs.ts"
@@ -35,15 +35,16 @@ export function channelTools(tools: ToolEditor, rt: Runtime) {
     input: { type: "object", properties: {}, additionalProperties: false },
     execute: async () => {
       const jobs = load()
-      const { sources, queues, defs } = store.loadChannels()
+      const { sources, defs } = store.loadChannels()
       const channels = allChannels(defs)
+      const counts = store.waitingCounts()
       if (!channels.size) return text("No channels. Create one with channel_create.")
       const lines = [...channels.values()].map((ch) => {
         const s = sources[ch.id]
         const host = (() => { try { return new URL(ch.request.url).host } catch { return ch.request.url } })()
         const subs = jobs.filter((j) => listens(j, ch.id))
         const listeners = subs.length
-          ? subs.map((j) => `${j.id}${isActive(j) ? "" : " (off)"}: ${queues[j.id]?.pending?.length ?? 0} waiting`).join(", ")
+          ? subs.map((j) => `${j.id}${isActive(j) ? "" : " (off)"}: ${counts.get(j.id)?.get(ch.id) ?? 0} waiting`).join(", ")
           : "no automations, not polled"
         const { missing } = envNames(ch.request)
         return (
@@ -71,10 +72,9 @@ export function channelTools(tools: ToolEditor, rt: Runtime) {
         return text(`Poll of ${ch.id} queued; the leader process runs it within ${tickMs / 1000}s.`)
       }
       if (rt.isPolling(ch.id)) return text(`${ch.id} is already polling.`)
-      const polled = await track(pollChannels([ch]))
-      const r = polled.results.get(ch.id)!
+      const r = (await track(pollChannels([ch]))).get(ch.id)!
       if (r.error) return text(`error: poll of ${ch.id} failed: ${r.error}`)
-      const started = await track(processArrivals(load(), ch.id, polled.state))
+      const started = await track(processArrivals(load(), ch.id))
       return text(`Polled ${ch.id}: ${plural(r.fresh, "new event")}, ${plural(started, "run")} started.`)
     },
   }))
@@ -197,8 +197,7 @@ export function channelTools(tools: ToolEditor, rt: Runtime) {
       const { id } = input
       if (configChannels.has(id)) throw new Error(`"${id}" is defined in opencode.json(c); remove it there`)
       if (!store.loadChannels().defs[id]) throw new Error(`no channel "${id}" created with channel_create`)
-      // Under the jobs lock, so an automation can't attach the channel between the check and the delete.
-      const { users, paused } = await mutate(async (jobs) => {
+      const { users, paused } = await mutate((jobs) => {
         const users = jobs.filter((j) => listens(j, id))
         const fromConfig = users.filter((j) => j.source === "config")
         if (fromConfig.length) throw new Error(`config automations use it (${fromConfig.map((j) => j.id).join(", ")}); change them in opencode.json(c) first`)
@@ -214,7 +213,7 @@ export function channelTools(tools: ToolEditor, rt: Runtime) {
             if (!runnable(j)) { j.paused = true; paused.push(j.id) }
           }
         }
-        await store.mutateChannels((s) => removeChannel(s, id))
+        store.removeChannel(id)
         return { users, paused }
       })
       return text(

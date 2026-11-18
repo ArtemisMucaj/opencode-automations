@@ -72,6 +72,7 @@ test("TUI renders automations page and persists pause/run-now actions", async ()
     directory: dataDir, session: "new", timeoutMinutes: 30, runMissed: true, enabled: true,
     source: "tool", createdAt: Date.now(), nextRunAt: Date.now() + 60_000,
   } satisfies Job])
+  store.enqueue({ job: "morning", title: "3 MRs need you", body: "!12 blocked", priority: "normal" }, ["phone"])
   const testRenderer = await createTestRenderer({ width: 120, height: 45 })
   const host = fakeHost(dataDir, testRenderer.renderer)
   let stop: Awaited<ReturnType<typeof plugin.setup>> | undefined
@@ -103,6 +104,9 @@ test("TUI renders automations page and persists pause/run-now actions", async ()
     expect(frame).toContain("Automations")
     expect(frame).toContain("Morning triage")
     expect(frame).toContain("Check merge requests")
+    // What it told the user, and where that stands.
+    expect(frame).toContain("3 MRs need you")
+    expect(frame).toMatch(/phone\s+pending/)
     await host.command((command) => command.title === "pause/resume").run()
     expect(store.loadJobs()[0].paused).toBe(true)
     await host.command((command) => command.title === "run now").run()
@@ -125,16 +129,19 @@ test("TUI channels tab shows status, mapping and listeners, and queues a poll", 
     directory: dataDir, session: "sticky", timeoutMinutes: 30, runMissed: true, enabled: true,
     on: { channels: ["datadog", "sentry"] }, source: "tool", createdAt: Date.now(),
   } satisfies Job])
+  const polled = Date.now() - 30_000
   await store.mutateChannels((s) => {
     s.config.datadog = {
       name: "Datadog", url: "https://api.example.test/api/v1/monitor", everyMs: 60_000, items: "",
       filter: { overall_state: ["Alert"] }, event: { id: "{id}:{overall_state_modified}", sessionKey: "{id}", title: "{name}" }, env: ["DD_API_KEY"],
     }
-    s.defs.sentry = { id: "sentry", name: "Sentry", every: "5m", request: { url: "https://sentry.example.test/issues?token={env:T}" }, event: { id: "{id}" }, createdAt: 1 }
-    s.sources.datadog = { seen: [], lastPollAt: Date.now() - 30_000, lastOkAt: Date.now() - 30_000 }
-    s.sources.sentry = { seen: [], lastPollAt: Date.now(), lastError: "HTTP 403: bad token", failures: 3 }
-    s.queues.triage = { pending: [{ channel: "datadog", id: "1:t", title: "CPU high on web-1" }], sessions: {} }
+    s.defs.sentry = { id: "sentry", name: "Sentry", every: "5m", request: { url: "https://sentry.example.test/issues?token={env:T}" }, event: { id: "{id}" } }
+    s.sources.datadog = { lastPollAt: polled, lastOkAt: polled }
+    s.sources.sentry = { lastPollAt: Date.now(), lastError: "HTTP 403: bad token", failures: 3 }
   })
+  // The latest poll's event waits for the automation attached to the channel.
+  store.ingest("datadog", [{ channel: "datadog", id: "1:t", title: "CPU high on web-1" }], polled)
+  store.subscribe(store.loadJobs(), { datadog: polled })
   const testRenderer = await createTestRenderer({ width: 140, height: 50 })
   const host = fakeHost(dataDir, testRenderer.renderer)
   let stop: Awaited<ReturnType<typeof plugin.setup>> | undefined

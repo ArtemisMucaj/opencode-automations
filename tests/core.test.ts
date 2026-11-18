@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test"
-import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { Job } from "../store.ts"
@@ -75,12 +75,14 @@ test("store persists edits and keeps latest status per run", async () => {
   expect(b.history("one", 10)[0].status).toBe("succeeded")
   expect(b.history(undefined, 1)[0].runID).toBe("r2")
   expect(b.history(undefined, 0)).toEqual([])
-  // A line cut short by a crash is skipped; the runs around it still load.
-  appendFileSync(join(dir, "history.jsonl"), '{"runID":"r3","jobID"\n')
   a.appendRun({ runID: "r4", jobID: "two", startedAt: 4, status: "succeeded" })
   expect(b.history().map((r) => r.runID)).toEqual(["r4", "r2", "r1"])
-  writeFileSync(join(dir, "jobs.json"), "broken")
-  expect(() => a.loadJobs()).toThrow()
+  // A write that changes nothing isn't one: the TUI, which watches for writes, isn't woken.
+  const version = b.version()
+  a.saveJobs(a.loadJobs())
+  expect(b.version()).toBe(version)
+  a.saveJobs([])
+  expect(b.version()).not.toBe(version)
 })
 
 test("lease elects one store instance and releases ownership", async () => {
@@ -102,46 +104,24 @@ test("lease elects one store instance and releases ownership", async () => {
   }
 })
 
-test("channel state waits for a lock held by another process instead of failing", async () => {
+test("a write waits for one in progress in another process instead of failing", async () => {
   const { Store } = await import("../store.ts")
   const dir = temp()
   const store = new Store(dir)
   const holder = Bun.spawn(["bun", "-e", `
-    const lockfile = require("proper-lockfile")
-    const release = lockfile.lockSync(${JSON.stringify(join(dir, "channels.json"))}, { realpath: false })
+    const { Database } = require("bun:sqlite")
+    const db = new Database(${JSON.stringify(join(dir, "state.db"))})
+    db.exec("BEGIN IMMEDIATE")
     console.log("locked")
-    setTimeout(() => { release(); process.exit(0) }, 300)
-  `], { cwd: join(import.meta.dir, ".."), stdout: "pipe" })
-  const reader = holder.stdout.getReader()
-  await reader.read() // "locked"
+    setTimeout(() => { db.exec("COMMIT"); process.exit(0) }, 300)
+  `], { stdout: "pipe" })
+  await holder.stdout.getReader().read() // "locked"
   const started = Date.now()
-  await store.mutateChannels((s) => { s.sources.x = { seen: ["a"] } })
+  await store.mutateChannels((s) => { s.sources.x = { failures: 1 } })
   expect(Date.now() - started).toBeGreaterThanOrEqual(100)
-  expect(store.loadChannels().sources.x.seen).toEqual(["a"])
+  expect(store.loadChannels().sources.x).toEqual({ failures: 1 })
   await holder.exited
-})
-
-test("waiting for a busy lock doesn't block the event loop", async () => {
-  const { Store } = await import("../store.ts")
-  const dir = temp()
-  const store = new Store(dir)
-  const holder = Bun.spawn(["bun", "-e", `
-    const lockfile = require("proper-lockfile")
-    const release = lockfile.lockSync(${JSON.stringify(join(dir, "channels.json"))}, { realpath: false })
-    console.log("locked")
-    setTimeout(() => { release(); process.exit(0) }, 400)
-  `], { cwd: join(import.meta.dir, ".."), stdout: "pipe" })
-  await holder.stdout.getReader().read()
-  // A timer set while the write waits for the lock must fire on time, not after the lock is free.
-  let fired = 0
-  const started = Date.now()
-  const timer = new Promise<void>((r) => setTimeout(() => { fired = Date.now() - started; r() }, 50))
-  const write = store.mutateChannels((s) => { s.sources.x = { seen: [] } })
-  await timer
-  expect(fired).toBeLessThan(250)
-  await write
-  expect(Date.now() - started).toBeGreaterThanOrEqual(200)
-  await holder.exited
+  store.close()
 })
 
 test("within waits at most its time, or until its signal aborts", async () => {
@@ -155,19 +135,19 @@ test("within waits at most its time, or until its signal aborts", async () => {
   await expect(within(Promise.reject(new Error("boom")), 1000)).rejects.toThrow("boom")
 })
 
-test("history reads from the end of the file, across blocks, and stops when it has enough", async () => {
+test("history gives the latest record of each run, newest first, per automation", async () => {
   const { Store } = await import("../store.ts")
   const s = new Store(temp())
-  // Over 64 KB of records, with multi-byte text, so lines straddle block boundaries.
-  for (let i = 0; i < 1500; i++) {
+  for (let i = 0; i < 20; i++) {
     s.appendRun({ runID: `r${i}`, jobID: i % 2 ? "odd" : "even", startedAt: i, status: "running" })
     s.appendRun({ runID: `r${i}`, jobID: i % 2 ? "odd" : "even", startedAt: i, endedAt: i + 1, status: "failed", error: "délai dépassé ⧗" })
   }
-  expect(s.history(undefined, 3).map((r) => r.runID)).toEqual(["r1499", "r1498", "r1497"])
-  expect(s.history("even", 2).map((r) => r.runID)).toEqual(["r1498", "r1496"])
+  expect(s.history(undefined, 3).map((r) => r.runID)).toEqual(["r19", "r18", "r17"])
+  expect(s.history("even", 2).map((r) => r.runID)).toEqual(["r18", "r16"])
   const all = s.history(undefined, 5000)
-  expect(all).toHaveLength(1500)
+  expect(all).toHaveLength(20)
   expect(all.every((r) => r.status === "failed" && r.error === "délai dépassé ⧗")).toBe(true)
+  s.close()
 })
 
 test("the small helpers format counts, durations and errors", async () => {

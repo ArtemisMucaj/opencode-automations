@@ -6,9 +6,9 @@
       "options": {
         "tickSeconds": 30,
         "defaultTimeoutMinutes": 30,
-        // Native desktop notifications enabled for automation run completion.
-        "notify": {
-          "native": true,
+        // Desktop notifications for what automations report.
+        "outbox": {
+          "destinations": [{ "id": "desktop", "type": "Notification.Native" }],
         },
         // No sample jobs run automatically.
         // See examples/opencode.jsonc for opt-in configuration.

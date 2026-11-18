@@ -8,18 +8,15 @@ import { insertNode as _$insertNode } from "@opentui/solid";
 import { insert as _$insert } from "@opentui/solid";
 import { createElement as _$createElement } from "@opentui/solid";
 // opencode v2 TUI plugin for automations.
-// Reads the same jobs.json / history.jsonl the server plugin writes, and writes *intents*
-// back (pause, edit, delete, run-now). The server leader executes them on its next tick,
-// so there is still exactly one firer and one run history.
+// Reads state.db and writes intents (pause, edit, delete, run now) that the server's leader carries out.
 
 import { Plugin } from "@opencode/plugin/tui";
-import { watch } from "node:fs";
 import { createMemo, createSignal, For, Index, Show } from "solid-js";
 import { describe, nextRun } from "./cron.ts";
 import { DEFAULT_TIMEOUT_MINUTES, defaultDataDir, isActive, listens, newJob, parseScheduleText, runnable, runningJobs, stateOf } from "./jobs.ts";
 import { clock, elapsed, errorMessage, plural, relative } from "./util.ts";
 import { Store } from "./store.ts";
-import { channelRows, emptyChannels, removeChannel, requestPoll } from "./channels.ts";
+import { channelRows, emptyChannels, requestPoll } from "./channels.ts";
 const glyph = {
   running: "◐",
   succeeded: "✓",
@@ -53,11 +50,11 @@ function look(ctx, surface) {
 }
 const keyHints = [["c", "channels"], ["↑↓", "select"], ["space", "pause"], ["r", "run now"], ["n", "new"], ["e", "prompt"], ["s", "schedule"], ["m", "model"], ["d", "delete"], ["⏎", "open session"], ["esc", "close"]];
 const channelHints = [["c", "automations"], ["↑↓", "select"], ["p", "poll now"], ["d", "delete"], ["esc", "close"]];
-
-/** The TUI waits only briefly for the channels lock (the server may hold it), so the screen never freezes for long. */
-const LOCK_WAIT_MS = 200;
+const BUSY_MS = 250;
 export function createState(ctx, dataDir) {
-  const store = new Store(dataDir);
+  const store = new Store(dataDir, {
+    busyMs: BUSY_MS
+  });
   const [jobs, setJobs] = createSignal(store.loadJobs());
   const [runs, setRuns] = createSignal(store.history(undefined, 300));
   const [now, setNow] = createSignal(Date.now());
@@ -69,6 +66,28 @@ export function createState(ctx, dataDir) {
     }
   };
   const [channels, setChannels] = createSignal(loadChannels());
+  const loadWaiting = () => {
+    try {
+      return {
+        counts: store.waitingCounts(),
+        first: new Map(jobs().filter(j => j.on).map(j => [j.id, store.waiting(j.id, 20)]))
+      };
+    } catch {
+      return {
+        counts: new Map(),
+        first: new Map()
+      };
+    }
+  };
+  const [waiting, setWaiting] = createSignal(loadWaiting());
+  const loadSent = () => {
+    try {
+      return new Map(jobs().map(j => [j.id, store.sent(j.id, 5)]));
+    } catch {
+      return new Map();
+    }
+  };
+  const [sent, setSent] = createSignal(loadSent());
   // Kept here, not in the view: the dialog is re-created after nested prompts and must reopen on the same job and tab.
   const [selectedID, setSelectedID] = createSignal();
   const [selectedChannel, setSelectedChannel] = createSignal();
@@ -77,7 +96,7 @@ export function createState(ctx, dataDir) {
   const seen = new Set(runs().filter(r => r.status !== "running").map(r => r.runID));
   function refresh() {
     let next;
-    // Runs from a timer and the file watcher: a file that can't be read now keeps what is shown.
+    // State that can't be read now keeps what is shown.
     try {
       setJobs(store.loadJobs());
       next = store.history(undefined, 300);
@@ -85,6 +104,8 @@ export function createState(ctx, dataDir) {
       return;
     }
     setChannels(loadChannels());
+    setWaiting(loadWaiting());
+    setSent(loadSent());
     setRuns(next);
     setNow(Date.now());
     for (const r of next) {
@@ -123,18 +144,22 @@ export function createState(ctx, dataDir) {
     }
   }
   const act = fn => attempt(() => store.mutate(fn));
-  const actChannels = fn => attempt(() => store.mutateChannels(fn, LOCK_WAIT_MS));
+  const actChannels = fn => attempt(() => store.mutateChannels(fn));
+  const tick = () => setNow(Date.now());
   return {
     store,
     jobs,
     runs,
     now,
     refresh,
+    tick,
     act,
     selectedID,
     setSelectedID,
     channels,
     actChannels,
+    waiting,
+    sent,
     selectedChannel,
     setSelectedChannel,
     tab,
@@ -156,6 +181,7 @@ function AutomationsView(props) {
   const index = createMemo(() => Math.max(0, sorted().findIndex(j => j.id === selectedID())));
   const selected = createMemo(() => sorted()[index()]);
   const jobRuns = createMemo(() => state.runs().filter(r => r.jobID === selected()?.id).slice(0, 8));
+  const jobSent = createMemo(() => state.sent().get(selected()?.id ?? "") ?? []);
 
   // ---- channels tab ----
   const onChannels = () => state.tab() === "channels";
@@ -242,11 +268,11 @@ function AutomationsView(props) {
         message: `Delete the channel “${c.name}”? No automation uses it.`
       });
       if (!ok) return;
-      // Checked again under the jobs lock: this list may be up to 15 s old, and chat may have attached it since.
-      await toastErr(state.act(async jobs => {
+      // Checked again: chat may have attached it since.
+      await toastErr(state.act(jobs => {
         const now = jobs.filter(j => listens(j, c.id));
         if (now.length) throw new Error(`Used by ${now.map(j => j.name).join(", ")} now. Detach it from chat: channel_delete with detach.`);
-        await state.store.mutateChannels(s => removeChannel(s, c.id), LOCK_WAIT_MS);
+        state.store.removeChannel(c.id);
       }));
     })
   };
@@ -783,12 +809,8 @@ function AutomationsView(props) {
                   children: c => {
                     const src = () => state.channels().sources[c().id];
                     const users = () => listeners(c().id);
-                    const waiting = createMemo(() => {
-                      const out = new Map();
-                      for (const j of users()) out.set(j.id, state.channels().queues[j.id]?.pending.filter(e => e.channel === c().id) ?? []);
-                      return out;
-                    });
-                    const queue = id => waiting().get(id) ?? [];
+                    const count = id => state.waiting().counts.get(id)?.get(c().id) ?? 0;
+                    const first = id => (state.waiting().first.get(id) ?? []).filter(e => e.channel === c().id).slice(0, 3);
                     const status = () => chStatus(c());
                     return (() => {
                       var _el$50 = _$createElement("scrollbox"),
@@ -1005,10 +1027,10 @@ function AutomationsView(props) {
                                     var _c$ = _$memo(() => j.schedule.kind === "event");
                                     return () => _c$() ? "as events arrive" : describe(j.schedule);
                                   })(), _el$71);
-                                  _$insert(_el$69, () => queue(j.id).length, _el$72);
+                                  _$insert(_el$69, () => count(j.id), _el$72);
                                   _$insert(_el$65, _$createComponent(For, {
                                     get each() {
-                                      return queue(j.id).slice(0, 3);
+                                      return first(j.id);
                                     },
                                     children: e => (() => {
                                       var _el$73 = _$createElement("text");
@@ -1283,6 +1305,52 @@ function AutomationsView(props) {
                         return _el$89;
                       }
                     }), null);
+                    _$insert(_el$80, _$createComponent(Show, {
+                      get when() {
+                        return jobSent().length;
+                      },
+                      get children() {
+                        return _$createComponent(Block, {
+                          title: "Notified",
+                          hue: 3,
+                          get children() {
+                            var _el$90 = _$createElement("box");
+                            _$setProp(_el$90, "flexDirection", "column");
+                            _$insert(_el$90, _$createComponent(For, {
+                              get each() {
+                                return jobSent();
+                              },
+                              children: m => (() => {
+                                var _el$92 = _$createElement("text"),
+                                  _el$93 = _$createTextNode(` `),
+                                  _el$94 = _$createElement("span"),
+                                  _el$95 = _$createTextNode(`  `);
+                                _$insertNode(_el$92, _el$93);
+                                _$insertNode(_el$92, _el$94);
+                                _$insert(_el$92, () => clock(m.at), _el$93);
+                                _$insert(_el$92, () => m.title.slice(0, 60), _el$94);
+                                _$insertNode(_el$94, _el$95);
+                                _$insert(_el$94, () => m.sends.map(x => `${x.destination} ${x.status}`).join(", ") || "no destination takes it", null);
+                                _$effect(_p$ => {
+                                  var _v$36 = L().text,
+                                    _v$37 = {
+                                      fg: m.sends.some(x => x.status === "failed") ? L().bad : L().muted
+                                    };
+                                  _v$36 !== _p$.e && (_p$.e = _$setProp(_el$92, "fg", _v$36, _p$.e));
+                                  _v$37 !== _p$.t && (_p$.t = _$setProp(_el$94, "style", _v$37, _p$.t));
+                                  return _p$;
+                                }, {
+                                  e: undefined,
+                                  t: undefined
+                                });
+                                return _el$92;
+                              })()
+                            }));
+                            return _el$90;
+                          }
+                        });
+                      }
+                    }), null);
                     _$insert(_el$80, _$createComponent(Block, {
                       title: "Recent runs",
                       hue: 2,
@@ -1293,70 +1361,70 @@ function AutomationsView(props) {
                           },
                           get fallback() {
                             return (() => {
-                              var _el$91 = _$createElement("text");
-                              _$insertNode(_el$91, _$createTextNode(`none yet`));
-                              _$effect(_$p => _$setProp(_el$91, "fg", L().muted, _$p));
-                              return _el$91;
+                              var _el$96 = _$createElement("text");
+                              _$insertNode(_el$96, _$createTextNode(`none yet`));
+                              _$effect(_$p => _$setProp(_el$96, "fg", L().muted, _$p));
+                              return _el$96;
                             })();
                           },
                           get children() {
-                            var _el$90 = _$createElement("box");
-                            _$setProp(_el$90, "flexDirection", "column");
-                            _$insert(_el$90, _$createComponent(For, {
+                            var _el$91 = _$createElement("box");
+                            _$setProp(_el$91, "flexDirection", "column");
+                            _$insert(_el$91, _$createComponent(For, {
                               get each() {
                                 return jobRuns();
                               },
                               children: r => (() => {
-                                var _el$93 = _$createElement("box"),
-                                  _el$94 = _$createElement("text"),
-                                  _el$95 = _$createElement("span"),
-                                  _el$96 = _$createTextNode(` `),
-                                  _el$97 = _$createElement("span"),
-                                  _el$98 = _$createTextNode(`  `),
-                                  _el$99 = _$createTextNode(` `);
-                                _$insertNode(_el$93, _el$94);
-                                _$setProp(_el$93, "flexDirection", "column");
-                                _$insertNode(_el$94, _el$95);
-                                _$insertNode(_el$94, _el$96);
-                                _$insertNode(_el$94, _el$97);
-                                _$insert(_el$95, () => glyph[r.status]);
-                                _$insert(_el$94, () => clock(r.startedAt), _el$97);
-                                _$insertNode(_el$97, _el$98);
-                                _$insertNode(_el$97, _el$99);
-                                _$insert(_el$97, () => r.status, _el$99);
-                                _$insert(_el$97, () => elapsed(r), null);
-                                _$insert(_el$93, _$createComponent(Show, {
+                                var _el$98 = _$createElement("box"),
+                                  _el$99 = _$createElement("text"),
+                                  _el$100 = _$createElement("span"),
+                                  _el$101 = _$createTextNode(` `),
+                                  _el$102 = _$createElement("span"),
+                                  _el$103 = _$createTextNode(`  `),
+                                  _el$104 = _$createTextNode(` `);
+                                _$insertNode(_el$98, _el$99);
+                                _$setProp(_el$98, "flexDirection", "column");
+                                _$insertNode(_el$99, _el$100);
+                                _$insertNode(_el$99, _el$101);
+                                _$insertNode(_el$99, _el$102);
+                                _$insert(_el$100, () => glyph[r.status]);
+                                _$insert(_el$99, () => clock(r.startedAt), _el$102);
+                                _$insertNode(_el$102, _el$103);
+                                _$insertNode(_el$102, _el$104);
+                                _$insert(_el$102, () => r.status, _el$104);
+                                _$insert(_el$102, () => elapsed(r), null);
+                                _$insert(_el$98, _$createComponent(Show, {
                                   get when() {
                                     return r.error;
                                   },
                                   children: error => (() => {
-                                    var _el$100 = _$createElement("text");
-                                    _$insert(_el$100, () => "  " + error().slice(0, 100));
-                                    _$effect(_$p => _$setProp(_el$100, "fg", L().bad, _$p));
-                                    return _el$100;
+                                    var _el$105 = _$createElement("text");
+                                    _$insert(_el$105, () => "  " + error().slice(0, 100));
+                                    _$effect(_$p => _$setProp(_el$105, "fg", L().bad, _$p));
+                                    return _el$105;
                                   })()
                                 }), null);
                                 _$effect(_p$ => {
-                                  var _v$36 = L().text,
-                                    _v$37 = {
+                                  var _v$38 = L().text,
+                                    _v$39 = {
                                       fg: statusColor(r.status)
                                     },
-                                    _v$38 = {
+                                    _v$40 = {
                                       fg: L().muted
                                     };
-                                  _v$36 !== _p$.e && (_p$.e = _$setProp(_el$94, "fg", _v$36, _p$.e));
-                                  _v$37 !== _p$.t && (_p$.t = _$setProp(_el$95, "style", _v$37, _p$.t));
-                                  _v$38 !== _p$.a && (_p$.a = _$setProp(_el$97, "style", _v$38, _p$.a));
+                                  _v$38 !== _p$.e && (_p$.e = _$setProp(_el$99, "fg", _v$38, _p$.e));
+                                  _v$39 !== _p$.t && (_p$.t = _$setProp(_el$100, "style", _v$39, _p$.t));
+                                  _v$40 !== _p$.a && (_p$.a = _$setProp(_el$102, "style", _v$40, _p$.a));
                                   return _p$;
                                 }, {
                                   e: undefined,
                                   t: undefined,
                                   a: undefined
                                 });
-                                return _el$93;
+                                return _el$98;
                               })()
                             }));
-                            return _el$90;
+                            return _el$91;
                           }
                         });
                       }
@@ -1390,35 +1458,35 @@ function AutomationsView(props) {
             return onChannels() ? channelHints : keyHints;
           },
           children: ([key, label]) => (() => {
-            var _el$101 = _$createElement("text"),
-              _el$102 = _$createElement("span"),
-              _el$103 = _$createTextNode(` `),
-              _el$104 = _$createTextNode(` `),
-              _el$105 = _$createElement("span"),
-              _el$106 = _$createTextNode(` `);
-            _$insertNode(_el$101, _el$102);
-            _$insertNode(_el$101, _el$105);
-            _$insertNode(_el$102, _el$103);
-            _$insertNode(_el$102, _el$104);
-            _$insert(_el$102, key, _el$104);
-            _$insertNode(_el$105, _el$106);
-            _$insert(_el$105, label, null);
+            var _el$106 = _$createElement("text"),
+              _el$107 = _$createElement("span"),
+              _el$108 = _$createTextNode(` `),
+              _el$109 = _$createTextNode(` `),
+              _el$110 = _$createElement("span"),
+              _el$111 = _$createTextNode(` `);
+            _$insertNode(_el$106, _el$107);
+            _$insertNode(_el$106, _el$110);
+            _$insertNode(_el$107, _el$108);
+            _$insertNode(_el$107, _el$109);
+            _$insert(_el$107, key, _el$109);
+            _$insertNode(_el$110, _el$111);
+            _$insert(_el$110, label, null);
             _$effect(_p$ => {
-              var _v$39 = {
+              var _v$41 = {
                   fg: L().text,
                   bg: L().cap
                 },
-                _v$40 = {
+                _v$42 = {
                   fg: L().muted
                 };
-              _v$39 !== _p$.e && (_p$.e = _$setProp(_el$102, "style", _v$39, _p$.e));
-              _v$40 !== _p$.t && (_p$.t = _$setProp(_el$105, "style", _v$40, _p$.t));
+              _v$41 !== _p$.e && (_p$.e = _$setProp(_el$107, "style", _v$41, _p$.e));
+              _v$42 !== _p$.t && (_p$.t = _$setProp(_el$110, "style", _v$42, _p$.t));
               return _p$;
             }, {
               e: undefined,
               t: undefined
             });
-            return _el$101;
+            return _el$106;
           })()
         }));
         _$effect(_p$ => {
@@ -1468,78 +1536,78 @@ function SidebarSection(props) {
       return state.jobs().length || thisRun();
     },
     get children() {
-      var _el$107 = _$createElement("box"),
-        _el$108 = _$createElement("text"),
-        _el$109 = _$createElement("b"),
-        _el$111 = _$createElement("text");
-      _$insertNode(_el$107, _el$108);
-      _$insertNode(_el$107, _el$111);
-      _$setProp(_el$107, "flexDirection", "column");
-      _$setProp(_el$107, "marginTop", 1);
-      _$setProp(_el$107, "paddingLeft", 1);
-      _$setProp(_el$107, "paddingRight", 1);
-      _$setProp(_el$107, "paddingTop", 1);
-      _$setProp(_el$107, "paddingBottom", 1);
-      _$insertNode(_el$108, _el$109);
-      _$insertNode(_el$109, _$createTextNode(`⏰ Automations`));
-      _$insert(_el$107, _$createComponent(Show, {
+      var _el$112 = _$createElement("box"),
+        _el$113 = _$createElement("text"),
+        _el$114 = _$createElement("b"),
+        _el$116 = _$createElement("text");
+      _$insertNode(_el$112, _el$113);
+      _$insertNode(_el$112, _el$116);
+      _$setProp(_el$112, "flexDirection", "column");
+      _$setProp(_el$112, "marginTop", 1);
+      _$setProp(_el$112, "paddingLeft", 1);
+      _$setProp(_el$112, "paddingRight", 1);
+      _$setProp(_el$112, "paddingTop", 1);
+      _$setProp(_el$112, "paddingBottom", 1);
+      _$insertNode(_el$113, _el$114);
+      _$insertNode(_el$114, _$createTextNode(`⏰ Automations`));
+      _$insert(_el$112, _$createComponent(Show, {
         get when() {
           return thisRun();
         },
         children: r => (() => {
-          var _el$113 = _$createElement("text"),
-            _el$114 = _$createTextNode(`this session: `),
-            _el$115 = _$createTextNode(` `);
-          _$insertNode(_el$113, _el$114);
-          _$insertNode(_el$113, _el$115);
-          _$insert(_el$113, () => r().jobID, _el$115);
-          _$insert(_el$113, () => glyph[r().status], null);
-          _$effect(_$p => _$setProp(_el$113, "fg", L().info, _$p));
-          return _el$113;
+          var _el$118 = _$createElement("text"),
+            _el$119 = _$createTextNode(`this session: `),
+            _el$120 = _$createTextNode(` `);
+          _$insertNode(_el$118, _el$119);
+          _$insertNode(_el$118, _el$120);
+          _$insert(_el$118, () => r().jobID, _el$120);
+          _$insert(_el$118, () => glyph[r().status], null);
+          _$effect(_$p => _$setProp(_el$118, "fg", L().info, _$p));
+          return _el$118;
         })()
-      }), _el$111);
-      _$insert(_el$107, _$createComponent(For, {
+      }), _el$116);
+      _$insert(_el$112, _$createComponent(For, {
         get each() {
           return upcoming();
         },
         children: j => (() => {
-          var _el$116 = _$createElement("box"),
-            _el$117 = _$createElement("text"),
-            _el$118 = _$createElement("text");
-          _$insertNode(_el$116, _el$117);
-          _$insertNode(_el$116, _el$118);
-          _$setProp(_el$116, "flexDirection", "row");
-          _$setProp(_el$116, "justifyContent", "space-between");
-          _$insert(_el$117, () => j.name.slice(0, 18));
-          _$insert(_el$118, () => relative(j.nextRunAt, state.now()));
+          var _el$121 = _$createElement("box"),
+            _el$122 = _$createElement("text"),
+            _el$123 = _$createElement("text");
+          _$insertNode(_el$121, _el$122);
+          _$insertNode(_el$121, _el$123);
+          _$setProp(_el$121, "flexDirection", "row");
+          _$setProp(_el$121, "justifyContent", "space-between");
+          _$insert(_el$122, () => j.name.slice(0, 18));
+          _$insert(_el$123, () => relative(j.nextRunAt, state.now()));
           _$effect(_p$ => {
-            var _v$44 = L().text,
-              _v$45 = L().muted;
-            _v$44 !== _p$.e && (_p$.e = _$setProp(_el$117, "fg", _v$44, _p$.e));
-            _v$45 !== _p$.t && (_p$.t = _$setProp(_el$118, "fg", _v$45, _p$.t));
+            var _v$46 = L().text,
+              _v$47 = L().muted;
+            _v$46 !== _p$.e && (_p$.e = _$setProp(_el$122, "fg", _v$46, _p$.e));
+            _v$47 !== _p$.t && (_p$.t = _$setProp(_el$123, "fg", _v$47, _p$.t));
             return _p$;
           }, {
             e: undefined,
             t: undefined
           });
-          return _el$116;
+          return _el$121;
         })()
-      }), _el$111);
-      _$insertNode(_el$111, _$createTextNode(`/automations`));
+      }), _el$116);
+      _$insertNode(_el$116, _$createTextNode(`/automations`));
       _$effect(_p$ => {
-        var _v$41 = L().panel,
-          _v$42 = L().ink(0),
-          _v$43 = L().faint;
-        _v$41 !== _p$.e && (_p$.e = _$setProp(_el$107, "backgroundColor", _v$41, _p$.e));
-        _v$42 !== _p$.t && (_p$.t = _$setProp(_el$108, "fg", _v$42, _p$.t));
-        _v$43 !== _p$.a && (_p$.a = _$setProp(_el$111, "fg", _v$43, _p$.a));
+        var _v$43 = L().panel,
+          _v$44 = L().ink(0),
+          _v$45 = L().faint;
+        _v$43 !== _p$.e && (_p$.e = _$setProp(_el$112, "backgroundColor", _v$43, _p$.e));
+        _v$44 !== _p$.t && (_p$.t = _$setProp(_el$113, "fg", _v$44, _p$.t));
+        _v$45 !== _p$.a && (_p$.a = _$setProp(_el$116, "fg", _v$45, _p$.a));
         return _p$;
       }, {
         e: undefined,
         t: undefined,
         a: undefined
       });
-      return _el$107;
+      return _el$112;
     }
   });
 }
@@ -1549,18 +1617,18 @@ export default Plugin.define({
     const dataDir = typeof ctx.options.dataDir === "string" ? ctx.options.dataDir : defaultDataDir();
     const state = createState(ctx, dataDir);
 
-    // Live updates: atomic renames + appends in the data dir, plus a slow tick for "in 12m" labels.
-    let debounce;
-    let watcher;
-    try {
-      watcher = watch(dataDir, (_event, file) => {
-        // Lock directories and temp files come and go around every write; the rename that follows is what counts.
-        if (file && /\.(lock|tmp)$/.test(String(file))) return;
-        clearTimeout(debounce);
-        debounce = setTimeout(state.refresh, 150);
-      });
-    } catch {}
-    const ticker = setInterval(state.refresh, 15_000);
+    // Re-read when another process commits; a slow tick moves "in 12m" labels on.
+    let version = state.store.version();
+    const watcher = setInterval(() => {
+      try {
+        const v = state.store.version();
+        if (v !== version) {
+          version = v;
+          state.refresh();
+        }
+      } catch {}
+    }, 500);
+    const ticker = setInterval(state.tick, 15_000);
 
     // Shown as a dialog over the current screen rather than a routed page, which opencode puts in its own tab.
     const open = () => {
@@ -1601,9 +1669,9 @@ export default Plugin.define({
       }]
     }));
     return () => {
-      watcher?.close();
-      clearTimeout(debounce);
+      clearInterval(watcher);
       clearInterval(ticker);
+      state.store.close();
       for (const u of unregister) u();
     };
   }

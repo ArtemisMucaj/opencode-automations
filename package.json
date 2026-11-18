@@ -1,6 +1,6 @@
 {
   "name": "opencode-automations",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "exports": {
     ".": "./index.ts",
@@ -20,8 +20,7 @@
   "dependencies": {
     "@opencode/plugin": "2.2.1",
     "cron-parser": "5.10.2",
-    "pino": "10.4.0",
-    "proper-lockfile": "4.1.2"
+    "pino": "10.4.0"
   },
   "peerDependencies": {
     "@opentui/core": "0.7.0",
@@ -35,7 +34,6 @@
     "@opentui/core": "0.7.0",
     "@opentui/solid": "0.7.0",
     "@types/bun": "1.4.4",
-    "@types/proper-lockfile": "4.1.4",
     "babel-preset-solid": "1.9.12",
     "typescript": "7.0.2"
   }

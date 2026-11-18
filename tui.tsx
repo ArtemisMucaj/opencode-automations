@@ -1,17 +1,14 @@
 // opencode v2 TUI plugin for automations.
-// Reads the same jobs.json / history.jsonl the server plugin writes, and writes *intents*
-// back (pause, edit, delete, run-now). The server leader executes them on its next tick,
-// so there is still exactly one firer and one run history.
+// Reads state.db and writes intents (pause, edit, delete, run now) that the server's leader carries out.
 
 import type { Renderable, RGBA } from "@opentui/core"
 import { Plugin } from "@opencode/plugin/tui"
-import { watch, type FSWatcher } from "node:fs"
 import { createMemo, createSignal, For, Index, Show, type JSX } from "solid-js"
 import { describe, nextRun } from "./cron.ts"
 import { DEFAULT_TIMEOUT_MINUTES, defaultDataDir, isActive, listens, newJob, parseScheduleText, runnable, runningJobs, stateOf } from "./jobs.ts"
 import { clock, elapsed, errorMessage, plural, relative } from "./util.ts"
-import { Store, type Job, type Run, type RunStatus, type SessionMode } from "./store.ts"
-import { channelRows, emptyChannels, removeChannel, requestPoll, type ChannelEvent, type ChannelRow, type ChannelsState } from "./channels.ts"
+import { Store, type InboxEvent, type Job, type Run, type RunStatus, type SentMessage, type SessionMode } from "./store.ts"
+import { channelRows, emptyChannels, requestPoll, type ChannelRow, type ChannelsState } from "./channels.ts"
 
 type Context = Plugin.Context
 
@@ -62,15 +59,24 @@ const channelHints: [string, string][] = [
   ["esc", "close"],
 ]
 
-/** The TUI waits only briefly for the channels lock (the server may hold it), so the screen never freezes for long. */
-const LOCK_WAIT_MS = 200
+const BUSY_MS = 250
 export function createState(ctx: Context, dataDir: string) {
-  const store = new Store(dataDir)
+  const store = new Store(dataDir, { busyMs: BUSY_MS })
   const [jobs, setJobs] = createSignal<Job[]>(store.loadJobs())
   const [runs, setRuns] = createSignal<Run[]>(store.history(undefined, 300))
   const [now, setNow] = createSignal(Date.now())
   const loadChannels = () => { try { return store.loadChannels() } catch { return emptyChannels() } }
   const [channels, setChannels] = createSignal<ChannelsState>(loadChannels())
+  const loadWaiting = () => {
+    try {
+      return { counts: store.waitingCounts(), first: new Map(jobs().filter((j) => j.on).map((j) => [j.id, store.waiting(j.id, 20)])) }
+    } catch { return { counts: new Map<string, Map<string, number>>(), first: new Map<string, InboxEvent[]>() } }
+  }
+  const [waiting, setWaiting] = createSignal(loadWaiting())
+  const loadSent = () => {
+    try { return new Map(jobs().map((j) => [j.id, store.sent(j.id, 5)])) } catch { return new Map<string, SentMessage[]>() }
+  }
+  const [sent, setSent] = createSignal(loadSent())
   // Kept here, not in the view: the dialog is re-created after nested prompts and must reopen on the same job and tab.
   const [selectedID, setSelectedID] = createSignal<string>()
   const [selectedChannel, setSelectedChannel] = createSignal<string>()
@@ -81,12 +87,14 @@ export function createState(ctx: Context, dataDir: string) {
 
   function refresh() {
     let next: Run[]
-    // Runs from a timer and the file watcher: a file that can't be read now keeps what is shown.
+    // State that can't be read now keeps what is shown.
     try {
       setJobs(store.loadJobs())
       next = store.history(undefined, 300)
     } catch { return }
     setChannels(loadChannels())
+    setWaiting(loadWaiting())
+    setSent(loadSent())
     setRuns(next)
     setNow(Date.now())
     for (const r of next) {
@@ -114,10 +122,15 @@ export function createState(ctx: Context, dataDir: string) {
       return errorMessage(e)
     }
   }
-  const act = (fn: (jobs: Job[]) => void | Promise<void>) => attempt(() => store.mutate(fn))
-  const actChannels = (fn: (s: ChannelsState) => void) => attempt(() => store.mutateChannels(fn, LOCK_WAIT_MS))
+  const act = (fn: (jobs: Job[]) => void) => attempt(() => store.mutate(fn))
+  const actChannels = (fn: (s: ChannelsState) => void) => attempt(() => store.mutateChannels(fn))
 
-  return { store, jobs, runs, now, refresh, act, selectedID, setSelectedID, channels, actChannels, selectedChannel, setSelectedChannel, tab, setTab }
+  const tick = () => setNow(Date.now())
+
+  return {
+    store, jobs, runs, now, refresh, tick, act, selectedID, setSelectedID, channels, actChannels, waiting, sent,
+    selectedChannel, setSelectedChannel, tab, setTab,
+  }
 }
 
 type State = ReturnType<typeof createState>
@@ -133,6 +146,7 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
   const index = createMemo(() => Math.max(0, sorted().findIndex((j) => j.id === selectedID())))
   const selected = createMemo(() => sorted()[index()])
   const jobRuns = createMemo(() => state.runs().filter((r) => r.jobID === selected()?.id).slice(0, 8))
+  const jobSent = createMemo(() => state.sent().get(selected()?.id ?? "") ?? [])
 
   // ---- channels tab ----
   const onChannels = () => state.tab() === "channels"
@@ -212,11 +226,11 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
       }
       const ok = await ctx.ui.dialog.confirm({ title: "Delete channel", message: `Delete the channel “${c.name}”? No automation uses it.` })
       if (!ok) return
-      // Checked again under the jobs lock: this list may be up to 15 s old, and chat may have attached it since.
-      await toastErr(state.act(async (jobs) => {
+      // Checked again: chat may have attached it since.
+      await toastErr(state.act((jobs) => {
         const now = jobs.filter((j) => listens(j, c.id))
         if (now.length) throw new Error(`Used by ${now.map((j) => j.name).join(", ")} now. Detach it from chat: channel_delete with detach.`)
-        await state.store.mutateChannels((s) => removeChannel(s, c.id), LOCK_WAIT_MS)
+        state.store.removeChannel(c.id)
       }))
     }),
   }
@@ -500,12 +514,8 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
                     {(c) => {
                       const src = () => state.channels().sources[c().id]
                       const users = () => listeners(c().id)
-                      const waiting = createMemo(() => {
-                        const out = new Map<string, ChannelEvent[]>()
-                        for (const j of users()) out.set(j.id, state.channels().queues[j.id]?.pending.filter((e) => e.channel === c().id) ?? [])
-                        return out
-                      })
-                      const queue = (id: string) => waiting().get(id) ?? []
+                      const count = (id: string) => state.waiting().counts.get(id)?.get(c().id) ?? 0
+                      const first = (id: string) => (state.waiting().first.get(id) ?? []).filter((e) => e.channel === c().id).slice(0, 3)
                       const status = () => chStatus(c())
                       return (
                         <scrollbox flexGrow={1} minHeight={0}>
@@ -560,10 +570,10 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
                                           <span style={{ fg: isActive(j) ? L().ok : L().muted }}>{isActive(j) ? "●" : "○"}</span> {j.name}
                                           <span style={{ fg: L().muted }}>
                                             {"  "}
-                                            {j.schedule.kind === "event" ? "as events arrive" : describe(j.schedule)} · {queue(j.id).length} waiting
+                                            {j.schedule.kind === "event" ? "as events arrive" : describe(j.schedule)} · {count(j.id)} waiting
                                           </span>
                                         </text>
-                                        <For each={queue(j.id).slice(0, 3)}>
+                                        <For each={first(j.id)}>
                                           {(e) => <text fg={L().muted}>{"  " + e.title.slice(0, 90)}</text>}
                                         </For>
                                       </box>
@@ -647,6 +657,24 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
                         <Block title="Prompt" hue={1}>
                           <text fg={L().text}>{j().prompt}</text>
                         </Block>
+
+                        <Show when={jobSent().length}>
+                          <Block title="Notified" hue={3}>
+                            <box flexDirection="column">
+                              <For each={jobSent()}>
+                                {(m) => (
+                                  <text fg={L().text}>
+                                    {clock(m.at)} {m.title.slice(0, 60)}
+                                    <span style={{ fg: m.sends.some((x) => x.status === "failed") ? L().bad : L().muted }}>
+                                      {"  "}
+                                      {m.sends.map((x) => `${x.destination} ${x.status}`).join(", ") || "no destination takes it"}
+                                    </span>
+                                  </text>
+                                )}
+                              </For>
+                            </box>
+                          </Block>
+                        </Show>
 
                         <Block title="Recent runs" hue={2}>
                           <Show when={jobRuns().length} fallback={<text fg={L().muted}>none yet</text>}>
@@ -740,18 +768,15 @@ export default Plugin.define({
 
     const state = createState(ctx, dataDir)
 
-    // Live updates: atomic renames + appends in the data dir, plus a slow tick for "in 12m" labels.
-    let debounce: ReturnType<typeof setTimeout> | undefined
-    let watcher: FSWatcher | undefined
-    try {
-      watcher = watch(dataDir, (_event, file) => {
-        // Lock directories and temp files come and go around every write; the rename that follows is what counts.
-        if (file && /\.(lock|tmp)$/.test(String(file))) return
-        clearTimeout(debounce)
-        debounce = setTimeout(state.refresh, 150)
-      })
-    } catch {}
-    const ticker = setInterval(state.refresh, 15_000)
+    // Re-read when another process commits; a slow tick moves "in 12m" labels on.
+    let version = state.store.version()
+    const watcher = setInterval(() => {
+      try {
+        const v = state.store.version()
+        if (v !== version) { version = v; state.refresh() }
+      } catch {}
+    }, 500)
+    const ticker = setInterval(state.tick, 15_000)
 
     // Shown as a dialog over the current screen rather than a routed page, which opencode puts in its own tab.
     const open = () => {
@@ -780,9 +805,9 @@ export default Plugin.define({
     }))
 
     return () => {
-      watcher?.close()
-      clearTimeout(debounce)
+      clearInterval(watcher)
       clearInterval(ticker)
+      state.store.close()
       for (const u of unregister) u()
     }
   },

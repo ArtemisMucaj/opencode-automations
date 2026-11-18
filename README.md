@@ -87,13 +87,26 @@ Cron schedules follow daylight-saving changes in their timezone. If opencode was
 
 ## Notifications
 
-The server side of the plugin sends notifications, so they work with no opencode window open. Destinations are set under `notify` in the plugin options (see [Configuration](#configuration)).
+Everything the plugin tells you goes through an **outbox**. The agent running an automation writes a message (a title, a short plain-text body, and how urgent it is), and the plugin delivers it to every **destination** you configured: your desktop or your phone through Pushover. The agent never picks a destination. You set them up once, under `outbox.destinations` in the plugin options (see [Configuration](#configuration)):
 
-**What you receive.** The agent running the automation writes the notification itself: a title and a short, plain-text message with the most important thing first, since a lock screen only shows the first lines. It sends at most 5 per run by default. If a run finds nothing worth your attention, it stays quiet.
+```jsonc
+"outbox": {
+  "destinations": [
+    { "id": "desktop", "type": "Notification.Native" },
+    { "id": "phone", "type": "Notification.PushOver", "options": { "token": "{env:PUSHOVER_TOKEN}", "user": "{env:PUSHOVER_USER}" }, "minPriority": "normal" }
+  ]
+}
+```
 
-**What you always receive.** When a run fails or times out, you get a notice automatically, even if the agent never got to say anything. Per automation, you can turn notifications off entirely or change which outcomes get the automatic notice.
+- `minPriority` (`low`, `normal` or `high`) keeps a destination for what matters: with `"high"`, your phone only buzzes for things that need action soon.
+- Settings can reference environment variables as `{env:NAME}`, so tokens stay out of the file.
+- A delivery that fails (Pushover down, no network) is retried after 1, 5 and 30 minutes, then logged and given up on.
 
-The dialog also shows a toast when a run finishes, if opencode is open.
+**What you receive.** The agent writes the notification itself, most important thing first, since often only the first lines are shown. It sends at most 5 per run by default. If a run finds nothing worth your attention, it stays quiet.
+
+**What you always receive.** When a run fails or times out, you get a notice automatically, even if the agent never got to say anything. So does a channel that fails three polls in a row. Per automation, you can turn notifications off entirely or change which outcomes get the automatic notice.
+
+The dialog shows what each automation sent and where it was delivered, and a toast when a run finishes, if opencode is open.
 
 ## Sessions: fresh, sticky or current
 
@@ -103,7 +116,9 @@ Each automation picks where its runs happen:
 - **`sticky`**: runs share one conversation. The agent builds on what earlier runs found instead of redoing their work, and it doesn't repeat what it already told you. Good for "report only what changed" automations and for following an incident over several runs.
 - **`current`**: runs are queued into the chat you created the automation from. Only available when creating from chat.
 
-**How sticky sessions stay cheap.** Re-sending a long conversation to the model on every run would cost a lot, and providers keep the cache for only a few minutes. So each sticky run ends by writing a short memory of what it found, for the next run to read. The plugin then picks the cheapest way to continue:
+**Memory.** Every automation that runs more than once keeps a memory: each run ends by writing a short note of what it found (the current state, what it told you, what to watch for), and the next run starts from it. That is what lets "report only what changed" work, even with a new session per run. A run in a new session gets the note ahead of its prompt.
+
+**How sticky sessions stay cheap.** Re-sending a long conversation to the model on every run would cost a lot, and providers keep the cache for only a few minutes. A sticky session uses the same memory to pick the cheapest way to continue:
 
 - If the previous run ended recently enough that the model's cache is still warm, the next run continues the conversation as is.
 - Otherwise the conversation is compacted down to that memory first, so the model reads a few hundred characters instead of every earlier run. The session stays one entry in your list, with its whole history still viewable.
@@ -112,7 +127,7 @@ You don't need to do anything for this. The agent is told how to keep its memory
 
 ## Channels: run on events
 
-A channel watches an HTTP API. The plugin polls the API on a fixed interval and turns new items into events. Automations attached to a channel run when events arrive. Polling means nothing has to reach your machine from outside, so it works on a laptop behind a firewall.
+A channel watches an HTTP API. The plugin polls the API on a fixed interval and writes new items to a shared **inbox**. Each automation takes from the inbox the events of the channels it is attached to, and runs on them. Polling means nothing has to reach your machine from outside, so it works on a laptop behind a firewall.
 
 ```
 Datadog API ──poll every 1m──▶ new alerts ──▶ "alert-triage"  (runs as alerts arrive, one session per monitor)
@@ -134,7 +149,7 @@ The agent walks you through it. It reuses a channel if one already watches what 
 - **As events arrive.** An automation with a channel and no schedule runs each time something new comes in, with up to 10 events per run. With a sticky session and a per-item key (one per monitor, one per issue), a flapping alert stays in a single conversation with its history and memory.
 - **As a digest.** An automation with a channel *and* a schedule collects events and runs on schedule with everything since the last run (up to 50). If nothing is new, nothing runs.
 
-One channel can feed several automations, and one automation can listen to several channels. The first time an automation is attached to a channel, it receives everything currently there (what's alerting right now). After that it receives only new items. Paused automations keep their events for when they resume.
+One channel can feed several automations, and one automation can listen to several channels. When an automation is attached to a channel, it receives what the channel's latest poll returned (what's alerting right now). After that it receives only new items. Paused automations keep their events for when they resume. An event is dropped once every automation on its channel has taken it and its item has been gone from the API for 7 days.
 
 **Watching channels.** The `c` key in `/automations` shows each channel's status: polling or failing, what it polls and how often, the last poll and error, and which automations it feeds with how many events waiting. If a channel fails three polls in a row (expired key, API down), you get one notification.
 
@@ -153,9 +168,11 @@ Automations created from chat or the dialog need no configuration at all. The op
       "options": {
         "defaultTimeoutMinutes": 30,
         "defaultModel": "anthropic/claude-sonnet-4-5",
-        "notify": {
-          "native": true,
-          "pushover": { "token": "<app token>", "user": "<user key>" }
+        "outbox": {
+          "destinations": [
+            { "id": "desktop", "type": "Notification.Native" },
+            { "id": "phone", "type": "Notification.PushOver", "options": { "token": "{env:PUSHOVER_TOKEN}", "user": "{env:PUSHOVER_USER}" } }
+          ]
         },
         "jobs": [
           {
@@ -182,7 +199,7 @@ Configuration reloads on save. Run `/reload` if opencode is already open. `examp
 | `defaultModel` | the agent's | `provider/model`, applied when a run's session is created |
 | `defaultAgent` | | Agent for runs that don't name one |
 | `tickSeconds` | 30 | How often the plugin checks schedules and polls channels |
-| `notify` | | `native`, `pushover`, `on` (outcomes that get an automatic notice, default `["failed", "timeout"]`), `maxPerRun` (default 5) |
+| `outbox` | | `destinations` (see [Notifications](#notifications)), `on` (outcomes that get an automatic notice, default `["failed", "timeout"]`), `maxPerRun` (default 5) |
 | `jobs` | | Automations defined in config (below) |
 | `channels` | | Channels defined in config; see `examples/opencode.jsonc` |
 | `dataDir` | see below | Where automations and history are stored |
@@ -206,19 +223,26 @@ Automations from config can be paused and run from the dialog but not edited the
 
 ## Where things are stored
 
-`~/.local/share/opencode/plugins/automations/` (or under `$XDG_DATA_HOME`):
+Everything is in one SQLite database, `state.db`, in `~/.local/share/opencode/plugins/automations/` (or under `$XDG_DATA_HOME`):
 
-- `jobs.json`: automations created from chat or the dialog, plus the state of config ones (paused, last run, sticky session and memory)
-- `history.jsonl`: every run, with its outcome, session and how many notifications it sent. What a run said stays in its session. `automation_history` and the dialog read from it
-- `channels.json`: channels created from chat, which items have been seen, and events waiting for each automation
+- `jobs`: automations created from chat or the dialog, plus the state of config ones (paused, next and last run)
+- `runs`: every run, with its outcome, session and how many notifications it sent. What a run said stays in its session
+- `channel_defs`, `sources`: channels created from chat, and each channel's poll status
+- `inbox`, `subscriptions`, `deliveries`: the events channels brought in, and which automation took which
+- `sessions`, `memory`: sticky sessions and each automation's memory
+- `outbox`, `sends`: what was sent to you, and its delivery status per destination
+
+To look inside: `sqlite3 state.db "SELECT title, at FROM outbox ORDER BY id DESC LIMIT 5"`.
+
+**Upgrading from 0.1.** This version doesn't read the old `jobs.json`, `channels.json` and `history.jsonl`, and the `notify` option is replaced by `outbox`. Recreate your automations and channels, and move your notification settings to `outbox.destinations`. The old files can be deleted.
 
 The server part logs problems to opencode's stderr as JSON lines, one per problem, with the automation or channel it concerns. Problems include a poll that fails, state it can't save, and a notification that isn't delivered. Set `AUTOMATIONS_LOG_LEVEL` where the opencode server runs to change what is logged (`warn`, `error`, `silent`; default `info`).
 
 ## Under the hood
 
-Two parts ship in one package. A **server** part runs inside opencode's background server: it keeps time, starts runs, polls channels, follows each run to its end and sends notifications. A **TUI** part runs in each opencode window: the `/automations` dialog and the sidebar. Only the server starts a run, so with several windows open you still get exactly one run per schedule and one shared history.
+Two parts ship in one package. A **server** part runs inside opencode's background server: it keeps time, polls channels into the inbox, starts runs, follows each run to its end and delivers the outbox. A **TUI** part runs in each opencode window: the `/automations` dialog and the sidebar. Only one server process, the leader, starts runs and sends notifications, so with several windows open you still get exactly one run per schedule and one shared history. Elsewhere, "run now" is queued for the leader's next tick.
 
-Automations are ordinary opencode sessions, so anything your agents can do in chat, they can do in a run. The agent gets a few extra tools (`automation_*`, `channel_*`) and short guidance on notifying and remembering. The `/automation` and `/channel` commands hand it that guidance up front.
+Automations are ordinary opencode sessions, so anything your agents can do in chat, they can do in a run. The agent gets a few extra tools (`automation_*`, `channel_*`) and short guidance on notifying and remembering. It never sees the inbox or the outbox: the plugin hands a run its events, and delivers what it says. The `/automation` and `/channel` commands hand it that guidance up front.
 
 ## Developing
 
