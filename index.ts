@@ -615,7 +615,7 @@ export default Plugin.define({
       if (f && remembers(f.job)) add(MEMORY_GUIDE)
       else delete c.tools[UPDATE_TOOL]
       if (f?.job.session === "sticky") f.cacheMs ??= cacheLifetime(c.options)
-      if (f) add(runContext(f.job, notifies ? outbox.maxPerRun : undefined))
+      if (f) add(runContext(f.job))
     })
 
     await ctx.session.hook?.("compaction", (c) => {

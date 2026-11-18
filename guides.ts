@@ -61,7 +61,7 @@ export const RUN_GUIDE =
   `Write it as a notification, not a chat reply: plain text, no markdown (no **, #, backticks, tables or [text](url)). ` +
   `Lead with what matters most: it is read at a glance, often only the title and the first lines. ` +
   `Short lines, one item per line, a blank line between groups; paste links directly as full URLs. ` +
-  `Send few notifications, within the limit given below; group related items into one. ` +
+  `Send few notifications; group related items into one. ` +
   `Where it is delivered is set up by the user; you don't choose. Failures and timeouts are reported to the user automatically.`
 export const RUN_GUIDE_SHORT =
   `This run is ending and you haven't called ${NOTIFY_TOOL}, so the user has heard nothing: ` +
@@ -89,7 +89,6 @@ const SESSION_MODES: Record<SessionMode, string> = {
   sticky: "Its runs share this session.",
   current: "It runs in the chat it was created from.",
 }
-export const runContext = (job: Job, maxNotifications?: number) =>
-  `This run is for the automation "${job.name}" (id: ${job.id}). ${SESSION_MODES[job.session]}` +
-  (maxNotifications !== undefined ? ` You can send up to ${maxNotifications} notifications in this run.` : "")
+export const runContext = (job: Job) =>
+  `This run is for the automation "${job.name}" (id: ${job.id}). ${SESSION_MODES[job.session]}`
 
