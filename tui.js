@@ -182,6 +182,17 @@ function AutomationsView(props) {
   const selected = createMemo(() => sorted()[index()]);
   const jobRuns = createMemo(() => state.runs().filter(r => r.jobID === selected()?.id).slice(0, 8));
   const jobSent = createMemo(() => state.sent().get(selected()?.id ?? "") ?? []);
+  // Only the selected job's notes are read; state.runs() is replaced on every refresh, so this re-reads with it.
+  const jobNotes = createMemo(() => {
+    state.runs();
+    const id = selected()?.id;
+    if (!id) return [];
+    try {
+      return state.store.notes(id);
+    } catch {
+      return [];
+    }
+  });
 
   // ---- channels tab ----
   const onChannels = () => state.tab() === "channels";
@@ -1321,32 +1332,86 @@ function AutomationsView(props) {
                                 return jobSent();
                               },
                               children: m => (() => {
-                                var _el$92 = _$createElement("text"),
-                                  _el$93 = _$createTextNode(` `),
-                                  _el$94 = _$createElement("span"),
-                                  _el$95 = _$createTextNode(`  `);
-                                _$insertNode(_el$92, _el$93);
-                                _$insertNode(_el$92, _el$94);
-                                _$insert(_el$92, () => clock(m.at), _el$93);
-                                _$insert(_el$92, () => m.title.slice(0, 60), _el$94);
-                                _$insertNode(_el$94, _el$95);
-                                _$insert(_el$94, () => m.sends.map(x => `${x.destination} ${x.status}`).join(", ") || "no destination takes it", null);
+                                var _el$93 = _$createElement("text"),
+                                  _el$94 = _$createTextNode(` `),
+                                  _el$95 = _$createElement("span"),
+                                  _el$96 = _$createTextNode(`  `);
+                                _$insertNode(_el$93, _el$94);
+                                _$insertNode(_el$93, _el$95);
+                                _$insert(_el$93, () => clock(m.at), _el$94);
+                                _$insert(_el$93, () => m.title.slice(0, 60), _el$95);
+                                _$insertNode(_el$95, _el$96);
+                                _$insert(_el$95, () => m.sends.map(x => `${x.destination} ${x.status}`).join(", ") || "no destination takes it", null);
                                 _$effect(_p$ => {
                                   var _v$36 = L().text,
                                     _v$37 = {
                                       fg: m.sends.some(x => x.status === "failed") ? L().bad : L().muted
                                     };
-                                  _v$36 !== _p$.e && (_p$.e = _$setProp(_el$92, "fg", _v$36, _p$.e));
-                                  _v$37 !== _p$.t && (_p$.t = _$setProp(_el$94, "style", _v$37, _p$.t));
+                                  _v$36 !== _p$.e && (_p$.e = _$setProp(_el$93, "fg", _v$36, _p$.e));
+                                  _v$37 !== _p$.t && (_p$.t = _$setProp(_el$95, "style", _v$37, _p$.t));
                                   return _p$;
                                 }, {
                                   e: undefined,
                                   t: undefined
                                 });
-                                return _el$92;
+                                return _el$93;
                               })()
                             }));
                             return _el$90;
+                          }
+                        });
+                      }
+                    }), null);
+                    _$insert(_el$80, _$createComponent(Show, {
+                      get when() {
+                        return jobNotes().length;
+                      },
+                      get children() {
+                        return _$createComponent(Block, {
+                          title: "Memory",
+                          hue: 4,
+                          get children() {
+                            var _el$91 = _$createElement("box");
+                            _$setProp(_el$91, "flexDirection", "column");
+                            _$setProp(_el$91, "gap", 1);
+                            _$insert(_el$91, _$createComponent(For, {
+                              get each() {
+                                return jobNotes();
+                              },
+                              children: n => (() => {
+                                var _el$97 = _$createElement("box"),
+                                  _el$98 = _$createElement("text"),
+                                  _el$99 = _$createTextNode(`updated `),
+                                  _el$100 = _$createTextNode(` (`),
+                                  _el$101 = _$createTextNode(`)`),
+                                  _el$102 = _$createElement("text");
+                                _$insertNode(_el$97, _el$98);
+                                _$insertNode(_el$97, _el$102);
+                                _$setProp(_el$97, "flexDirection", "column");
+                                _$insertNode(_el$98, _el$99);
+                                _$insertNode(_el$98, _el$100);
+                                _$insertNode(_el$98, _el$101);
+                                _$insert(_el$98, (() => {
+                                  var _c$2 = _$memo(() => !!n.key);
+                                  return () => _c$2() ? `${n.key} · ` : "";
+                                })(), _el$99);
+                                _$insert(_el$98, () => clock(n.updatedAt), _el$100);
+                                _$insert(_el$98, () => relative(n.updatedAt, state.now()), _el$101);
+                                _$insert(_el$102, () => n.note);
+                                _$effect(_p$ => {
+                                  var _v$38 = L().muted,
+                                    _v$39 = L().text;
+                                  _v$38 !== _p$.e && (_p$.e = _$setProp(_el$98, "fg", _v$38, _p$.e));
+                                  _v$39 !== _p$.t && (_p$.t = _$setProp(_el$102, "fg", _v$39, _p$.t));
+                                  return _p$;
+                                }, {
+                                  e: undefined,
+                                  t: undefined
+                                });
+                                return _el$97;
+                              })()
+                            }));
+                            return _el$91;
                           }
                         });
                       }
@@ -1361,70 +1426,70 @@ function AutomationsView(props) {
                           },
                           get fallback() {
                             return (() => {
-                              var _el$96 = _$createElement("text");
-                              _$insertNode(_el$96, _$createTextNode(`none yet`));
-                              _$effect(_$p => _$setProp(_el$96, "fg", L().muted, _$p));
-                              return _el$96;
+                              var _el$103 = _$createElement("text");
+                              _$insertNode(_el$103, _$createTextNode(`none yet`));
+                              _$effect(_$p => _$setProp(_el$103, "fg", L().muted, _$p));
+                              return _el$103;
                             })();
                           },
                           get children() {
-                            var _el$91 = _$createElement("box");
-                            _$setProp(_el$91, "flexDirection", "column");
-                            _$insert(_el$91, _$createComponent(For, {
+                            var _el$92 = _$createElement("box");
+                            _$setProp(_el$92, "flexDirection", "column");
+                            _$insert(_el$92, _$createComponent(For, {
                               get each() {
                                 return jobRuns();
                               },
                               children: r => (() => {
-                                var _el$98 = _$createElement("box"),
-                                  _el$99 = _$createElement("text"),
-                                  _el$100 = _$createElement("span"),
-                                  _el$101 = _$createTextNode(` `),
-                                  _el$102 = _$createElement("span"),
-                                  _el$103 = _$createTextNode(`  `),
-                                  _el$104 = _$createTextNode(` `);
-                                _$insertNode(_el$98, _el$99);
-                                _$setProp(_el$98, "flexDirection", "column");
-                                _$insertNode(_el$99, _el$100);
-                                _$insertNode(_el$99, _el$101);
-                                _$insertNode(_el$99, _el$102);
-                                _$insert(_el$100, () => glyph[r.status]);
-                                _$insert(_el$99, () => clock(r.startedAt), _el$102);
-                                _$insertNode(_el$102, _el$103);
-                                _$insertNode(_el$102, _el$104);
-                                _$insert(_el$102, () => r.status, _el$104);
-                                _$insert(_el$102, () => elapsed(r), null);
-                                _$insert(_el$98, _$createComponent(Show, {
+                                var _el$105 = _$createElement("box"),
+                                  _el$106 = _$createElement("text"),
+                                  _el$107 = _$createElement("span"),
+                                  _el$108 = _$createTextNode(` `),
+                                  _el$109 = _$createElement("span"),
+                                  _el$110 = _$createTextNode(`  `),
+                                  _el$111 = _$createTextNode(` `);
+                                _$insertNode(_el$105, _el$106);
+                                _$setProp(_el$105, "flexDirection", "column");
+                                _$insertNode(_el$106, _el$107);
+                                _$insertNode(_el$106, _el$108);
+                                _$insertNode(_el$106, _el$109);
+                                _$insert(_el$107, () => glyph[r.status]);
+                                _$insert(_el$106, () => clock(r.startedAt), _el$109);
+                                _$insertNode(_el$109, _el$110);
+                                _$insertNode(_el$109, _el$111);
+                                _$insert(_el$109, () => r.status, _el$111);
+                                _$insert(_el$109, () => elapsed(r), null);
+                                _$insert(_el$105, _$createComponent(Show, {
                                   get when() {
                                     return r.error;
                                   },
                                   children: error => (() => {
-                                    var _el$105 = _$createElement("text");
-                                    _$insert(_el$105, () => "  " + error().slice(0, 100));
-                                    _$effect(_$p => _$setProp(_el$105, "fg", L().bad, _$p));
-                                    return _el$105;
+                                    var _el$112 = _$createElement("text");
+                                    _$insert(_el$112, () => "  " + error().slice(0, 100));
+                                    _$effect(_$p => _$setProp(_el$112, "fg", L().bad, _$p));
+                                    return _el$112;
                                   })()
                                 }), null);
                                 _$effect(_p$ => {
-                                  var _v$38 = L().text,
-                                    _v$39 = {
+                                  var _v$40 = L().text,
+                                    _v$41 = {
                                       fg: statusColor(r.status)
                                     },
-                                    _v$40 = {
+                                    _v$42 = {
                                       fg: L().muted
                                     };
-                                  _v$38 !== _p$.e && (_p$.e = _$setProp(_el$99, "fg", _v$38, _p$.e));
-                                  _v$39 !== _p$.t && (_p$.t = _$setProp(_el$100, "style", _v$39, _p$.t));
-                                  _v$40 !== _p$.a && (_p$.a = _$setProp(_el$102, "style", _v$40, _p$.a));
+                                  _v$40 !== _p$.e && (_p$.e = _$setProp(_el$106, "fg", _v$40, _p$.e));
+                                  _v$41 !== _p$.t && (_p$.t = _$setProp(_el$107, "style", _v$41, _p$.t));
+                                  _v$42 !== _p$.a && (_p$.a = _$setProp(_el$109, "style", _v$42, _p$.a));
                                   return _p$;
                                 }, {
                                   e: undefined,
                                   t: undefined,
                                   a: undefined
                                 });
-                                return _el$98;
+                                return _el$105;
                               })()
                             }));
-                            return _el$91;
+                            return _el$92;
                           }
                         });
                       }
@@ -1458,35 +1523,35 @@ function AutomationsView(props) {
             return onChannels() ? channelHints : keyHints;
           },
           children: ([key, label]) => (() => {
-            var _el$106 = _$createElement("text"),
-              _el$107 = _$createElement("span"),
-              _el$108 = _$createTextNode(` `),
-              _el$109 = _$createTextNode(` `),
-              _el$110 = _$createElement("span"),
-              _el$111 = _$createTextNode(` `);
-            _$insertNode(_el$106, _el$107);
-            _$insertNode(_el$106, _el$110);
-            _$insertNode(_el$107, _el$108);
-            _$insertNode(_el$107, _el$109);
-            _$insert(_el$107, key, _el$109);
-            _$insertNode(_el$110, _el$111);
-            _$insert(_el$110, label, null);
+            var _el$113 = _$createElement("text"),
+              _el$114 = _$createElement("span"),
+              _el$115 = _$createTextNode(` `),
+              _el$116 = _$createTextNode(` `),
+              _el$117 = _$createElement("span"),
+              _el$118 = _$createTextNode(` `);
+            _$insertNode(_el$113, _el$114);
+            _$insertNode(_el$113, _el$117);
+            _$insertNode(_el$114, _el$115);
+            _$insertNode(_el$114, _el$116);
+            _$insert(_el$114, key, _el$116);
+            _$insertNode(_el$117, _el$118);
+            _$insert(_el$117, label, null);
             _$effect(_p$ => {
-              var _v$41 = {
+              var _v$43 = {
                   fg: L().text,
                   bg: L().cap
                 },
-                _v$42 = {
+                _v$44 = {
                   fg: L().muted
                 };
-              _v$41 !== _p$.e && (_p$.e = _$setProp(_el$107, "style", _v$41, _p$.e));
-              _v$42 !== _p$.t && (_p$.t = _$setProp(_el$110, "style", _v$42, _p$.t));
+              _v$43 !== _p$.e && (_p$.e = _$setProp(_el$114, "style", _v$43, _p$.e));
+              _v$44 !== _p$.t && (_p$.t = _$setProp(_el$117, "style", _v$44, _p$.t));
               return _p$;
             }, {
               e: undefined,
               t: undefined
             });
-            return _el$106;
+            return _el$113;
           })()
         }));
         _$effect(_p$ => {
@@ -1536,78 +1601,78 @@ function SidebarSection(props) {
       return state.jobs().length || thisRun();
     },
     get children() {
-      var _el$112 = _$createElement("box"),
-        _el$113 = _$createElement("text"),
-        _el$114 = _$createElement("b"),
-        _el$116 = _$createElement("text");
-      _$insertNode(_el$112, _el$113);
-      _$insertNode(_el$112, _el$116);
-      _$setProp(_el$112, "flexDirection", "column");
-      _$setProp(_el$112, "marginTop", 1);
-      _$setProp(_el$112, "paddingLeft", 1);
-      _$setProp(_el$112, "paddingRight", 1);
-      _$setProp(_el$112, "paddingTop", 1);
-      _$setProp(_el$112, "paddingBottom", 1);
-      _$insertNode(_el$113, _el$114);
-      _$insertNode(_el$114, _$createTextNode(`⏰ Automations`));
-      _$insert(_el$112, _$createComponent(Show, {
+      var _el$119 = _$createElement("box"),
+        _el$120 = _$createElement("text"),
+        _el$121 = _$createElement("b"),
+        _el$123 = _$createElement("text");
+      _$insertNode(_el$119, _el$120);
+      _$insertNode(_el$119, _el$123);
+      _$setProp(_el$119, "flexDirection", "column");
+      _$setProp(_el$119, "marginTop", 1);
+      _$setProp(_el$119, "paddingLeft", 1);
+      _$setProp(_el$119, "paddingRight", 1);
+      _$setProp(_el$119, "paddingTop", 1);
+      _$setProp(_el$119, "paddingBottom", 1);
+      _$insertNode(_el$120, _el$121);
+      _$insertNode(_el$121, _$createTextNode(`⏰ Automations`));
+      _$insert(_el$119, _$createComponent(Show, {
         get when() {
           return thisRun();
         },
         children: r => (() => {
-          var _el$118 = _$createElement("text"),
-            _el$119 = _$createTextNode(`this session: `),
-            _el$120 = _$createTextNode(` `);
-          _$insertNode(_el$118, _el$119);
-          _$insertNode(_el$118, _el$120);
-          _$insert(_el$118, () => r().jobID, _el$120);
-          _$insert(_el$118, () => glyph[r().status], null);
-          _$effect(_$p => _$setProp(_el$118, "fg", L().info, _$p));
-          return _el$118;
+          var _el$125 = _$createElement("text"),
+            _el$126 = _$createTextNode(`this session: `),
+            _el$127 = _$createTextNode(` `);
+          _$insertNode(_el$125, _el$126);
+          _$insertNode(_el$125, _el$127);
+          _$insert(_el$125, () => r().jobID, _el$127);
+          _$insert(_el$125, () => glyph[r().status], null);
+          _$effect(_$p => _$setProp(_el$125, "fg", L().info, _$p));
+          return _el$125;
         })()
-      }), _el$116);
-      _$insert(_el$112, _$createComponent(For, {
+      }), _el$123);
+      _$insert(_el$119, _$createComponent(For, {
         get each() {
           return upcoming();
         },
         children: j => (() => {
-          var _el$121 = _$createElement("box"),
-            _el$122 = _$createElement("text"),
-            _el$123 = _$createElement("text");
-          _$insertNode(_el$121, _el$122);
-          _$insertNode(_el$121, _el$123);
-          _$setProp(_el$121, "flexDirection", "row");
-          _$setProp(_el$121, "justifyContent", "space-between");
-          _$insert(_el$122, () => j.name.slice(0, 18));
-          _$insert(_el$123, () => relative(j.nextRunAt, state.now()));
+          var _el$128 = _$createElement("box"),
+            _el$129 = _$createElement("text"),
+            _el$130 = _$createElement("text");
+          _$insertNode(_el$128, _el$129);
+          _$insertNode(_el$128, _el$130);
+          _$setProp(_el$128, "flexDirection", "row");
+          _$setProp(_el$128, "justifyContent", "space-between");
+          _$insert(_el$129, () => j.name.slice(0, 18));
+          _$insert(_el$130, () => relative(j.nextRunAt, state.now()));
           _$effect(_p$ => {
-            var _v$46 = L().text,
-              _v$47 = L().muted;
-            _v$46 !== _p$.e && (_p$.e = _$setProp(_el$122, "fg", _v$46, _p$.e));
-            _v$47 !== _p$.t && (_p$.t = _$setProp(_el$123, "fg", _v$47, _p$.t));
+            var _v$48 = L().text,
+              _v$49 = L().muted;
+            _v$48 !== _p$.e && (_p$.e = _$setProp(_el$129, "fg", _v$48, _p$.e));
+            _v$49 !== _p$.t && (_p$.t = _$setProp(_el$130, "fg", _v$49, _p$.t));
             return _p$;
           }, {
             e: undefined,
             t: undefined
           });
-          return _el$121;
+          return _el$128;
         })()
-      }), _el$116);
-      _$insertNode(_el$116, _$createTextNode(`/automations`));
+      }), _el$123);
+      _$insertNode(_el$123, _$createTextNode(`/automations`));
       _$effect(_p$ => {
-        var _v$43 = L().panel,
-          _v$44 = L().ink(0),
-          _v$45 = L().faint;
-        _v$43 !== _p$.e && (_p$.e = _$setProp(_el$112, "backgroundColor", _v$43, _p$.e));
-        _v$44 !== _p$.t && (_p$.t = _$setProp(_el$113, "fg", _v$44, _p$.t));
-        _v$45 !== _p$.a && (_p$.a = _$setProp(_el$116, "fg", _v$45, _p$.a));
+        var _v$45 = L().panel,
+          _v$46 = L().ink(0),
+          _v$47 = L().faint;
+        _v$45 !== _p$.e && (_p$.e = _$setProp(_el$119, "backgroundColor", _v$45, _p$.e));
+        _v$46 !== _p$.t && (_p$.t = _$setProp(_el$120, "fg", _v$46, _p$.t));
+        _v$47 !== _p$.a && (_p$.a = _$setProp(_el$123, "fg", _v$47, _p$.a));
         return _p$;
       }, {
         e: undefined,
         t: undefined,
         a: undefined
       });
-      return _el$112;
+      return _el$119;
     }
   });
 }

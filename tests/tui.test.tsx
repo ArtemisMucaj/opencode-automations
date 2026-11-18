@@ -142,6 +142,7 @@ test("TUI channels tab shows status, mapping and listeners, and queues a poll", 
   // The latest poll's event waits for the automation attached to the channel.
   store.ingest("datadog", [{ channel: "datadog", id: "1:t", title: "CPU high on web-1" }], polled)
   store.subscribe(store.loadJobs(), { datadog: polled })
+  store.setNote("triage", "datadog:42", "Monitor 42 flapping since 09:10.")
   const testRenderer = await createTestRenderer({ width: 140, height: 50 })
   const host = fakeHost(dataDir, testRenderer.renderer)
   let stop: Awaited<ReturnType<typeof plugin.setup>> | undefined
@@ -162,6 +163,9 @@ test("TUI channels tab shows status, mapping and listeners, and queues a poll", 
     await testRenderer.renderOnce()
     // Automations tab: the job lists its channels.
     expect(testRenderer.captureCharFrame()).toContain("datadog, sentry")
+    // Its memory, per session key.
+    expect(testRenderer.captureCharFrame()).toContain("datadog:42 · updated")
+    expect(testRenderer.captureCharFrame()).toContain("Monitor 42 flapping since 09:10.")
 
     await host.command((command) => command.bind === "c").run()
     await testRenderer.renderOnce()

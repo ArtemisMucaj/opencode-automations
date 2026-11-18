@@ -386,6 +386,13 @@ export class Store {
     return this.get<{ note: string }>("SELECT note FROM memory WHERE job = ? AND key = ?", jobID, key)?.note
   }
 
+  /** Every memory note of a job, one per session key, the most recently updated first. */
+  notes(jobID: string): Array<{ key: string; note: string; updatedAt: number }> {
+    return this.all<{ key: string; note: string; updated_at: number }>(
+      "SELECT key, note, updated_at FROM memory WHERE job = ? ORDER BY updated_at DESC, key", jobID,
+    ).map((r) => ({ key: r.key, note: r.note, updatedAt: r.updated_at }))
+  }
+
   setNote(jobID: string, key: string, note: string | undefined): void {
     if (note === undefined) this.run("DELETE FROM memory WHERE job = ? AND key = ?", jobID, key)
     else this.run("INSERT OR REPLACE INTO memory (job, key, note, updated_at) VALUES (?, ?, ?, ?)", jobID, key, note, Date.now())

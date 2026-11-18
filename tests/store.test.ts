@@ -120,6 +120,20 @@ test("a deleted job's state goes with it, and jobs keep their order when saved",
   expect([store.note("a"), store.session("a")]).toEqual([undefined, undefined])
 })
 
+test("a job's notes are listed per key, the most recently updated first", () => {
+  const store = open()
+  expect(store.notes("a")).toEqual([])
+  store.setNote("a", "", "main")
+  store.db.run("UPDATE memory SET updated_at = 1 WHERE key = ''")
+  store.setNote("a", "dd:42", "monitor 42")
+  store.setNote("b", "", "other job")
+  expect(store.notes("a").map(({ key, note }) => ({ key, note }))).toEqual([
+    { key: "dd:42", note: "monitor 42" },
+    { key: "", note: "main" },
+  ])
+  expect(store.notes("a")[1].updatedAt).toBe(1)
+})
+
 test("detaching a channel drops the sticky sessions and memory of its keys", () => {
   const store = open()
   subscribe(store, [job("a", ["dd", "other"])])

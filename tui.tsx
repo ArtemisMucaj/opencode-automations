@@ -147,6 +147,13 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
   const selected = createMemo(() => sorted()[index()])
   const jobRuns = createMemo(() => state.runs().filter((r) => r.jobID === selected()?.id).slice(0, 8))
   const jobSent = createMemo(() => state.sent().get(selected()?.id ?? "") ?? [])
+  // Only the selected job's notes are read; state.runs() is replaced on every refresh, so this re-reads with it.
+  const jobNotes = createMemo(() => {
+    state.runs()
+    const id = selected()?.id
+    if (!id) return []
+    try { return state.store.notes(id) } catch { return [] }
+  })
 
   // ---- channels tab ----
   const onChannels = () => state.tab() === "channels"
@@ -670,6 +677,23 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
                                       {m.sends.map((x) => `${x.destination} ${x.status}`).join(", ") || "no destination takes it"}
                                     </span>
                                   </text>
+                                )}
+                              </For>
+                            </box>
+                          </Block>
+                        </Show>
+
+                        <Show when={jobNotes().length}>
+                          <Block title="Memory" hue={4}>
+                            <box flexDirection="column" gap={1}>
+                              <For each={jobNotes()}>
+                                {(n) => (
+                                  <box flexDirection="column">
+                                    <text fg={L().muted}>
+                                      {n.key ? `${n.key} · ` : ""}updated {clock(n.updatedAt)} ({relative(n.updatedAt, state.now())})
+                                    </text>
+                                    <text fg={L().text}>{n.note}</text>
+                                  </box>
                                 )}
                               </For>
                             </box>
