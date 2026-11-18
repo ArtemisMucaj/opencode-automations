@@ -165,7 +165,6 @@ test("TUI channels tab shows status, mapping and listeners, and queues a poll", 
     await testRenderer.renderOnce()
     // Automations tab: the job lists its channels.
     expect(testRenderer.captureCharFrame()).toContain("datadog, sentry")
-    // Its memory, per session key.
     expect(testRenderer.captureCharFrame()).toContain("datadog:42 · updated")
     expect(testRenderer.captureCharFrame()).toContain("Monitor 42 flapping since 09:10.")
 
@@ -205,7 +204,6 @@ test("TUI channels tab shows status, mapping and listeners, and queues a poll", 
     await host.command((command) => command.title === "pause/resume").run()
     expect(store.loadJobs()[0].paused).toBeUndefined()
 
-    // Inbox tab: every channel's events, with what each automation did with them.
     await host.command((command) => command.bind === "i").run()
     await testRenderer.renderOnce()
     frame = testRenderer.captureCharFrame()
@@ -214,7 +212,6 @@ test("TUI channels tab shows status, mapping and listeners, and queues a poll", 
     expect(frame).toContain("CPU high on web-1")
     expect(frame).toContain("Alert triage  waiting")
 
-    // Outbox tab: what was sent, and how each destination took it.
     await host.command((command) => command.bind === "o").run()
     await testRenderer.renderOnce()
     frame = testRenderer.captureCharFrame()
@@ -223,7 +220,6 @@ test("TUI channels tab shows status, mapping and listeners, and queues a poll", 
     expect(frame).toContain("Spike from a deploy.")
     expect(frame).toContain("phone  failed")
     expect(frame).toContain("HTTP 500")
-    // The open tab's key goes back to the automations.
     await host.command((command) => command.bind === "o").run()
     await testRenderer.renderOnce()
     expect(testRenderer.captureCharFrame()).toContain("[jobs]")
@@ -247,10 +243,10 @@ test("the inbox list scrolls with the cursor and highlights the selected event",
     await host.command((command) => command.id === "automations.open").run()
     await render(() => <box width={140} height={50}>{host.dialog!()}</box>, testRenderer.renderer)
     await host.command((command) => command.bind === "i").run()
-    // Drawn before moving, so the rows exist before the list scrolls under them.
+    // Drawn first, so the rows exist before the list scrolls under them.
     await testRenderer.renderOnce()
     await testRenderer.renderOnce()
-    // Newest first: 25 rows down is event 15, past the rows that fit at first.
+    // Newest first: 25 down is event 15.
     for (let i = 0; i < 25; i++) await host.command((command) => command.title === "down").run()
     await testRenderer.renderOnce()
     await testRenderer.renderOnce()

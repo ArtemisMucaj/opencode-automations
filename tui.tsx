@@ -41,7 +41,6 @@ function look(ctx: Context, surface?: "dialog") {
 }
 
 type Tab = "jobs" | "channels" | "inbox" | "outbox"
-/** The keys that switch tabs; pressing the open tab's key goes back to the automations. */
 const tabKeys: Record<Exclude<Tab, "jobs">, string> = { channels: "c", inbox: "i", outbox: "o" }
 const tabHints = (tab: Tab): [string, string][] => [
   ...(tab === "jobs" ? [] : [[tabKeys[tab], "automations"] as [string, string]]),
@@ -69,7 +68,6 @@ const listHints: [string, string][] = [
   ["↑↓", "select"],
   ["esc", "close"],
 ]
-/** How many of the latest inbox events and outbox messages the tabs show. */
 const LIST_LIMIT = 100
 
 const BUSY_MS = 250
@@ -96,7 +94,7 @@ export function createState(ctx: Context, dataDir: string) {
   const [selectedEvent, setSelectedEvent] = createSignal<number>()
   const [selectedMessage, setSelectedMessage] = createSignal<number>()
   const [tab, setTab] = createSignal<Tab>("jobs")
-  // Bumped on every refresh, for reads made only while they're shown (a job's memory, the inbox and outbox tabs).
+  // For reads made only while shown.
   const [refreshed, setRefreshed] = createSignal(0)
 
   const notifyMode = (ctx.options.notify ?? "blurred") as "always" | "blurred" | "off"
@@ -166,7 +164,6 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
   const selected = createMemo(() => sorted()[index()])
   const jobRuns = createMemo(() => state.runs().filter((r) => r.jobID === selected()?.id).slice(0, 8))
   const jobSent = createMemo(() => state.sent().get(selected()?.id ?? "") ?? [])
-  // Only the selected job's notes are read, again on each refresh. A read that fails keeps what is shown, as refresh() does.
   const jobNotes = createMemo<ReturnType<Store["notes"]>>((shown) => {
     state.refreshed()
     const id = selected()?.id
@@ -198,7 +195,7 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
   const running = createMemo(() => runningJobs(state.jobs(), state.runs(), state.now()))
   const jobName = (id?: string) => (id ? (state.jobs().find((j) => j.id === id)?.name ?? id) : "chat")
 
-  // ---- inbox and outbox tabs: read only while open ----
+  // ---- inbox and outbox tabs ----
   const inbox = createMemo<InboxEntry[]>((shown) => {
     state.refreshed()
     if (state.tab() !== "inbox") return []
@@ -425,7 +422,6 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
       polling: { fg: L().ok, bg: t.background.feedback.success.base, dot: "●" },
       idle: { fg: L().muted, bg: L().cap, dot: "○" },
     })[st]
-  /** An inbox event's overall delivery state: waiting if any automation still waits for it. */
   const deliveryState = (e: InboxEntry): DeliveryStatus | "unclaimed" =>
     e.deliveries.some((d) => d.status === "waiting") ? "waiting"
       : e.deliveries.some((d) => d.status === "dropped") ? "dropped"
@@ -437,7 +433,6 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
       dropped: { fg: L().bad, dot: "✗" },
       unclaimed: { fg: L().muted, dot: "○" },
     })[f]
-  /** A message's overall delivery: failed if any destination failed, pending while any is still trying. */
   const sendState = (m: SentMessage): SendStatus | "none" =>
     m.sends.some((x) => x.status === "failed") ? "failed"
       : m.sends.some((x) => x.status === "pending") ? "pending"
@@ -479,9 +474,9 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
     return { left: Math.floor((o.w - width) / 2) - o.x, top: Math.floor((o.h - height) / 2) - o.y, width, height }
   })
   const activeCount = createMemo(() => state.jobs().filter(isActive).length)
-  // Long lists show the rows around the cursor that fit: the panel less its header, the list's title and the hints.
-  // Rows are slots (<Index>): a slot's position in the list is its slot number plus the window's start, read reactively.
-  const fits = createMemo(() => Math.max(5, (panel()?.height ?? 30) - 10))
+  // <Index> keeps slots, so a row's position must be read reactively: slot + window start.
+  const headerAndHintRows = 10
+  const fits = createMemo(() => Math.max(5, (panel()?.height ?? 30) - headerAndHintRows))
   const windowStart = (length: number, i: number) => Math.max(0, Math.min(length - fits(), i - Math.floor(fits() / 2)))
   const evStart = createMemo(() => windowStart(inbox().length, evIndex()))
   const msgStart = createMemo(() => windowStart(outbox().length, msgIndex()))

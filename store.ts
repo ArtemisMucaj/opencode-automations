@@ -54,7 +54,6 @@ export interface Run {
 
 export type InboxEvent = ChannelEvent & { seq: number }
 export type DeliveryStatus = "waiting" | "taken" | "dropped"
-/** An inbox event as shown to the user: when it was first and last seen, and what each automation did with it. */
 export type InboxEntry = InboxEvent & { at: number; seenAt: number; deliveries: Array<{ job: string; status: DeliveryStatus }> }
 
 interface StickySession { id: string; usedAt: number; warmUntil?: number }
@@ -312,11 +311,7 @@ export class Store {
     return out
   }
 
-  /**
-   * The latest events of every channel, newest first, each with what became of it per automation: still
-   * waiting for it (or for a retry), taken by a run, or dropped after failed starts.
-   * Read in one deferred transaction, so the three reads see one snapshot without taking the write lock.
-   */
+  /** Deferred, not tx(): one snapshot for the three reads, without taking the write lock. */
   inbox(limit = 100): InboxEntry[] {
     return this.db.transaction(() => this.readInbox(limit)).deferred()
   }
@@ -331,8 +326,7 @@ export class Store {
       m.set(job, status)
       fates.set(seq, m)
     }
-    // Waiting: the job is subscribed from before it, and hasn't taken it yet (or is to retry it, which also
-    // needs the subscription: a retry left by a job that has since left the channel is never taken).
+    // Retries are left out of the deliveries below: without the subscription, a retry is never taken.
     for (const r of this.all<{ seq: number; job: string }>(
       "SELECT i.seq, s.job FROM inbox i JOIN subscriptions s ON s.channel = i.channel " +
       "WHERE i.seq IN (SELECT value FROM json_each(?)) AND (i.seq > s.since_seq OR i.seen_at >= s.since_poll)", seqs)) {
@@ -419,7 +413,6 @@ export class Store {
     return this.get<{ note: string }>("SELECT note FROM memory WHERE job = ? AND key = ?", jobID, key)?.note
   }
 
-  /** Every memory note of a job, one per session key, the most recently updated first. */
   notes(jobID: string): Array<{ key: string; note: string; updatedAt: number }> {
     return this.all<{ key: string; note: string; updated_at: number }>(
       "SELECT key, note, updated_at FROM memory WHERE job = ? ORDER BY updated_at DESC, key", jobID,

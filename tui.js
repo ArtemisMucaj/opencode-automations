@@ -48,7 +48,6 @@ function look(ctx, surface) {
     ink: i => hue(i)[dark ? 300 : 700]
   };
 }
-/** The keys that switch tabs; pressing the open tab's key goes back to the automations. */
 const tabKeys = {
   channels: "c",
   inbox: "i",
@@ -58,7 +57,6 @@ const tabHints = tab => [...(tab === "jobs" ? [] : [[tabKeys[tab], "automations"
 const keyHints = [["↑↓", "select"], ["space", "pause"], ["r", "run now"], ["n", "new"], ["e", "prompt"], ["s", "schedule"], ["m", "model"], ["d", "delete"], ["⏎", "open session"], ["esc", "close"]];
 const channelHints = [["↑↓", "select"], ["p", "poll now"], ["d", "delete"], ["esc", "close"]];
 const listHints = [["↑↓", "select"], ["esc", "close"]];
-/** How many of the latest inbox events and outbox messages the tabs show. */
 const LIST_LIMIT = 100;
 const BUSY_MS = 250;
 export function createState(ctx, dataDir) {
@@ -104,7 +102,7 @@ export function createState(ctx, dataDir) {
   const [selectedEvent, setSelectedEvent] = createSignal();
   const [selectedMessage, setSelectedMessage] = createSignal();
   const [tab, setTab] = createSignal("jobs");
-  // Bumped on every refresh, for reads made only while they're shown (a job's memory, the inbox and outbox tabs).
+  // For reads made only while shown.
   const [refreshed, setRefreshed] = createSignal(0);
   const notifyMode = ctx.options.notify ?? "blurred";
   const seen = new Set(runs().filter(r => r.status !== "running").map(r => r.runID));
@@ -202,7 +200,6 @@ function AutomationsView(props) {
   const selected = createMemo(() => sorted()[index()]);
   const jobRuns = createMemo(() => state.runs().filter(r => r.jobID === selected()?.id).slice(0, 8));
   const jobSent = createMemo(() => state.sent().get(selected()?.id ?? "") ?? []);
-  // Only the selected job's notes are read, again on each refresh. A read that fails keeps what is shown, as refresh() does.
   const jobNotes = createMemo(shown => {
     state.refreshed();
     const id = selected()?.id;
@@ -241,7 +238,7 @@ function AutomationsView(props) {
   const running = createMemo(() => runningJobs(state.jobs(), state.runs(), state.now()));
   const jobName = id => id ? state.jobs().find(j => j.id === id)?.name ?? id : "chat";
 
-  // ---- inbox and outbox tabs: read only while open ----
+  // ---- inbox and outbox tabs ----
   const inbox = createMemo(shown => {
     state.refreshed();
     if (state.tab() !== "inbox") return [];
@@ -558,7 +555,6 @@ function AutomationsView(props) {
       dot: "○"
     }
   })[st];
-  /** An inbox event's overall delivery state: waiting if any automation still waits for it. */
   const deliveryState = e => e.deliveries.some(d => d.status === "waiting") ? "waiting" : e.deliveries.some(d => d.status === "dropped") ? "dropped" : e.deliveries.length ? "taken" : "unclaimed";
   const deliveryUI = f => ({
     waiting: {
@@ -578,7 +574,6 @@ function AutomationsView(props) {
       dot: "○"
     }
   })[f];
-  /** A message's overall delivery: failed if any destination failed, pending while any is still trying. */
   const sendState = m => m.sends.some(x => x.status === "failed") ? "failed" : m.sends.some(x => x.status === "pending") ? "pending" : m.sends.length ? "sent" : "none";
   const sendUI = st => ({
     sent: {
@@ -637,9 +632,9 @@ function AutomationsView(props) {
     };
   });
   const activeCount = createMemo(() => state.jobs().filter(isActive).length);
-  // Long lists show the rows around the cursor that fit: the panel less its header, the list's title and the hints.
-  // Rows are slots (<Index>): a slot's position in the list is its slot number plus the window's start, read reactively.
-  const fits = createMemo(() => Math.max(5, (panel()?.height ?? 30) - 10));
+  // <Index> keeps slots, so a row's position must be read reactively: slot + window start.
+  const headerAndHintRows = 10;
+  const fits = createMemo(() => Math.max(5, (panel()?.height ?? 30) - headerAndHintRows));
   const windowStart = (length, i) => Math.max(0, Math.min(length - fits(), i - Math.floor(fits() / 2)));
   const evStart = createMemo(() => windowStart(inbox().length, evIndex()));
   const msgStart = createMemo(() => windowStart(outbox().length, msgIndex()));

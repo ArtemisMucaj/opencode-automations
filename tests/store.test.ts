@@ -145,14 +145,12 @@ test("the inbox lists every channel's events, newest first, with each automation
   expect(x).toMatchObject({ channel: "other", id: "x", at: 20, seenAt: 20, deliveries: [] })
   expect(two).toMatchObject({ id: "2", sessionKey: "k", deliveries: [{ job: "a", status: "waiting" }, { job: "b", status: "waiting" }] })
   expect(one.deliveries).toEqual([{ job: "a", status: "taken" }, { job: "b", status: "waiting" }])
-  // Dropped after failed starts; a retry waits again.
   store.giveBack("a", [one.seq], false)
   expect(store.inbox()[2].deliveries[0]).toEqual({ job: "a", status: "waiting" })
   store.take("a", [one.seq])
   for (let n = 0; n < MAX_START_ATTEMPTS; n++) { store.giveBack("a", [one.seq], true); store.take("a", [one.seq]) }
   expect(store.inbox()[2].deliveries[0]).toEqual({ job: "a", status: "dropped" })
   expect(store.inbox(1)).toHaveLength(1)
-  // A retry left by a job that has since left the channel isn't waiting: it would never be taken.
   store.giveBack("b", [...store.take("b", [two.seq])], false)
   expect(store.inbox()[1].deliveries).toContainEqual({ job: "b", status: "waiting" })
   subscribe(store, [job("a", ["dd"])])
