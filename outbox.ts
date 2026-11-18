@@ -10,8 +10,6 @@ export type { Priority, Destination }
 export interface OutboxConfig {
   /** Run outcomes that get an automatic notice. Default: failed, timeout. */
   on?: RunStatus[]
-  /** Default 5. */
-  maxPerRun?: number
   destinations?: Destination[]
 }
 
@@ -19,7 +17,6 @@ export interface OutboxConfig {
 export type JobNotify = boolean | RunStatus[]
 
 const DEFAULT_ON: RunStatus[] = ["failed", "timeout"]
-export const DEFAULT_MAX_PER_RUN = 5
 export const RETRY_MS = [60_000, 5 * 60_000, 30 * 60_000]
 const RANK: Record<Priority, number> = { low: 0, normal: 1, high: 2 }
 const TYPES = new Set(["Notification.Native", "Notification.PushOver"])
@@ -54,7 +51,6 @@ export function compose(job: Job, run: Run): Message {
 
 export class Outbox {
   readonly destinations: Destination[]
-  readonly maxPerRun: number
   private readonly on: RunStatus[]
   private dispatching?: Promise<void>
   private again = false
@@ -67,13 +63,12 @@ export class Outbox {
     private readonly deps: Deps = defaultDeps,
   ) {
     this.destinations = parseDestinations(cfg)
-    this.maxPerRun = cfg?.maxPerRun ?? DEFAULT_MAX_PER_RUN
     this.on = cfg?.on ?? DEFAULT_ON
   }
 
-  /** Whether a job may notify at all. */
+  /** Whether a job may notify at all. Destinations only decide where its messages go. */
   canNotify(job: Job): boolean {
-    return job.notify !== false && this.destinations.length > 0
+    return job.notify !== false
   }
 
   /** Whether a run's outcome gets an automatic notice (never success). */
@@ -82,13 +77,12 @@ export class Outbox {
     return (Array.isArray(job.notify) ? job.notify : this.on).includes(status)
   }
 
-  /** Queue a message for every destination that takes its priority; returns how many do. */
-  add(m: Message, from: { job?: string; run?: string } = {}): number {
+  /** Queue a message for every destination that takes its priority. */
+  add(m: Message, from: { job?: string; run?: string } = {}): void {
     const priority = m.priority ?? "normal"
     const to = this.destinations.filter((d) => RANK[priority] >= RANK[d.minPriority ?? "low"]).map((d) => d.id)
     this.store.enqueue({ ...from, title: m.title, body: m.body, priority, url: m.url, urlTitle: m.urlTitle }, to)
     if (to.length) this.kick()
-    return to.length
   }
 
   /** Start sending what is due, without waiting. */

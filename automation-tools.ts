@@ -17,7 +17,6 @@ const scheduleProps = {
 
 export function automationTools(tools: ToolEditor, rt: Runtime) {
   const { ctx, opts, store, outbox, defaultTimeout, load, mutate, checkChannels, runAutomation } = rt
-  const { maxPerRun } = outbox
   tools.add(tool({
     name: "notify",
     options: { namespace: "automation", ...CODE_MODE },
@@ -49,7 +48,6 @@ export function automationTools(tools: ToolEditor, rt: Runtime) {
     execute: async (input, tc) => {
       const f = rt.runOf(tc.sessionID)
       if (!f || !outbox.canNotify(f.job)) return text("error: notifications are only available inside an automation run that has them enabled.")
-      if (f.sent >= maxPerRun) return text(`error: this run already sent ${f.sent} notifications (limit ${maxPerRun}). Don't send more.`)
       const title = input.title.trim()
       const message = input.message.trim()
       if (!title || !message) return text("error: title and message are required.")
@@ -67,13 +65,11 @@ export function automationTools(tools: ToolEditor, rt: Runtime) {
         )
       }
       const priority: Priority = input.priority ?? "normal"
-      let destinations: number
       try {
-        destinations = outbox.add({ title, body: message, priority, url: input.url, urlTitle: input.url_title }, { job: f.job.id, run: f.run.runID })
+        outbox.add({ title, body: message, priority, url: input.url, urlTitle: input.url_title }, { job: f.job.id, run: f.run.runID })
       } catch (e) { return text(`error: couldn't queue it (${errorMessage(e)}). Try once more.`) }
       f.sent++
-      const outcome = destinations ? "Queued for delivery." : `Recorded, but not delivered: the user only gets notifications above ${priority} priority.`
-      return text(`${outcome} ${maxPerRun - f.sent} notifications left for this run.`)
+      return text("Outbox message queued.")
     },
   }))
 
