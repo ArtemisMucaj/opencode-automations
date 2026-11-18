@@ -91,16 +91,6 @@ test("Pushover failures carry the response body", async () => {
   })).rejects.toThrow("user key is invalid")
 })
 
-test("a webhook gets the message as JSON, in plain text", async () => {
-  const calls: Array<{ url: string; input?: RequestInit }> = []
-  await deliver({ id: "hook", type: "webhook", url: "https://hook.test/x", headers: { "X-Token": "t" } }, { title: "T", body: "**b**", priority: "low", url: "https://x.test" }, {
-    platform: "linux", fetch: async (url, input) => { calls.push({ url, input }); return new Response("ok") }, exec: noExec,
-  })
-  expect(calls[0].url).toBe("https://hook.test/x")
-  expect(new Headers(calls[0].input?.headers).get("X-Token")).toBe("t")
-  expect(JSON.parse(calls[0].input?.body as string)).toEqual({ title: "T", message: "b", priority: "low", url: "https://x.test" })
-})
-
 test("long messages are split into numbered parts at paragraph boundaries, in order", async () => {
   const paragraphs = Array.from({ length: 4 }, (_, i) => `Finding ${i + 1}: ` + "detail ".repeat(40).trim())
   const bodies: Array<{ title: string; message: string; url?: string }> = []
@@ -174,13 +164,12 @@ function store() {
   return new Store(dir)
 }
 
-test("senders are checked: ids unique, a known type, what each type needs", () => {
+test("senders are checked: ids unique, a known type, what Pushover needs", () => {
   expect(parseSenders(undefined)).toEqual([])
   expect(parseSenders({ senders: [native, pushover] })).toHaveLength(2)
   expect(() => parseSenders({ senders: [native, native] })).toThrow("unique")
   expect(() => parseSenders({ senders: [{ id: "x", type: "sms" } as unknown as Sender] })).toThrow("type must be one of")
   expect(() => parseSenders({ senders: [{ id: "p", type: "pushover", token: "t" } as unknown as Sender] })).toThrow("token and user")
-  expect(() => parseSenders({ senders: [{ id: "w", type: "webhook" } as unknown as Sender] })).toThrow("needs url")
 })
 
 test("automatic notices: failures by default, never for success, and only with a sender", () => {

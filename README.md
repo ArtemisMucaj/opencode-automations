@@ -87,21 +87,19 @@ Cron schedules follow daylight-saving changes in their timezone. If opencode was
 
 ## Notifications
 
-Everything the plugin tells you goes through an **outbox**. The agent running an automation writes a message (a title, a short plain-text body, and how urgent it is), and the plugin delivers it to every **sender** you configured: your desktop, your phone through Pushover, or any URL as a webhook. The agent never picks a destination. You set them up once, under `outbox.senders` in the plugin options (see [Configuration](#configuration)):
+Everything the plugin tells you goes through an **outbox**. The agent running an automation writes a message (a title, a short plain-text body, and how urgent it is), and the plugin delivers it to every **sender** you configured: your desktop or your phone through Pushover. The agent never picks a destination. You set them up once, under `outbox.senders` in the plugin options (see [Configuration](#configuration)):
 
 ```jsonc
 "outbox": {
   "senders": [
     { "id": "desktop", "type": "native" },
-    { "id": "phone", "type": "pushover", "token": "{env:PUSHOVER_TOKEN}", "user": "{env:PUSHOVER_USER}", "minPriority": "normal" },
-    { "id": "hook", "type": "webhook", "url": "{env:NOTIFY_HOOK}" }
+    { "id": "phone", "type": "pushover", "token": "{env:PUSHOVER_TOKEN}", "user": "{env:PUSHOVER_USER}", "minPriority": "normal" }
   ]
 }
 ```
 
 - `minPriority` (`low`, `normal` or `high`) keeps a sender for what matters: with `"high"`, your phone only buzzes for things that need action soon.
 - Settings can reference environment variables as `{env:NAME}`, so tokens stay out of the file.
-- A webhook gets a POST of `{ "title", "message", "priority", "url"? }` as JSON.
 - A delivery that fails (Pushover down, no network) is retried after 1, 5 and 30 minutes, then logged and given up on.
 
 **What you receive.** The agent writes the notification itself, most important thing first, since often only the first lines are shown. It sends at most 5 per run by default. If a run finds nothing worth your attention, it stays quiet.

@@ -1,6 +1,4 @@
-// The outbox: everything the plugin tells the user is written here first (the agent's messages, a run that
-// failed, a channel that can't poll), and a dispatcher delivers it to every configured sender, retrying
-// failures. The agent only says what to tell the user and how urgent it is; senders are global config.
+// The outbox: everything the plugin tells the user, delivered to the configured senders with retries.
 
 import { deliver, defaultDeps, type Deps, type Message, type Priority, type Sender } from "./notify.ts"
 import { log } from "./log.ts"
@@ -10,9 +8,9 @@ import { elapsed, errorMessage } from "./util.ts"
 export type { Priority, Sender }
 
 export interface OutboxConfig {
-  /** Run outcomes that get an automatic notice. Default: failed, timeout. Successful runs never do. */
+  /** Run outcomes that get an automatic notice. Default: failed, timeout. */
   on?: RunStatus[]
-  /** Most automation_notify calls one run may make. Default 5. */
+  /** Default 5. */
   maxPerRun?: number
   senders?: Sender[]
 }
@@ -22,12 +20,10 @@ export type JobNotify = boolean | RunStatus[]
 
 const DEFAULT_ON: RunStatus[] = ["failed", "timeout"]
 export const DEFAULT_MAX_PER_RUN = 5
-/** Waits before each retry of a failed send; after the last, it is given up on. */
 export const RETRY_MS = [60_000, 5 * 60_000, 30 * 60_000]
 const RANK: Record<Priority, number> = { low: 0, normal: 1, high: 2 }
-const TYPES = new Set(["native", "pushover", "webhook"])
+const TYPES = new Set(["native", "pushover"])
 
-/** Check the configured senders. */
 export function parseSenders(cfg: OutboxConfig | undefined): Sender[] {
   const senders = cfg?.senders ?? []
   const ids = new Set<string>()
@@ -38,13 +34,12 @@ export function parseSenders(cfg: OutboxConfig | undefined): Sender[] {
     ids.add(s.id)
     if (!TYPES.has(s.type)) throw new Error(`${where}: type must be one of ${[...TYPES].join(", ")}`)
     if (s.type === "pushover" && (!s.token || !s.user)) throw new Error(`${where} needs token and user`)
-    if (s.type === "webhook" && !s.url) throw new Error(`${where} needs url`)
     if (s.minPriority !== undefined && !(s.minPriority in RANK)) throw new Error(`${where}: minPriority must be low, normal or high`)
   }
   return senders
 }
 
-/** The automatic end-of-run notice. Agent output is not included: the agent notifies itself. */
+/** The automatic notice for a failed or timed-out run. */
 export function compose(job: Job, run: Run): Message {
   const error = run.error?.trim()
   switch (run.status) {
@@ -64,10 +59,7 @@ export class Outbox {
   private dispatching?: Promise<void>
   private again = false
 
-  /**
-   * `sends`: whether this process sends. Only the leader does; a message added elsewhere waits for the
-   * leader's next tick.
-   */
+  /** `sends`: whether this process sends (only the leader does). */
   constructor(
     private readonly store: Store,
     cfg: OutboxConfig | undefined,
@@ -79,21 +71,18 @@ export class Outbox {
     this.on = cfg?.on ?? DEFAULT_ON
   }
 
-  /** Whether a job may notify at all (the automation_notify tool is offered only then). */
+  /** Whether a job may notify at all. */
   canNotify(job: Job): boolean {
     return job.notify !== false && this.senders.length > 0
   }
 
-  /** Whether a run's outcome gets an automatic notice. Success never does: the agent notifies if it needs to. */
+  /** Whether a run's outcome gets an automatic notice (never success). */
   noticeFor(job: Job, status: RunStatus): boolean {
     if (status === "succeeded" || !this.canNotify(job)) return false
     return (Array.isArray(job.notify) ? job.notify : this.on).includes(status)
   }
 
-  /**
-   * Write a message to the outbox for every sender that takes its priority, and start sending it. Returns how
-   * many senders take it: none when every one is set to a higher minPriority.
-   */
+  /** Queue a message for every sender that takes its priority; returns how many do. */
   add(m: Message, from: { job?: string; run?: string } = {}): number {
     const priority = m.priority ?? "normal"
     const to = this.senders.filter((s) => RANK[priority] >= RANK[s.minPriority ?? "low"]).map((s) => s.id)
@@ -102,20 +91,17 @@ export class Outbox {
     return to.length
   }
 
-  /** Start sending what is due, without waiting for it (retries come due on the leader's ticks). */
+  /** Start sending what is due, without waiting. */
   kick(): void {
     if (this.sends()) void this.dispatch().catch((err) => log.error({ err }, "outbox dispatch failed"))
   }
 
-  /** Resolves once the pass in progress, if any, is over: shutdown waits for it. */
+  /** The pass in progress, for shutdown to wait on. */
   idle(): Promise<void> {
     return this.dispatching ?? Promise.resolve()
   }
 
-  /**
-   * Send what is due. One pass at a time: a call during a pass makes it go round once more, so a message
-   * added meanwhile isn't left for the next tick.
-   */
+  /** Send what is due. A call during a pass makes it go round once more. */
   dispatch(): Promise<void> {
     if (this.dispatching) { this.again = true; return this.dispatching }
     this.dispatching = (async () => {

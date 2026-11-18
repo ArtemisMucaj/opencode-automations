@@ -18,8 +18,6 @@
             { "id": "desktop", "type": "native" },
             // Phone notifications via Pushover, only for what matters.
             // { "id": "phone", "type": "pushover", "token": "{env:PUSHOVER_TOKEN}", "user": "{env:PUSHOVER_USER}", "minPriority": "normal" },
-            // Any URL: gets { title, message, priority, url } as JSON.
-            // { "id": "hook", "type": "webhook", "url": "{env:NOTIFY_HOOK}" },
           ],
         },
         "jobs": [

@@ -1,16 +1,14 @@
-// Notifications: formatting a message for each kind of sink, and delivering it to one sender.
-// What gets sent, to whom and when (the outbox and its dispatcher) is in outbox.ts.
+// Formatting a message for each kind of sink, and delivering it through one sender.
 
 import { spawn } from "node:child_process"
 import { httpError, withEnv, type Fetch } from "./util.ts"
 
 export type Priority = "low" | "normal" | "high"
 
-/** Where messages go. Configured once, under `outbox.senders`; the agent never picks one. */
+/** Configured under `outbox.senders`. */
 export type Sender = { id: string; minPriority?: Priority } & (
   | { type: "native"; sound?: string }
   | { type: "pushover"; token: string; user: string }
-  | { type: "webhook"; url: string; headers?: Record<string, string> }
 )
 
 export interface Message {
@@ -44,9 +42,8 @@ export const defaultDeps: Deps = {
 
 /** Pushover's documented limits. https://pushover.net/api#limits */
 export const PUSHOVER = { message: 1024, title: 250, url: 512, urlTitle: 100 } as const
-/** Most messages one notification is split into on Pushover; the rest is cut. */
 export const MAX_PARTS = 4
-/** Longest message the agent may send, whatever the sinks: about what fits in MAX_PARTS Pushover messages. */
+/** Longest message the agent may send: about MAX_PARTS Pushover messages. */
 export const MAX_MESSAGE = 4000
 
 const escapeHTML = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
@@ -125,11 +122,7 @@ function cutLine(src: string, max: number, style: Style): string[] {
   return pieces
 }
 
-/**
- * Split text into rendered messages of at most `max` characters, breaking between
- * paragraphs first, then lines, then words. Lines are rendered independently, so a
- * cut never lands inside an HTML tag.
- */
+/** Split into rendered messages of at most `max` characters, at paragraphs, then lines, then words. */
 export function split(text: string, max: number, style: Style): string[] {
   const parts: string[][] = [[]]
   const size = (p: string[]) => p.join("\n").length
@@ -155,7 +148,7 @@ export function split(text: string, max: number, style: Style): string[] {
 
 const clip = (s: string, max: number) => (s.length <= max ? s : s.slice(0, max - 1).trimEnd() + "…")
 
-/** Pushover payloads for one notification: several numbered parts when it's long, at most MAX_PARTS. */
+/** Pushover payloads: numbered parts when long, at most MAX_PARTS. */
 export function pushoverParts(m: Message): Array<Record<string, string | number>> {
   const bodies = split(m.body, PUSHOVER.message, "html")
   if (!bodies.length) bodies.push(escapeHTML(m.title))
@@ -188,7 +181,7 @@ const ok = async (r: Response) => {
 }
 const timeout = () => AbortSignal.timeout(10_000)
 
-/** Deliver one message through one sender; throws if it couldn't. {env:NAME} in its settings is filled now. */
+/** Deliver through one sender; throws on failure. */
 export async function deliver(sender: Sender, m: Message, deps: Deps = defaultDeps): Promise<void> {
   const plain = format(m.body, "plain") || m.title
   const high = m.priority === "high"
@@ -196,7 +189,7 @@ export async function deliver(sender: Sender, m: Message, deps: Deps = defaultDe
     case "native": {
       const body = m.url ? `${plain}\n${m.url}` : plain
       if (deps.platform === "darwin") {
-        // No sound setting: one by priority. An empty one: silent.
+        // An empty sound is silent.
         const sound = sender.sound ?? (high ? "Basso" : "Glass")
         return deps.exec("osascript", [
           "-e", "on run argv",
@@ -223,12 +216,6 @@ export async function deliver(sender: Sender, m: Message, deps: Deps = defaultDe
         }).then(ok)
       }
       return
-    }
-    case "webhook": {
-      const body = { title: m.title, message: plain, priority: m.priority ?? "normal", ...(m.url ? { url: m.url } : {}), ...(m.urlTitle ? { url_title: m.urlTitle } : {}) }
-      await deps.fetch(withEnv(sender.url), {
-        method: "POST", signal: timeout(), headers: { "content-type": "application/json", ...withEnv(sender.headers ?? {}) }, body: JSON.stringify(body),
-      }).then(ok)
     }
   }
 }
