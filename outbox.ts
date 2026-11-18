@@ -22,7 +22,7 @@ const DEFAULT_ON: RunStatus[] = ["failed", "timeout"]
 export const DEFAULT_MAX_PER_RUN = 5
 export const RETRY_MS = [60_000, 5 * 60_000, 30 * 60_000]
 const RANK: Record<Priority, number> = { low: 0, normal: 1, high: 2 }
-const TYPES = new Set(["native", "pushover"])
+const TYPES = new Set(["Notification.Native", "Notification.PushOver"])
 
 export function parseDestinations(cfg: OutboxConfig | undefined): Destination[] {
   const destinations = cfg?.destinations ?? []
@@ -33,7 +33,7 @@ export function parseDestinations(cfg: OutboxConfig | undefined): Destination[] 
     if (ids.has(s.id)) throw new Error(`${where}: ids must be unique`)
     ids.add(s.id)
     if (!TYPES.has(s.type)) throw new Error(`${where}: type must be one of ${[...TYPES].join(", ")}`)
-    if (s.type === "pushover" && (!s.token || !s.user)) throw new Error(`${where} needs token and user`)
+    if (s.type === "Notification.PushOver" && (!s.options?.token || !s.options?.user)) throw new Error(`${where} needs options.token and options.user`)
     if (s.minPriority !== undefined && !(s.minPriority in RANK)) throw new Error(`${where}: minPriority must be low, normal or high`)
   }
   return destinations

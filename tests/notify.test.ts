@@ -17,8 +17,8 @@ const message: Message = { title: "Morning", body: "All clear", priority: "norma
 
 const noNetwork = async (): Promise<Response> => { throw new Error("unexpected network request") }
 const noExec = async () => { throw new Error("unexpected native notification") }
-const native: Destination = { id: "desktop", type: "native" }
-const pushover: Destination = { id: "phone", type: "pushover", token: "test-token", user: "test-user" }
+const native: Destination = { id: "desktop", type: "Notification.Native" }
+const pushover: Destination = { id: "phone", type: "Notification.PushOver", options: { token: "test-token", user: "test-user" } }
 
 test("native on macOS sends title and body as arguments, not AppleScript source", async () => {
   const calls: Array<{ command: string; args: string[] }> = []
@@ -72,7 +72,7 @@ test("Pushover sends credentials, HTML message, priority and link; credentials m
   const calls: Array<{ url: string; input?: RequestInit }> = []
   process.env.TEST_PUSHOVER_TOKEN = "env-token"
   try {
-    await deliver({ ...pushover, token: "{env:TEST_PUSHOVER_TOKEN}" }, {
+    await deliver({ ...pushover, options: { token: "{env:TEST_PUSHOVER_TOKEN}", user: "test-user" } }, {
       title: "CI broke", body: "**main** is red: a < b & c", priority: "high", url: "https://ci.test/1", urlTitle: "Open build",
     }, { platform: "linux", fetch: async (url, input) => { calls.push({ url, input }); return new Response("ok") }, exec: noExec })
   } finally { delete process.env.TEST_PUSHOVER_TOKEN }
@@ -169,7 +169,7 @@ test("destinations are checked: ids unique, a known type, what Pushover needs", 
   expect(parseDestinations({ destinations: [native, pushover] })).toHaveLength(2)
   expect(() => parseDestinations({ destinations: [native, native] })).toThrow("unique")
   expect(() => parseDestinations({ destinations: [{ id: "x", type: "sms" } as unknown as Destination] })).toThrow("type must be one of")
-  expect(() => parseDestinations({ destinations: [{ id: "p", type: "pushover", token: "t" } as unknown as Destination] })).toThrow("token and user")
+  expect(() => parseDestinations({ destinations: [{ id: "p", type: "Notification.PushOver", options: { token: "t" } } as unknown as Destination] })).toThrow("options.token and options.user")
 })
 
 test("automatic notices: failures by default, never for success, and only with a destination", () => {

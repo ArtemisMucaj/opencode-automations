@@ -92,8 +92,8 @@ Everything the plugin tells you goes through an **outbox**. The agent running an
 ```jsonc
 "outbox": {
   "destinations": [
-    { "id": "desktop", "type": "native" },
-    { "id": "phone", "type": "pushover", "token": "{env:PUSHOVER_TOKEN}", "user": "{env:PUSHOVER_USER}", "minPriority": "normal" }
+    { "id": "desktop", "type": "Notification.Native" },
+    { "id": "phone", "type": "Notification.PushOver", "options": { "token": "{env:PUSHOVER_TOKEN}", "user": "{env:PUSHOVER_USER}" }, "minPriority": "normal" }
   ]
 }
 ```
@@ -170,8 +170,8 @@ Automations created from chat or the dialog need no configuration at all. The op
         "defaultModel": "anthropic/claude-sonnet-4-5",
         "outbox": {
           "destinations": [
-            { "id": "desktop", "type": "native" },
-            { "id": "phone", "type": "pushover", "token": "{env:PUSHOVER_TOKEN}", "user": "{env:PUSHOVER_USER}" }
+            { "id": "desktop", "type": "Notification.Native" },
+            { "id": "phone", "type": "Notification.PushOver", "options": { "token": "{env:PUSHOVER_TOKEN}", "user": "{env:PUSHOVER_USER}" } }
           ]
         },
         "jobs": [

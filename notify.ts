@@ -6,10 +6,13 @@ import { httpError, withEnv, type Fetch } from "./util.ts"
 export type Priority = "low" | "normal" | "high"
 
 /** Configured under `outbox.destinations`. */
-export type Destination = { id: string; minPriority?: Priority } & (
-  | { type: "native"; sound?: string }
-  | { type: "pushover"; token: string; user: string }
-)
+export namespace Notification {
+  interface Base { id: string; minPriority?: Priority }
+  /** Desktop notifications (macOS, Linux). An empty `sound` is silent. */
+  export interface Native extends Base { type: "Notification.Native"; sound?: string }
+  export interface PushOver extends Base { type: "Notification.PushOver"; options: { token: string; user: string } }
+}
+export type Destination = Notification.Native | Notification.PushOver
 
 export interface Message {
   title: string
@@ -186,10 +189,9 @@ export async function deliver(destination: Destination, m: Message, deps: Deps =
   const plain = format(m.body, "plain") || m.title
   const high = m.priority === "high"
   switch (destination.type) {
-    case "native": {
+    case "Notification.Native": {
       const body = m.url ? `${plain}\n${m.url}` : plain
       if (deps.platform === "darwin") {
-        // An empty sound is silent.
         const sound = destination.sound ?? (high ? "Basso" : "Glass")
         return deps.exec("osascript", [
           "-e", "on run argv",
@@ -207,8 +209,8 @@ export async function deliver(destination: Destination, m: Message, deps: Deps =
       }
       throw new Error(`native notifications are not supported on ${deps.platform}`)
     }
-    case "pushover": {
-      const creds = { token: withEnv(destination.token), user: withEnv(destination.user) }
+    case "Notification.PushOver": {
+      const creds = { token: withEnv(destination.options.token), user: withEnv(destination.options.user) }
       // In order, so parts arrive 1/n … n/n.
       for (const part of pushoverParts(m)) {
         await deps.fetch("https://api.pushover.net/1/messages.json", {

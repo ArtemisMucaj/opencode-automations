@@ -15,9 +15,9 @@
           "on": ["failed", "timeout"],
           "maxPerRun": 5,
           "destinations": [
-            { "id": "desktop", "type": "native" },
+            { "id": "desktop", "type": "Notification.Native" },
             // Phone notifications via Pushover, only for what matters.
-            // { "id": "phone", "type": "pushover", "token": "{env:PUSHOVER_TOKEN}", "user": "{env:PUSHOVER_USER}", "minPriority": "normal" },
+            // { "id": "phone", "type": "Notification.PushOver", "options": { "token": "{env:PUSHOVER_TOKEN}", "user": "{env:PUSHOVER_USER}" }, "minPriority": "normal" },
           ],
         },
         "jobs": [

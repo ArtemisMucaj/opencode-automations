@@ -143,7 +143,7 @@ async function start(options: Record<string, unknown> = {}, jobs: Job[] = [], se
 }
 
 /** The outbox with one destination, Pushover. */
-const pushover = { destinations: [{ id: "phone", type: "pushover", token: "test-token", user: "test-user" }] }
+const pushover = { destinations: [{ id: "phone", type: "Notification.PushOver", options: { token: "test-token", user: "test-user" } }] }
 /** Save the run's memory, as a run is told to before it ends (else it is asked once more). */
 const remember = (app: { call: (name: string, input: unknown, sessionID: string) => Promise<{ content: string }> }, sessionID: string, note = "noted") =>
   app.call("automation_memory_update", { note }, sessionID)
