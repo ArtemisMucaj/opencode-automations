@@ -541,7 +541,7 @@ function AutomationsView(props) {
     }]
   }));
   const L = createMemo(() => look(ctx, "dialog"));
-  const statusLook = st => ({
+  const statusUI = st => ({
     failing: {
       fg: L().bad,
       bg: t.background.feedback.error.base,
@@ -978,10 +978,10 @@ function AutomationsView(props) {
                         return isSel();
                       },
                       get dot() {
-                        return statusLook(status()).dot;
+                        return statusUI(status()).dot;
                       },
                       get dotFg() {
-                        return statusLook(status()).fg;
+                        return statusUI(status()).fg;
                       },
                       get name() {
                         return c().name;
@@ -1039,8 +1039,8 @@ function AutomationsView(props) {
                                   fg: L().text
                                 },
                                 _v$31 = {
-                                  fg: statusLook(status()).fg,
-                                  bg: statusLook(status()).bg
+                                  fg: statusUI(status()).fg,
+                                  bg: statusUI(status()).bg
                                 },
                                 _v$32 = {
                                   fg: L().muted

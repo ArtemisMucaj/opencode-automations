@@ -419,7 +419,7 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
   }))
 
   const L = createMemo(() => look(ctx, "dialog"))
-  const statusLook = (st: "failing" | "polling" | "idle") =>
+  const statusUI = (st: "failing" | "polling" | "idle") =>
     ({
       failing: { fg: L().bad, bg: t.background.feedback.error.base, dot: "✗" },
       polling: { fg: L().ok, bg: t.background.feedback.success.base, dot: "●" },
@@ -612,7 +612,7 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
                         const status = () => chStatus(c())
                         const src = () => state.channels().sources[c().id]
                         const when = () => (status() === "idle" ? "idle" : src()?.lastPollAt ? relative(src()!.lastPollAt, state.now()) : "soon")
-                        return <Row selected={isSel()} dot={statusLook(status()).dot} dotFg={statusLook(status()).fg} name={c().name} when={when()} />
+                        return <Row selected={isSel()} dot={statusUI(status()).dot} dotFg={statusUI(status()).fg} name={c().name} when={when()} />
                       }}
                     </Index>
                   </box>
@@ -634,7 +634,7 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
                                 </span>
                                 {"  "}
                                 <span
-                                  style={{ fg: statusLook(status()).fg, bg: statusLook(status()).bg }}
+                                  style={{ fg: statusUI(status()).fg, bg: statusUI(status()).bg }}
                                 >
                                   {` ${status()} `}
                                 </span>
