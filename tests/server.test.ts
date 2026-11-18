@@ -272,7 +272,7 @@ test("the run's agent sends notifications itself; a successful run then sends no
     const queued = await app.call("automation_notify", {
       title: "2 MRs need you", message: "- **!12** blocked\n- !15 approved", priority: "high", url: "https://mr.test", url_title: "Open",
     }, "session-1")
-    expect(queued.content).toContain("Queued for delivery")
+    expect(queued.content).toContain("Outbox message queued")
     await sent(fetch, 1)
     expect(bodies(fetch)).toEqual([{
       token: "test-token", user: "test-user", title: "2 MRs need you", message: "• <b>!12</b> blocked\n• !15 approved",
@@ -702,7 +702,7 @@ test("a run's tools and guidance work through another instance of the plugin in 
     expect(system.join("\n")).toContain("End every run with automation_memory_update")
     expect(new Set(system).size).toBe(system.length)
 
-    expect((await other.call("automation_notify", { title: "Brief", message: "MR !12 blocked" }, "session-1")).content).toContain("Queued for delivery")
+    expect((await other.call("automation_notify", { title: "Brief", message: "MR !12 blocked" }, "session-1")).content).toContain("Outbox message queued")
     expect((await other.call("automation_memory_update", { note: "MR !12 reported." }, "session-1")).content).toContain("Saved")
     await end(app, "session-1")
     // The run that started in the first instance saw both: it ended without asking again.
@@ -1487,15 +1487,15 @@ test("the old notify option is refused, naming what replaced it", async () => {
   await expect(start({ outbox: { destinations: [{ id: "x", type: "sms" }] } })).rejects.toThrow("type must be one of")
 })
 
-test("a notification no destination takes is recorded, and the run is told it isn't delivered", async () => {
+test("a notification no destination takes is still queued in the outbox", async () => {
   const app = await start({ outbox: { destinations: [{ ...pushover.destinations[0], minPriority: "high" }] } }, [job()])
   await app.call("automation_run", { id: "morning" })
-  expect((await app.call("automation_notify", { title: "FYI", message: "low stakes" }, "session-1")).content).toContain("not delivered")
+  expect((await app.call("automation_notify", { title: "FYI", message: "low stakes" }, "session-1")).content).toContain("Outbox message queued")
   expect(app.store.sent("morning")[0]).toMatchObject({ title: "FYI", sends: [] })
 
   const unconfigured = await start({}, [job()])
   await unconfigured.call("automation_run", { id: "morning" })
-  expect((await unconfigured.call("automation_notify", { title: "Brief", message: "MR !12 blocked" }, "session-1")).content).toContain("no destination")
+  expect((await unconfigured.call("automation_notify", { title: "Brief", message: "MR !12 blocked" }, "session-1")).content).toContain("Outbox message queued")
   expect(unconfigured.store.sent("morning")[0]).toMatchObject({ title: "Brief", sends: [] })
 })
 

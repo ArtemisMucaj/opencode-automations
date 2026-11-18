@@ -82,13 +82,12 @@ export class Outbox {
     return (Array.isArray(job.notify) ? job.notify : this.on).includes(status)
   }
 
-  /** Queue a message for every destination that takes its priority; returns how many do. */
-  add(m: Message, from: { job?: string; run?: string } = {}): number {
+  /** Queue a message for every destination that takes its priority. */
+  add(m: Message, from: { job?: string; run?: string } = {}): void {
     const priority = m.priority ?? "normal"
     const to = this.destinations.filter((d) => RANK[priority] >= RANK[d.minPriority ?? "low"]).map((d) => d.id)
     this.store.enqueue({ ...from, title: m.title, body: m.body, priority, url: m.url, urlTitle: m.urlTitle }, to)
     if (to.length) this.kick()
-    return to.length
   }
 
   /** Start sending what is due, without waiting. */
