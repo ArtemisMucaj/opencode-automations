@@ -59,6 +59,10 @@ You can also use the dialog. Type `/automations` to see your list, then:
 | `⏎` | open its latest run |
 | `d` | delete it |
 | `c` | switch to channels (see [Run on events](#run-on-events-channels)) |
+| `i` | switch to the inbox: the latest events from every channel, and which automations took them, still wait for them, or dropped them |
+| `o` | switch to the outbox: the latest messages sent to you, and whether each destination got them |
+
+Press a tab's key again to go back to your automations. An automation's details also show its memory: the note each run leaves for the next one.
 
 The sidebar also shows what runs next.
 

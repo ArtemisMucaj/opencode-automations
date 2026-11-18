@@ -134,6 +134,26 @@ test("a job's notes are listed per key, the most recently updated first", () => 
   expect(store.notes("a")[1].updatedAt).toBe(1)
 })
 
+test("the inbox lists every channel's events, newest first, with each automation's part in them", () => {
+  const store = open()
+  expect(store.inbox()).toEqual([])
+  subscribe(store, [job("a", ["dd"]), job("b", ["dd"])])
+  poll(store, 10, ev("1"), ev("2", "k"))
+  store.ingest("other", [{ channel: "other", id: "x", title: "nobody listens" }], 20)
+  store.take("a", [store.waiting("a")[0].seq])
+  const [x, two, one] = store.inbox()
+  expect(x).toMatchObject({ channel: "other", id: "x", at: 20, seenAt: 20, deliveries: [] })
+  expect(two).toMatchObject({ id: "2", sessionKey: "k", deliveries: [{ job: "a", status: "waiting" }, { job: "b", status: "waiting" }] })
+  expect(one.deliveries).toEqual([{ job: "a", status: "taken" }, { job: "b", status: "waiting" }])
+  // Dropped after failed starts; a retry waits again.
+  store.giveBack("a", [one.seq], false)
+  expect(store.inbox()[2].deliveries[0]).toEqual({ job: "a", status: "waiting" })
+  store.take("a", [one.seq])
+  for (let n = 0; n < MAX_START_ATTEMPTS; n++) { store.giveBack("a", [one.seq], true); store.take("a", [one.seq]) }
+  expect(store.inbox()[2].deliveries[0]).toEqual({ job: "a", status: "dropped" })
+  expect(store.inbox(1)).toHaveLength(1)
+})
+
 test("detaching a channel drops the sticky sessions and memory of its keys", () => {
   const store = open()
   subscribe(store, [job("a", ["dd", "other"])])

@@ -53,6 +53,9 @@ export interface Run {
 }
 
 export type InboxEvent = ChannelEvent & { seq: number }
+export type DeliveryStatus = "waiting" | "taken" | "dropped"
+/** An inbox event as shown to the user: when it was first and last seen, and what each automation did with it. */
+export type InboxEntry = InboxEvent & { at: number; seenAt: number; deliveries: Array<{ job: string; status: DeliveryStatus }> }
 
 interface StickySession { id: string; usedAt: number; warmUntil?: number }
 
@@ -315,6 +318,44 @@ export class Store {
       out.set(r.job, perChannel)
     }
     return out
+  }
+
+  /**
+   * The latest events of every channel, newest first, each with what became of it per automation: still
+   * waiting for it (or for a retry), taken by a run, or dropped after failed starts.
+   */
+  inbox(limit = 100): InboxEntry[] {
+    const rows = this.all<Row>("SELECT seq, channel, id, key, title, body, url, at, seen_at FROM inbox ORDER BY seq DESC LIMIT ?", limit)
+    if (!rows.length) return []
+    const seqs = JSON.stringify(rows.map((r) => r.seq))
+    const fates = new Map<number, Map<string, DeliveryStatus>>()
+    const set = (seq: number, job: string, status: DeliveryStatus) => {
+      const m = fates.get(seq) ?? new Map<string, DeliveryStatus>()
+      m.set(job, status)
+      fates.set(seq, m)
+    }
+    // Waiting: the job is subscribed from before it, and hasn't taken it yet.
+    for (const r of this.all<{ seq: number; job: string }>(
+      "SELECT i.seq, s.job FROM inbox i JOIN subscriptions s ON s.channel = i.channel " +
+      "WHERE i.seq IN (SELECT value FROM json_each(?)) AND (i.seq > s.since_seq OR i.seen_at >= s.since_poll)", seqs)) {
+      set(r.seq, r.job, "waiting")
+    }
+    for (const r of this.all<{ seq: number; job: string; status: string }>(
+      "SELECT seq, job, status FROM deliveries WHERE seq IN (SELECT value FROM json_each(?))", seqs)) {
+      set(r.seq, r.job, r.status === "retry" ? "waiting" : (r.status as DeliveryStatus))
+    }
+    return rows.map((r) => ({
+      seq: r.seq as number,
+      channel: r.channel as string,
+      id: r.id as string,
+      ...(r.key !== null ? { sessionKey: r.key as string } : {}),
+      title: r.title as string,
+      ...(r.body !== null ? { body: r.body as string } : {}),
+      ...(r.url !== null ? { url: r.url as string } : {}),
+      at: r.at as number,
+      seenAt: r.seen_at as number,
+      deliveries: [...(fates.get(r.seq as number) ?? [])].map(([job, status]) => ({ job, status })).sort((a, b) => a.job.localeCompare(b.job)),
+    }))
   }
 
   /** Mark events as taken; returns the ones that were still free. */

@@ -3,11 +3,13 @@
 
 import type { Renderable, RGBA } from "@opentui/core"
 import { Plugin } from "@opencode/plugin/tui"
-import { createMemo, createSignal, For, Index, Show, type JSX } from "solid-js"
+import { createMemo, createSignal, For, Index, Match, Show, Switch, type JSX } from "solid-js"
 import { describe, nextRun } from "./cron.ts"
 import { DEFAULT_TIMEOUT_MINUTES, defaultDataDir, isActive, listens, newJob, parseScheduleText, runnable, runningJobs, stateOf } from "./jobs.ts"
 import { clock, elapsed, errorMessage, plural, relative } from "./util.ts"
-import { Store, type InboxEvent, type Job, type Run, type RunStatus, type SentMessage, type SessionMode } from "./store.ts"
+import {
+  Store, type DeliveryStatus, type InboxEntry, type InboxEvent, type Job, type Run, type RunStatus, type SendStatus, type SentMessage, type SessionMode,
+} from "./store.ts"
 import { channelRows, emptyChannels, requestPoll, type ChannelRow, type ChannelsState } from "./channels.ts"
 
 type Context = Plugin.Context
@@ -38,8 +40,14 @@ function look(ctx: Context, surface?: "dialog") {
   }
 }
 
+type Tab = "jobs" | "channels" | "inbox" | "outbox"
+/** The keys that switch tabs; pressing the open tab's key goes back to the automations. */
+const tabKeys: Record<Exclude<Tab, "jobs">, string> = { channels: "c", inbox: "i", outbox: "o" }
+const tabHints = (tab: Tab): [string, string][] =>
+  tab === "jobs"
+    ? [["c", "channels"], ["i", "inbox"], ["o", "outbox"]]
+    : [[tabKeys[tab], "automations"], ...(Object.entries(tabKeys) as [Exclude<Tab, "jobs">, string][]).filter(([t]) => t !== tab).map(([t, k]): [string, string] => [k, t])]
 const keyHints: [string, string][] = [
-  ["c", "channels"],
   ["↑↓", "select"],
   ["space", "pause"],
   ["r", "run now"],
@@ -52,12 +60,17 @@ const keyHints: [string, string][] = [
   ["esc", "close"],
 ]
 const channelHints: [string, string][] = [
-  ["c", "automations"],
   ["↑↓", "select"],
   ["p", "poll now"],
   ["d", "delete"],
   ["esc", "close"],
 ]
+const listHints: [string, string][] = [
+  ["↑↓", "select"],
+  ["esc", "close"],
+]
+/** How many of the latest inbox events and outbox messages the tabs show. */
+const LIST_LIMIT = 100
 
 const BUSY_MS = 250
 export function createState(ctx: Context, dataDir: string) {
@@ -80,7 +93,11 @@ export function createState(ctx: Context, dataDir: string) {
   // Kept here, not in the view: the dialog is re-created after nested prompts and must reopen on the same job and tab.
   const [selectedID, setSelectedID] = createSignal<string>()
   const [selectedChannel, setSelectedChannel] = createSignal<string>()
-  const [tab, setTab] = createSignal<"jobs" | "channels">("jobs")
+  const [selectedEvent, setSelectedEvent] = createSignal<number>()
+  const [selectedMessage, setSelectedMessage] = createSignal<number>()
+  const [tab, setTab] = createSignal<Tab>("jobs")
+  // Bumped on every refresh, for reads made only while they're shown (a job's memory, the inbox and outbox tabs).
+  const [refreshed, setRefreshed] = createSignal(0)
 
   const notifyMode = (ctx.options.notify ?? "blurred") as "always" | "blurred" | "off"
   const seen = new Set(runs().filter((r) => r.status !== "running").map((r) => r.runID))
@@ -97,6 +114,7 @@ export function createState(ctx: Context, dataDir: string) {
     setSent(loadSent())
     setRuns(next)
     setNow(Date.now())
+    setRefreshed((n) => n + 1)
     for (const r of next) {
       if (r.status === "running" || seen.has(r.runID)) continue
       seen.add(r.runID)
@@ -129,7 +147,8 @@ export function createState(ctx: Context, dataDir: string) {
 
   return {
     store, jobs, runs, now, refresh, tick, act, selectedID, setSelectedID, channels, actChannels, waiting, sent,
-    selectedChannel, setSelectedChannel, tab, setTab,
+    selectedChannel, setSelectedChannel, tab, setTab, refreshed,
+    selectedEvent, setSelectedEvent, selectedMessage, setSelectedMessage,
   }
 }
 
@@ -147,9 +166,9 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
   const selected = createMemo(() => sorted()[index()])
   const jobRuns = createMemo(() => state.runs().filter((r) => r.jobID === selected()?.id).slice(0, 8))
   const jobSent = createMemo(() => state.sent().get(selected()?.id ?? "") ?? [])
-  // Only the selected job's notes are read; state.runs() is replaced on every refresh, so this re-reads with it.
+  // Only the selected job's notes are read, again on each refresh.
   const jobNotes = createMemo(() => {
-    state.runs()
+    state.refreshed()
     const id = selected()?.id
     if (!id) return []
     try { return state.store.notes(id) } catch { return [] }
@@ -157,6 +176,7 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
 
   // ---- channels tab ----
   const onChannels = () => state.tab() === "channels"
+  const onJobs = () => state.tab() === "jobs"
   const chRows = createMemo(() => channelRows(state.channels()))
   const chIndex = createMemo(() => Math.max(0, chRows().findIndex((c) => c.id === state.selectedChannel())))
   const chSelected = createMemo(() => chRows()[chIndex()])
@@ -176,6 +196,27 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
     if (next) state.setSelectedChannel(next.id)
   }
   const running = createMemo(() => runningJobs(state.jobs(), state.runs(), state.now()))
+  const jobName = (id?: string) => (id ? (state.jobs().find((j) => j.id === id)?.name ?? id) : "chat")
+
+  // ---- inbox and outbox tabs: read only while open ----
+  const inbox = createMemo(() => {
+    state.refreshed()
+    if (state.tab() !== "inbox") return []
+    try { return state.store.inbox(LIST_LIMIT) } catch { return [] }
+  })
+  const evIndex = createMemo(() => Math.max(0, inbox().findIndex((e) => e.seq === state.selectedEvent())))
+  const evSelected = createMemo(() => inbox()[evIndex()])
+  const outbox = createMemo(() => {
+    state.refreshed()
+    if (state.tab() !== "outbox") return []
+    try { return state.store.sent(undefined, LIST_LIMIT) } catch { return [] }
+  })
+  const msgIndex = createMemo(() => Math.max(0, outbox().findIndex((m) => m.id === state.selectedMessage())))
+  const msgSelected = createMemo(() => outbox()[msgIndex()])
+  // Long lists show the rows around the cursor that fit: the panel less its header, the list's title and the hints.
+  const fits = () => Math.max(5, (panel()?.height ?? 30) - 10)
+  const windowStart = (length: number, i: number) => Math.max(0, Math.min(length - fits(), i - Math.floor(fits() / 2)))
+  const visible = <T,>(list: T[], i: number) => list.slice(windowStart(list.length, i), windowStart(list.length, i) + fits())
 
   /** Toast an error message; also takes the promise act() returns, and resolves once it has settled. */
   const toastErr = async (msg?: string | Promise<string | undefined>) => {
@@ -241,9 +282,20 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
       }))
     }),
   }
-  const jobsOnly = (fn: () => unknown) => () => (onChannels() ? undefined : fn())
+  const jobsOnly = (fn: () => unknown) => () => (onJobs() ? fn() : undefined)
   const channelsOnly = (fn: () => unknown) => () => (onChannels() ? fn() : undefined)
-  const step = (d: number) => (onChannels() ? moveChannel(d) : move(d))
+  const stepIn = <T,>(list: T[], i: number, d: number, pick: (x: T) => void) => {
+    const next = list[Math.max(0, Math.min(list.length - 1, i + d))]
+    if (next) pick(next)
+  }
+  const step = (d: number) => {
+    const tab = state.tab()
+    if (tab === "channels") moveChannel(d)
+    else if (tab === "inbox") stepIn(inbox(), evIndex(), d, (e) => state.setSelectedEvent(e.seq))
+    else if (tab === "outbox") stepIn(outbox(), msgIndex(), d, (m) => state.setSelectedMessage(m.id))
+    else move(d)
+  }
+  const toggleTab = (tab: Exclude<Tab, "jobs">) => () => state.setTab(state.tab() === tab ? "jobs" : tab)
 
   const actions = {
     togglePause: withJob((j) =>
@@ -355,7 +407,9 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
       { title: "down", bind: "down", run: () => step(1) },
       { bind: "k", run: () => step(-1) },
       { bind: "j", run: () => step(1) },
-      { title: "channels/automations", bind: "c", run: () => state.setTab(onChannels() ? "jobs" : "channels") },
+      { title: "channels/automations", bind: "c", run: toggleTab("channels") },
+      { title: "inbox/automations", bind: "i", run: toggleTab("inbox") },
+      { title: "outbox/automations", bind: "o", run: toggleTab("outbox") },
       { title: "pause/resume", bind: "space", run: jobsOnly(actions.togglePause) },
       { title: "run now", bind: "r", run: jobsOnly(actions.runNow) },
       { title: "poll now", bind: "p", run: channelsOnly(channelActions.poll) },
@@ -363,7 +417,7 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
       { title: "prompt", bind: "e", run: jobsOnly(actions.editPrompt) },
       { title: "schedule", bind: "s", run: jobsOnly(actions.editSchedule) },
       { title: "model", bind: "m", run: jobsOnly(actions.pickModel) },
-      { title: "delete", bind: "d", run: () => (onChannels() ? channelActions.remove() : actions.remove()) },
+      { title: "delete", bind: "d", run: () => (onChannels() ? channelActions.remove() : onJobs() ? actions.remove() : undefined) },
       { title: "open session", bind: "return", run: jobsOnly(actions.openSession) },
     ],
   }))
@@ -374,6 +428,30 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
       failing: { fg: L().bad, bg: t.background.feedback.error.base, dot: "✗" },
       polling: { fg: L().ok, bg: t.background.feedback.success.base, dot: "●" },
       idle: { fg: L().muted, bg: L().cap, dot: "○" },
+    })[st]
+  /** An inbox event's overall fate: waiting if any automation still waits for it. */
+  const fate = (e: InboxEntry): DeliveryStatus | "unclaimed" =>
+    e.deliveries.some((d) => d.status === "waiting") ? "waiting"
+      : e.deliveries.some((d) => d.status === "dropped") ? "dropped"
+      : e.deliveries.length ? "taken" : "unclaimed"
+  const fateLook = (f: DeliveryStatus | "unclaimed") =>
+    ({
+      waiting: { fg: L().warn, dot: "◐" },
+      taken: { fg: L().ok, dot: "✓" },
+      dropped: { fg: L().bad, dot: "✗" },
+      unclaimed: { fg: L().muted, dot: "○" },
+    })[f]
+  /** A message's overall delivery: failed if any destination failed, pending while any is still trying. */
+  const sendState = (m: SentMessage): SendStatus | "none" =>
+    m.sends.some((x) => x.status === "failed") ? "failed"
+      : m.sends.some((x) => x.status === "pending") ? "pending"
+      : m.sends.length ? "sent" : "none"
+  const sendLook = (st: SendStatus | "none") =>
+    ({
+      sent: { fg: L().ok, dot: "✓" },
+      pending: { fg: L().warn, dot: "◐" },
+      failed: { fg: L().bad, dot: "✗" },
+      none: { fg: L().muted, dot: "○" },
     })[st]
   const statusColor = (s?: RunStatus) =>
     s === "succeeded" ? L().ok : s === "running" ? L().warn : s === "skipped" || !s ? L().muted : L().bad
@@ -466,11 +544,13 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
                   <b>⏰ Automations</b>
                 </text>
                 {/* Tabs as separate <text>s so a color change repaints (see the dot below). */}
-                <text fg={onChannels() ? L().muted : L().ink(0)}>{onChannels() ? " jobs " : "[jobs]"}</text>
-                <text fg={onChannels() ? L().ink(0) : L().muted}>{onChannels() ? "[channels]" : " channels "}</text>
+                <For each={["jobs", "channels", "inbox", "outbox"] as Tab[]}>
+                  {(tab) => (
+                    <text fg={state.tab() === tab ? L().ink(0) : L().muted}>{state.tab() === tab ? `[${tab}]` : ` ${tab} `}</text>
+                  )}
+                </For>
               </box>
-              <Show
-                when={onChannels()}
+              <Switch
                 fallback={
                   <text fg={L().muted}>
                     {plural(state.jobs().length, "job")} · {activeCount()} active ·{" "}
@@ -478,6 +558,21 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
                   </text>
                 }
               >
+                <Match when={state.tab() === "inbox"}>
+                  <text fg={L().muted}>
+                    {inbox().length >= LIST_LIMIT ? `latest ${LIST_LIMIT}` : plural(inbox().length, "event")} ·{" "}
+                    <span style={{ fg: L().warn }}>{inbox().filter((e) => e.deliveries.some((d) => d.status === "waiting")).length} waiting</span>
+                  </text>
+                </Match>
+                <Match when={state.tab() === "outbox"}>
+                  <text fg={L().muted}>
+                    {outbox().length >= LIST_LIMIT ? `latest ${LIST_LIMIT}` : plural(outbox().length, "message")} ·{" "}
+                    <span style={{ fg: outbox().some((m) => sendState(m) === "failed") ? L().bad : L().muted }}>
+                      {outbox().filter((m) => sendState(m) === "failed").length} failed
+                    </span>
+                  </text>
+                </Match>
+                <Match when={onChannels()}>
                 <text fg={L().muted}>
                   {plural(chRows().length, "channel")} ·{" "}
                   {chRows().filter((c) => chStatus(c) !== "idle").length} polled ·{" "}
@@ -485,7 +580,8 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
                     {chRows().filter((c) => chStatus(c) === "failing").length} failing
                   </span>
                 </text>
-              </Show>
+                </Match>
+              </Switch>
             </box>
 
             <Show when={onChannels()}>
@@ -598,7 +694,154 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
               </Show>
             </Show>
 
-            <Show when={!onChannels()}>
+
+            <Show when={state.tab() === "inbox"}>
+              <Show
+                when={inbox().length}
+                fallback={
+                  <box backgroundColor={L().panel} padding={2} flexDirection="column" gap={1}>
+                    <text fg={L().text}>The inbox is empty.</text>
+                    <text fg={L().muted}>Channels write the events they poll here, for the automations attached to them.</text>
+                  </box>
+                }
+              >
+                <box flexDirection="row" flexGrow={1} flexShrink={1} flexBasis={0} minHeight={0} gap={2}>
+                  <box flexDirection="column" width={38} backgroundColor={L().panel} paddingTop={1} paddingBottom={1}>
+                    <box paddingLeft={2} paddingBottom={1}>
+                      <text fg={L().muted}>
+                        <b>INBOX</b>
+                      </text>
+                    </box>
+                    <Index each={visible(inbox(), evIndex())}>
+                      {(e, at) => {
+                        const i = at + windowStart(inbox().length, evIndex())
+                        const look = () => fateLook(fate(e()))
+                        return <Row selected={i === evIndex()} dot={look().dot} dotFg={look().fg} name={e().title} when={relative(e().at, state.now())} />
+                      }}
+                    </Index>
+                  </box>
+
+                  <Show when={evSelected()}>
+                    {(e) => (
+                      <scrollbox flexGrow={1} minHeight={0}>
+                        <box flexDirection="column" gap={1}>
+                          <Block title="Event" hue={0}>
+                            <text fg={L().text}>
+                              <b>{e().title}</b>
+                            </text>
+                            <box flexDirection="column">
+                              <Field label="channel" value={state.channels().defs[e().channel]?.name ?? state.channels().config[e().channel]?.name ?? e().channel} />
+                              <Field label="id" value={e().id} />
+                              <Show when={e().sessionKey}>{(k) => <Field label="sessionKey" value={k()} />}</Show>
+                              <Field label="first seen" value={`${clock(e().at)}  (${relative(e().at, state.now())})`} />
+                              <Field label="last seen" value={`${clock(e().seenAt)}  (${relative(e().seenAt, state.now())})`} />
+                              <Show when={e().url}>{(u) => <Field label="url" value={u()} />}</Show>
+                            </box>
+                          </Block>
+
+                          <Show when={e().body}>
+                            {(b) => (
+                              <Block title="Body" hue={1}>
+                                <text fg={L().text}>{b()}</text>
+                              </Block>
+                            )}
+                          </Show>
+
+                          <Block title="Automations" hue={2}>
+                            <Show when={e().deliveries.length} fallback={<text fg={L().muted}>none took it or waits for it</text>}>
+                              <box flexDirection="column">
+                                <For each={e().deliveries}>
+                                  {(d) => (
+                                    <text fg={L().text}>
+                                      <span style={{ fg: fateLook(d.status).fg }}>{fateLook(d.status).dot}</span> {jobName(d.job)}
+                                      <span style={{ fg: L().muted }}>{"  "}{d.status}</span>
+                                    </text>
+                                  )}
+                                </For>
+                              </box>
+                            </Show>
+                          </Block>
+                        </box>
+                      </scrollbox>
+                    )}
+                  </Show>
+                </box>
+              </Show>
+            </Show>
+
+            <Show when={state.tab() === "outbox"}>
+              <Show
+                when={outbox().length}
+                fallback={
+                  <box backgroundColor={L().panel} padding={2} flexDirection="column" gap={1}>
+                    <text fg={L().text}>Nothing has been sent yet.</text>
+                    <text fg={L().muted}>What automations notify you of is kept here, with how each destination took it.</text>
+                  </box>
+                }
+              >
+                <box flexDirection="row" flexGrow={1} flexShrink={1} flexBasis={0} minHeight={0} gap={2}>
+                  <box flexDirection="column" width={38} backgroundColor={L().panel} paddingTop={1} paddingBottom={1}>
+                    <box paddingLeft={2} paddingBottom={1}>
+                      <text fg={L().muted}>
+                        <b>OUTBOX</b>
+                      </text>
+                    </box>
+                    <Index each={visible(outbox(), msgIndex())}>
+                      {(m, at) => {
+                        const i = at + windowStart(outbox().length, msgIndex())
+                        const look = () => sendLook(sendState(m()))
+                        return <Row selected={i === msgIndex()} dot={look().dot} dotFg={look().fg} name={m().title} when={relative(m().at, state.now())} />
+                      }}
+                    </Index>
+                  </box>
+
+                  <Show when={msgSelected()}>
+                    {(m) => (
+                      <scrollbox flexGrow={1} minHeight={0}>
+                        <box flexDirection="column" gap={1}>
+                          <Block title="Message" hue={0}>
+                            <text fg={L().text}>
+                              <b>{m().title}</b>
+                            </text>
+                            <box flexDirection="column">
+                              <Field label="from" value={jobName(m().job)} />
+                              <Field label="sent" value={`${clock(m().at)}  (${relative(m().at, state.now())})`} />
+                              <Field label="priority" value={m().priority} />
+                              <Show when={m().url}>{(u) => <Field label="url" value={m().urlTitle ? `${m().urlTitle}  ${u()}` : u()} />}</Show>
+                              <Show when={m().run}>{(r) => <Field label="run" value={r()} />}</Show>
+                            </box>
+                          </Block>
+
+                          <Block title="Body" hue={1}>
+                            <text fg={L().text}>{m().body}</text>
+                          </Block>
+
+                          <Block title="Destinations" hue={3}>
+                            <Show when={m().sends.length} fallback={<text fg={L().muted}>no destination takes it</text>}>
+                              <box flexDirection="column">
+                                <For each={m().sends}>
+                                  {(x) => (
+                                    <box flexDirection="column">
+                                      <text fg={L().text}>
+                                        <span style={{ fg: sendLook(x.status).fg }}>{sendLook(x.status).dot}</span> {x.destination}
+                                        <span style={{ fg: L().muted }}>{"  "}{x.status}</span>
+                                      </text>
+                                      <Show when={x.error}>{(err) => <text fg={L().bad}>{"  " + err()}</text>}</Show>
+                                    </box>
+                                  )}
+                                </For>
+                              </box>
+                            </Show>
+                          </Block>
+                        </box>
+                      </scrollbox>
+                    )}
+                  </Show>
+                </box>
+              </Show>
+            </Show>
+
+            <Show when={onJobs()}>
             <Show
               when={sorted().length}
               fallback={
@@ -731,7 +974,7 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
             </Show>
 
             <box flexDirection="row" flexWrap="wrap" paddingTop={1} paddingBottom={1} columnGap={2} flexShrink={0}>
-              <For each={onChannels() ? channelHints : keyHints}>
+              <For each={[...tabHints(state.tab()), ...(onJobs() ? keyHints : onChannels() ? channelHints : listHints)]}>
                 {([key, label]) => (
                   <text>
                     <span style={{ fg: L().text, bg: L().cap }}> {key} </span>

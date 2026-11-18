@@ -143,6 +143,8 @@ test("TUI channels tab shows status, mapping and listeners, and queues a poll", 
   store.ingest("datadog", [{ channel: "datadog", id: "1:t", title: "CPU high on web-1" }], polled)
   store.subscribe(store.loadJobs(), { datadog: polled })
   store.setNote("triage", "datadog:42", "Monitor 42 flapping since 09:10.")
+  const sent = store.enqueue({ job: "triage", title: "web-1 CPU is back to normal", body: "Spike from a deploy.", priority: "normal" }, ["phone"])
+  store.updateSend(sent, "phone", "failed", 3, Date.now(), "HTTP 500")
   const testRenderer = await createTestRenderer({ width: 140, height: 50 })
   const host = fakeHost(dataDir, testRenderer.renderer)
   let stop: Awaited<ReturnType<typeof plugin.setup>> | undefined
@@ -202,6 +204,29 @@ test("TUI channels tab shows status, mapping and listeners, and queues a poll", 
     // Automation keys do nothing on this tab.
     await host.command((command) => command.title === "pause/resume").run()
     expect(store.loadJobs()[0].paused).toBeUndefined()
+
+    // Inbox tab: every channel's events, with what each automation did with them.
+    await host.command((command) => command.bind === "i").run()
+    await testRenderer.renderOnce()
+    frame = testRenderer.captureCharFrame()
+    expect(frame).toContain("[inbox]")
+    expect(frame).toContain("1 event · 1 waiting")
+    expect(frame).toContain("CPU high on web-1")
+    expect(frame).toContain("Alert triage  waiting")
+
+    // Outbox tab: what was sent, and how each destination took it.
+    await host.command((command) => command.bind === "o").run()
+    await testRenderer.renderOnce()
+    frame = testRenderer.captureCharFrame()
+    expect(frame).toContain("[outbox]")
+    expect(frame).toContain("1 message · 1 failed")
+    expect(frame).toContain("Spike from a deploy.")
+    expect(frame).toContain("phone  failed")
+    expect(frame).toContain("HTTP 500")
+    // The open tab's key goes back to the automations.
+    await host.command((command) => command.bind === "o").run()
+    await testRenderer.renderOnce()
+    expect(testRenderer.captureCharFrame()).toContain("[jobs]")
   } finally {
     if (typeof stop === "function") stop()
     await testRenderer.dispose()
