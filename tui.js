@@ -54,7 +54,7 @@ const tabKeys = {
   inbox: "i",
   outbox: "o"
 };
-const tabHints = tab => tab === "jobs" ? [["c", "channels"], ["i", "inbox"], ["o", "outbox"]] : [[tabKeys[tab], "automations"], ...Object.entries(tabKeys).filter(([t]) => t !== tab).map(([t, k]) => [k, t])];
+const tabHints = tab => [...(tab === "jobs" ? [] : [[tabKeys[tab], "automations"]]), ...Object.entries(tabKeys).filter(([t]) => t !== tab).map(([t, k]) => [k, t])];
 const keyHints = [["↑↓", "select"], ["space", "pause"], ["r", "run now"], ["n", "new"], ["e", "prompt"], ["s", "schedule"], ["m", "model"], ["d", "delete"], ["⏎", "open session"], ["esc", "close"]];
 const channelHints = [["↑↓", "select"], ["p", "poll now"], ["d", "delete"], ["esc", "close"]];
 const listHints = [["↑↓", "select"], ["esc", "close"]];
@@ -202,17 +202,17 @@ function AutomationsView(props) {
   const selected = createMemo(() => sorted()[index()]);
   const jobRuns = createMemo(() => state.runs().filter(r => r.jobID === selected()?.id).slice(0, 8));
   const jobSent = createMemo(() => state.sent().get(selected()?.id ?? "") ?? []);
-  // Only the selected job's notes are read, again on each refresh.
-  const jobNotes = createMemo(() => {
+  // Only the selected job's notes are read, again on each refresh. A read that fails keeps what is shown, as refresh() does.
+  const jobNotes = createMemo(shown => {
     state.refreshed();
     const id = selected()?.id;
     if (!id) return [];
     try {
       return state.store.notes(id);
     } catch {
-      return [];
+      return shown;
     }
-  });
+  }, []);
 
   // ---- channels tab ----
   const onChannels = () => state.tab() === "channels";
@@ -242,32 +242,28 @@ function AutomationsView(props) {
   const jobName = id => id ? state.jobs().find(j => j.id === id)?.name ?? id : "chat";
 
   // ---- inbox and outbox tabs: read only while open ----
-  const inbox = createMemo(() => {
+  const inbox = createMemo(shown => {
     state.refreshed();
     if (state.tab() !== "inbox") return [];
     try {
       return state.store.inbox(LIST_LIMIT);
     } catch {
-      return [];
+      return shown;
     }
-  });
+  }, []);
   const evIndex = createMemo(() => Math.max(0, inbox().findIndex(e => e.seq === state.selectedEvent())));
   const evSelected = createMemo(() => inbox()[evIndex()]);
-  const outbox = createMemo(() => {
+  const outbox = createMemo(shown => {
     state.refreshed();
     if (state.tab() !== "outbox") return [];
     try {
       return state.store.sent(undefined, LIST_LIMIT);
     } catch {
-      return [];
+      return shown;
     }
-  });
+  }, []);
   const msgIndex = createMemo(() => Math.max(0, outbox().findIndex(m => m.id === state.selectedMessage())));
   const msgSelected = createMemo(() => outbox()[msgIndex()]);
-  // Long lists show the rows around the cursor that fit: the panel less its header, the list's title and the hints.
-  const fits = () => Math.max(5, (panel()?.height ?? 30) - 10);
-  const windowStart = (length, i) => Math.max(0, Math.min(length - fits(), i - Math.floor(fits() / 2)));
-  const visible = (list, i) => list.slice(windowStart(list.length, i), windowStart(list.length, i) + fits());
 
   /** Toast an error message; also takes the promise act() returns, and resolves once it has settled. */
   const toastErr = async msg => {
@@ -602,6 +598,8 @@ function AutomationsView(props) {
       dot: "○"
     }
   })[st];
+  const inboxWaiting = createMemo(() => inbox().filter(e => fate(e) === "waiting").length);
+  const outboxFailed = createMemo(() => outbox().filter(m => sendState(m) === "failed").length);
   const statusColor = s => s === "succeeded" ? L().ok : s === "running" ? L().warn : s === "skipped" || !s ? L().muted : L().bad;
   const badge = j => {
     const s = stateOf(j);
@@ -639,6 +637,12 @@ function AutomationsView(props) {
     };
   });
   const activeCount = createMemo(() => state.jobs().filter(isActive).length);
+  // Long lists show the rows around the cursor that fit: the panel less its header, the list's title and the hints.
+  // Rows are slots (<Index>): a slot's position in the list is its slot number plus the window's start, read reactively.
+  const fits = createMemo(() => Math.max(5, (panel()?.height ?? 30) - 10));
+  const windowStart = (length, i) => Math.max(0, Math.min(length - fits(), i - Math.floor(fits() / 2)));
+  const evStart = createMemo(() => windowStart(inbox().length, evIndex()));
+  const msgStart = createMemo(() => windowStart(outbox().length, msgIndex()));
   const Heading = p => (() => {
     var _el$ = _$createElement("text"),
       _el$2 = _$createElement("b");
@@ -820,7 +824,7 @@ function AutomationsView(props) {
                   return () => _c$() ? `latest ${LIST_LIMIT}` : plural(inbox().length, "event");
                 })(), _el$18);
                 _$insertNode(_el$20, _el$21);
-                _$insert(_el$20, () => inbox().filter(e => e.deliveries.some(d => d.status === "waiting")).length, _el$21);
+                _$insert(_el$20, inboxWaiting, _el$21);
                 _$effect(_p$ => {
                   var _v$7 = L().muted,
                     _v$8 = {
@@ -851,11 +855,11 @@ function AutomationsView(props) {
                   return () => _c$2() ? `latest ${LIST_LIMIT}` : plural(outbox().length, "message");
                 })(), _el$23);
                 _$insertNode(_el$25, _el$26);
-                _$insert(_el$25, () => outbox().filter(m => sendState(m) === "failed").length, _el$26);
+                _$insert(_el$25, outboxFailed, _el$26);
                 _$effect(_p$ => {
                   var _v$9 = L().muted,
                     _v$0 = {
-                      fg: outbox().some(m => sendState(m) === "failed") ? L().bad : L().muted
+                      fg: outboxFailed() ? L().bad : L().muted
                     };
                   _v$9 !== _p$.e && (_p$.e = _$setProp(_el$22, "fg", _v$9, _p$.e));
                   _v$0 !== _p$.t && (_p$.t = _$setProp(_el$25, "style", _v$0, _p$.t));
@@ -1331,14 +1335,13 @@ function AutomationsView(props) {
                 _$insertNode(_el$44, _$createTextNode(`INBOX`));
                 _$insert(_el$41, _$createComponent(Index, {
                   get each() {
-                    return visible(inbox(), evIndex());
+                    return inbox().slice(evStart(), evStart() + fits());
                   },
-                  children: (e, at) => {
-                    const i = at + windowStart(inbox().length, evIndex());
+                  children: (e, slot) => {
                     const look = () => fateLook(fate(e()));
                     return _$createComponent(Row, {
                       get selected() {
-                        return i === evIndex();
+                        return slot + evStart() === evIndex();
                       },
                       get dot() {
                         return look().dot;
@@ -1482,6 +1485,7 @@ function AutomationsView(props) {
                                 _$insert(_el$109, () => jobName(d.job), _el$112);
                                 _$insertNode(_el$112, _el$113);
                                 _$insert(_el$112, () => d.status, null);
+                                _$insert(_el$112, () => d.status === "waiting" && state.jobs().find(j => j.id === d.job)?.paused ? " · paused, so it runs once resumed" : "", null);
                                 _$effect(_p$ => {
                                   var _v$39 = L().text,
                                     _v$40 = {
@@ -1587,14 +1591,13 @@ function AutomationsView(props) {
                 _$insertNode(_el$50, _$createTextNode(`OUTBOX`));
                 _$insert(_el$47, _$createComponent(Index, {
                   get each() {
-                    return visible(outbox(), msgIndex());
+                    return outbox().slice(msgStart(), msgStart() + fits());
                   },
-                  children: (m, at) => {
-                    const i = at + windowStart(outbox().length, msgIndex());
+                  children: (m, slot) => {
                     const look = () => sendLook(sendState(m()));
                     return _$createComponent(Row, {
                       get selected() {
-                        return i === msgIndex();
+                        return slot + msgStart() === msgIndex();
                       },
                       get dot() {
                         return look().dot;

@@ -43,10 +43,10 @@ function look(ctx: Context, surface?: "dialog") {
 type Tab = "jobs" | "channels" | "inbox" | "outbox"
 /** The keys that switch tabs; pressing the open tab's key goes back to the automations. */
 const tabKeys: Record<Exclude<Tab, "jobs">, string> = { channels: "c", inbox: "i", outbox: "o" }
-const tabHints = (tab: Tab): [string, string][] =>
-  tab === "jobs"
-    ? [["c", "channels"], ["i", "inbox"], ["o", "outbox"]]
-    : [[tabKeys[tab], "automations"], ...(Object.entries(tabKeys) as [Exclude<Tab, "jobs">, string][]).filter(([t]) => t !== tab).map(([t, k]): [string, string] => [k, t])]
+const tabHints = (tab: Tab): [string, string][] => [
+  ...(tab === "jobs" ? [] : [[tabKeys[tab], "automations"] as [string, string]]),
+  ...Object.entries(tabKeys).filter(([t]) => t !== tab).map(([t, k]): [string, string] => [k, t]),
+]
 const keyHints: [string, string][] = [
   ["↑↓", "select"],
   ["space", "pause"],
@@ -166,13 +166,13 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
   const selected = createMemo(() => sorted()[index()])
   const jobRuns = createMemo(() => state.runs().filter((r) => r.jobID === selected()?.id).slice(0, 8))
   const jobSent = createMemo(() => state.sent().get(selected()?.id ?? "") ?? [])
-  // Only the selected job's notes are read, again on each refresh.
-  const jobNotes = createMemo(() => {
+  // Only the selected job's notes are read, again on each refresh. A read that fails keeps what is shown, as refresh() does.
+  const jobNotes = createMemo<ReturnType<Store["notes"]>>((shown) => {
     state.refreshed()
     const id = selected()?.id
     if (!id) return []
-    try { return state.store.notes(id) } catch { return [] }
-  })
+    try { return state.store.notes(id) } catch { return shown }
+  }, [])
 
   // ---- channels tab ----
   const onChannels = () => state.tab() === "channels"
@@ -199,24 +199,20 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
   const jobName = (id?: string) => (id ? (state.jobs().find((j) => j.id === id)?.name ?? id) : "chat")
 
   // ---- inbox and outbox tabs: read only while open ----
-  const inbox = createMemo(() => {
+  const inbox = createMemo<InboxEntry[]>((shown) => {
     state.refreshed()
     if (state.tab() !== "inbox") return []
-    try { return state.store.inbox(LIST_LIMIT) } catch { return [] }
-  })
+    try { return state.store.inbox(LIST_LIMIT) } catch { return shown }
+  }, [])
   const evIndex = createMemo(() => Math.max(0, inbox().findIndex((e) => e.seq === state.selectedEvent())))
   const evSelected = createMemo(() => inbox()[evIndex()])
-  const outbox = createMemo(() => {
+  const outbox = createMemo<SentMessage[]>((shown) => {
     state.refreshed()
     if (state.tab() !== "outbox") return []
-    try { return state.store.sent(undefined, LIST_LIMIT) } catch { return [] }
-  })
+    try { return state.store.sent(undefined, LIST_LIMIT) } catch { return shown }
+  }, [])
   const msgIndex = createMemo(() => Math.max(0, outbox().findIndex((m) => m.id === state.selectedMessage())))
   const msgSelected = createMemo(() => outbox()[msgIndex()])
-  // Long lists show the rows around the cursor that fit: the panel less its header, the list's title and the hints.
-  const fits = () => Math.max(5, (panel()?.height ?? 30) - 10)
-  const windowStart = (length: number, i: number) => Math.max(0, Math.min(length - fits(), i - Math.floor(fits() / 2)))
-  const visible = <T,>(list: T[], i: number) => list.slice(windowStart(list.length, i), windowStart(list.length, i) + fits())
 
   /** Toast an error message; also takes the promise act() returns, and resolves once it has settled. */
   const toastErr = async (msg?: string | Promise<string | undefined>) => {
@@ -453,6 +449,8 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
       failed: { fg: L().bad, dot: "✗" },
       none: { fg: L().muted, dot: "○" },
     })[st]
+  const inboxWaiting = createMemo(() => inbox().filter((e) => fate(e) === "waiting").length)
+  const outboxFailed = createMemo(() => outbox().filter((m) => sendState(m) === "failed").length)
   const statusColor = (s?: RunStatus) =>
     s === "succeeded" ? L().ok : s === "running" ? L().warn : s === "skipped" || !s ? L().muted : L().bad
   const badge = (j: Job) => {
@@ -481,6 +479,12 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
     return { left: Math.floor((o.w - width) / 2) - o.x, top: Math.floor((o.h - height) / 2) - o.y, width, height }
   })
   const activeCount = createMemo(() => state.jobs().filter(isActive).length)
+  // Long lists show the rows around the cursor that fit: the panel less its header, the list's title and the hints.
+  // Rows are slots (<Index>): a slot's position in the list is its slot number plus the window's start, read reactively.
+  const fits = createMemo(() => Math.max(5, (panel()?.height ?? 30) - 10))
+  const windowStart = (length: number, i: number) => Math.max(0, Math.min(length - fits(), i - Math.floor(fits() / 2)))
+  const evStart = createMemo(() => windowStart(inbox().length, evIndex()))
+  const msgStart = createMemo(() => windowStart(outbox().length, msgIndex()))
 
   const Heading = (p: { title: string; hue: number }) => (
     <text fg={L().ink(p.hue)}>
@@ -561,14 +565,14 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
                 <Match when={state.tab() === "inbox"}>
                   <text fg={L().muted}>
                     {inbox().length >= LIST_LIMIT ? `latest ${LIST_LIMIT}` : plural(inbox().length, "event")} ·{" "}
-                    <span style={{ fg: L().warn }}>{inbox().filter((e) => e.deliveries.some((d) => d.status === "waiting")).length} waiting</span>
+                    <span style={{ fg: L().warn }}>{inboxWaiting()} waiting</span>
                   </text>
                 </Match>
                 <Match when={state.tab() === "outbox"}>
                   <text fg={L().muted}>
                     {outbox().length >= LIST_LIMIT ? `latest ${LIST_LIMIT}` : plural(outbox().length, "message")} ·{" "}
-                    <span style={{ fg: outbox().some((m) => sendState(m) === "failed") ? L().bad : L().muted }}>
-                      {outbox().filter((m) => sendState(m) === "failed").length} failed
+                    <span style={{ fg: outboxFailed() ? L().bad : L().muted }}>
+                      {outboxFailed()} failed
                     </span>
                   </text>
                 </Match>
@@ -712,11 +716,10 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
                         <b>INBOX</b>
                       </text>
                     </box>
-                    <Index each={visible(inbox(), evIndex())}>
-                      {(e, at) => {
-                        const i = at + windowStart(inbox().length, evIndex())
+                    <Index each={inbox().slice(evStart(), evStart() + fits())}>
+                      {(e, slot) => {
                         const look = () => fateLook(fate(e()))
-                        return <Row selected={i === evIndex()} dot={look().dot} dotFg={look().fg} name={e().title} when={relative(e().at, state.now())} />
+                        return <Row selected={slot + evStart() === evIndex()} dot={look().dot} dotFg={look().fg} name={e().title} when={relative(e().at, state.now())} />
                       }}
                     </Index>
                   </box>
@@ -754,7 +757,11 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
                                   {(d) => (
                                     <text fg={L().text}>
                                       <span style={{ fg: fateLook(d.status).fg }}>{fateLook(d.status).dot}</span> {jobName(d.job)}
-                                      <span style={{ fg: L().muted }}>{"  "}{d.status}</span>
+                                      <span style={{ fg: L().muted }}>
+                                        {"  "}
+                                        {d.status}
+                                        {d.status === "waiting" && state.jobs().find((j) => j.id === d.job)?.paused ? " · paused, so it runs once resumed" : ""}
+                                      </span>
                                     </text>
                                   )}
                                 </For>
@@ -786,11 +793,10 @@ function AutomationsView(props: { ctx: Context; state: State; reopen: () => void
                         <b>OUTBOX</b>
                       </text>
                     </box>
-                    <Index each={visible(outbox(), msgIndex())}>
-                      {(m, at) => {
-                        const i = at + windowStart(outbox().length, msgIndex())
+                    <Index each={outbox().slice(msgStart(), msgStart() + fits())}>
+                      {(m, slot) => {
                         const look = () => sendLook(sendState(m()))
-                        return <Row selected={i === msgIndex()} dot={look().dot} dotFg={look().fg} name={m().title} when={relative(m().at, state.now())} />
+                        return <Row selected={slot + msgStart() === msgIndex()} dot={look().dot} dotFg={look().fg} name={m().title} when={relative(m().at, state.now())} />
                       }}
                     </Index>
                   </box>

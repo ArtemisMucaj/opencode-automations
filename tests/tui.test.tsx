@@ -234,6 +234,39 @@ test("TUI channels tab shows status, mapping and listeners, and queues a poll", 
   }
 })
 
+test("the inbox list scrolls with the cursor and highlights the selected event", async () => {
+  const dataDir = mkdtempSync(join(tmpdir(), "automations-tui-"))
+  const store = new Store(dataDir)
+  const n = (i: number) => String(i).padStart(2, "0")
+  store.ingest("dd", Array.from({ length: 40 }, (_, i) => ({ channel: "dd", id: n(i + 1), title: `event ${n(i + 1)}` })), Date.now())
+  const testRenderer = await createTestRenderer({ width: 140, height: 50 })
+  const host = fakeHost(dataDir, testRenderer.renderer)
+  let stop: Awaited<ReturnType<typeof plugin.setup>> | undefined
+  try {
+    stop = await plugin.setup(host.ctx)
+    await host.command((command) => command.id === "automations.open").run()
+    await render(() => <box width={140} height={50}>{host.dialog!()}</box>, testRenderer.renderer)
+    await host.command((command) => command.bind === "i").run()
+    // Drawn before moving, so the rows exist before the list scrolls under them.
+    await testRenderer.renderOnce()
+    await testRenderer.renderOnce()
+    // Newest first: 25 rows down is event 15, past the rows that fit at first.
+    for (let i = 0; i < 25; i++) await host.command((command) => command.title === "down").run()
+    await testRenderer.renderOnce()
+    await testRenderer.renderOnce()
+    const highlighted = testRenderer.captureSpans().lines
+      .filter((line) => line.spans.some((s) => s.text.includes("event ") && Math.round(s.bg.r * 255) === 0x33))
+      .map((line) => line.spans.map((s) => s.text).join(""))
+    expect(highlighted).toHaveLength(1)
+    expect(highlighted[0]).toContain("event 15")
+    expect(testRenderer.captureCharFrame()).not.toContain("event 40")
+  } finally {
+    if (typeof stop === "function") stop()
+    await testRenderer.dispose()
+    rmSync(dataDir, { recursive: true, force: true })
+  }
+})
+
 test("a run left running by a crash stops counting as running once its timeout has passed", () => {
   const jobs: Job[] = [{
     id: "a", name: "A", prompt: "p", schedule: { kind: "every", ms: 60_000 }, directory: "/project", session: "new",

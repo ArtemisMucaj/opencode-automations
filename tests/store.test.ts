@@ -152,6 +152,11 @@ test("the inbox lists every channel's events, newest first, with each automation
   for (let n = 0; n < MAX_START_ATTEMPTS; n++) { store.giveBack("a", [one.seq], true); store.take("a", [one.seq]) }
   expect(store.inbox()[2].deliveries[0]).toEqual({ job: "a", status: "dropped" })
   expect(store.inbox(1)).toHaveLength(1)
+  // A retry left by a job that has since left the channel isn't waiting: it would never be taken.
+  store.giveBack("b", [...store.take("b", [two.seq])], false)
+  expect(store.inbox()[1].deliveries).toContainEqual({ job: "b", status: "waiting" })
+  subscribe(store, [job("a", ["dd"])])
+  expect(store.inbox()[1].deliveries).toEqual([{ job: "a", status: "waiting" }])
 })
 
 test("detaching a channel drops the sticky sessions and memory of its keys", () => {

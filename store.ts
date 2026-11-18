@@ -294,15 +294,7 @@ export class Store {
       "WHERE s.job = ? AND (i.seq > s.since_seq OR i.seen_at >= s.since_poll) AND (d.status IS NULL OR d.status = 'retry') " +
       "ORDER BY i.seq LIMIT ?",
       jobID, limit,
-    ).map((r) => ({
-      seq: r.seq as number,
-      channel: r.channel as string,
-      id: r.id as string,
-      ...(r.key !== null ? { sessionKey: r.key as string } : {}),
-      title: r.title as string,
-      ...(r.body !== null ? { body: r.body as string } : {}),
-      ...(r.url !== null ? { url: r.url as string } : {}),
-    }))
+    ).map(inboxEvent)
   }
 
   /** Waiting events per automation and channel. */
@@ -323,8 +315,13 @@ export class Store {
   /**
    * The latest events of every channel, newest first, each with what became of it per automation: still
    * waiting for it (or for a retry), taken by a run, or dropped after failed starts.
+   * Read in one deferred transaction, so the three reads see one snapshot without taking the write lock.
    */
   inbox(limit = 100): InboxEntry[] {
+    return this.db.transaction(() => this.readInbox(limit)).deferred()
+  }
+
+  private readInbox(limit: number): InboxEntry[] {
     const rows = this.all<Row>("SELECT seq, channel, id, key, title, body, url, at, seen_at FROM inbox ORDER BY seq DESC LIMIT ?", limit)
     if (!rows.length) return []
     const seqs = JSON.stringify(rows.map((r) => r.seq))
@@ -334,24 +331,19 @@ export class Store {
       m.set(job, status)
       fates.set(seq, m)
     }
-    // Waiting: the job is subscribed from before it, and hasn't taken it yet.
+    // Waiting: the job is subscribed from before it, and hasn't taken it yet (or is to retry it, which also
+    // needs the subscription: a retry left by a job that has since left the channel is never taken).
     for (const r of this.all<{ seq: number; job: string }>(
       "SELECT i.seq, s.job FROM inbox i JOIN subscriptions s ON s.channel = i.channel " +
       "WHERE i.seq IN (SELECT value FROM json_each(?)) AND (i.seq > s.since_seq OR i.seen_at >= s.since_poll)", seqs)) {
       set(r.seq, r.job, "waiting")
     }
-    for (const r of this.all<{ seq: number; job: string; status: string }>(
-      "SELECT seq, job, status FROM deliveries WHERE seq IN (SELECT value FROM json_each(?))", seqs)) {
-      set(r.seq, r.job, r.status === "retry" ? "waiting" : (r.status as DeliveryStatus))
+    for (const r of this.all<{ seq: number; job: string; status: "taken" | "dropped" }>(
+      "SELECT seq, job, status FROM deliveries WHERE seq IN (SELECT value FROM json_each(?)) AND status != 'retry'", seqs)) {
+      set(r.seq, r.job, r.status)
     }
     return rows.map((r) => ({
-      seq: r.seq as number,
-      channel: r.channel as string,
-      id: r.id as string,
-      ...(r.key !== null ? { sessionKey: r.key as string } : {}),
-      title: r.title as string,
-      ...(r.body !== null ? { body: r.body as string } : {}),
-      ...(r.url !== null ? { url: r.url as string } : {}),
+      ...inboxEvent(r),
       at: r.at as number,
       seenAt: r.seen_at as number,
       deliveries: [...(fates.get(r.seq as number) ?? [])].map(([job, status]) => ({ job, status })).sort((a, b) => a.job.localeCompare(b.job)),
@@ -493,6 +485,18 @@ export class Store {
 
   release(): void {
     try { this.run("DELETE FROM lease WHERE name = 'leader' AND holder = ?", this.holder) } catch {}
+  }
+}
+
+function inboxEvent(r: Row): InboxEvent {
+  return {
+    seq: r.seq as number,
+    channel: r.channel as string,
+    id: r.id as string,
+    ...(r.key !== null ? { sessionKey: r.key as string } : {}),
+    title: r.title as string,
+    ...(r.body !== null ? { body: r.body as string } : {}),
+    ...(r.url !== null ? { url: r.url as string } : {}),
   }
 }
 
