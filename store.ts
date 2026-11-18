@@ -311,37 +311,34 @@ export class Store {
     return out
   }
 
-  /** Deferred, not tx(): one snapshot for the three reads, without taking the write lock. */
+  /** Deferred, not tx(): one snapshot for the reads, without taking the write lock. */
   inbox(limit = 100): InboxEntry[] {
-    return this.db.transaction(() => this.readInbox(limit)).deferred()
-  }
-
-  private readInbox(limit: number): InboxEntry[] {
-    const rows = this.all<Row>("SELECT seq, channel, id, key, title, body, url, at, seen_at FROM inbox ORDER BY seq DESC LIMIT ?", limit)
-    if (!rows.length) return []
-    const seqs = JSON.stringify(rows.map((r) => r.seq))
-    const fates = new Map<number, Map<string, DeliveryStatus>>()
-    const set = (seq: number, job: string, status: DeliveryStatus) => {
-      const m = fates.get(seq) ?? new Map<string, DeliveryStatus>()
-      m.set(job, status)
-      fates.set(seq, m)
-    }
-    // Retries are left out of the deliveries below: without the subscription, a retry is never taken.
-    for (const r of this.all<{ seq: number; job: string }>(
-      "SELECT i.seq, s.job FROM inbox i JOIN subscriptions s ON s.channel = i.channel " +
-      "WHERE i.seq IN (SELECT value FROM json_each(?)) AND (i.seq > s.since_seq OR i.seen_at >= s.since_poll)", seqs)) {
-      set(r.seq, r.job, "waiting")
-    }
-    for (const r of this.all<{ seq: number; job: string; status: "taken" | "dropped" }>(
-      "SELECT seq, job, status FROM deliveries WHERE seq IN (SELECT value FROM json_each(?)) AND status != 'retry'", seqs)) {
-      set(r.seq, r.job, r.status)
-    }
-    return rows.map((r) => ({
-      ...inboxEvent(r),
-      at: r.at as number,
-      seenAt: r.seen_at as number,
-      deliveries: [...(fates.get(r.seq as number) ?? [])].map(([job, status]) => ({ job, status })).sort((a, b) => a.job.localeCompare(b.job)),
-    }))
+    return this.db.transaction(() => {
+      const rows = this.all<Row>("SELECT seq, channel, id, key, title, body, url, at, seen_at FROM inbox ORDER BY seq DESC LIMIT ?", limit)
+      if (!rows.length) return []
+      const subs = this.all<{ job: string; channel: string; since_seq: number; since_poll: number | null }>(
+        "SELECT job, channel, since_seq, since_poll FROM subscriptions")
+      // Retries are left out: they wait again only while subscribed, which subs already says.
+      const done = Map.groupBy(
+        this.all<{ seq: number; job: string; status: "taken" | "dropped" }>(
+          "SELECT seq, job, status FROM deliveries WHERE seq >= ? AND status != 'retry'", rows.at(-1)!.seq),
+        (d) => d.seq)
+      return rows.map((r) => {
+        const seq = r.seq as number
+        const seen = r.seen_at as number
+        const statuses = new Map<string, DeliveryStatus>()
+        for (const s of subs) {
+          if (s.channel === r.channel && (seq > s.since_seq || (s.since_poll !== null && seen >= s.since_poll))) statuses.set(s.job, "waiting")
+        }
+        for (const d of done.get(seq) ?? []) statuses.set(d.job, d.status)
+        return {
+          ...inboxEvent(r),
+          at: r.at as number,
+          seenAt: seen,
+          deliveries: [...statuses].map(([job, status]) => ({ job, status })).sort((a, b) => a.job.localeCompare(b.job)),
+        }
+      })
+    }).deferred()
   }
 
   /** Mark events as taken; returns the ones that were still free. */
