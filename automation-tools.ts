@@ -80,7 +80,7 @@ export function automationTools(tools: ToolEditor, rt: Runtime) {
       "Hand the result of this run to the next run of this automation; it replaces the previous memory. " +
       "The next run may see only this, not this conversation. Write the current " +
       "state, what changed, open items, what the user was already told, useful IDs and links. " +
-      "The user reads it too: plain words, one item per line, grouped under short labels, no shorthand. " +
+      "The user reads it too. Use plain words and no shorthand, one item per line, grouped under short labels. " +
       `At most ${MAX_NOTE} characters. Call it before your final reply.`,
     input: {
       type: "object",
