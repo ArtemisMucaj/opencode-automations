@@ -17,7 +17,7 @@ import { checkTimeout, DEFAULT_TIMEOUT_MINUTES, defaultDataDir, find, isActive, 
 import { compose, Outbox } from "./outbox.ts"
 import { Store, type InboxEvent, type Job, type Run } from "./store.ts"
 import type { Options, PollResult, Reason, Running, Runtime } from "./types.ts"
-import { errorMessage, Owned, within } from "./util.ts"
+import { errorMessage, failureText, Owned, within } from "./util.ts"
 
 const MISSED_GRACE_MS = 2 * 60_000
 const CHANNEL_FAILURE_NOTICE = 3
@@ -579,7 +579,7 @@ export default Plugin.define({
                 running.get(sid)!.lastText = ev.data.text
                 break
               case "session.execution.failed":
-                finish(sid, "failed", JSON.stringify(ev.data.error))
+                finish(sid, "failed", failureText(ev.data.error))
                 break
               case "session.execution.interrupted": // by the user: a timeout finishes the run first
                 finish(sid, "failed", "interrupted")

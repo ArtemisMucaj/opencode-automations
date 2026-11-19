@@ -170,3 +170,13 @@ test("a schedule typed in the TUI goes through the same checks as one from chat"
   expect(() => parseScheduleText("2020-01-01T09:00:00Z")).toThrow("in the past")
   expect(() => parseScheduleText("tomorrow")).toThrow("use cron")
 })
+
+test("failureText says why a run failed in words, not JSON", async () => {
+  const { failureText } = await import("../util.ts")
+  const quota = { type: "provider.quota", message: "You have exceeded your monthly quota", status: 402, response: { body: "{\"error\":{}}" }, retryAfterMs: 10 }
+  expect(failureText(quota)).toBe("Model quota used up: You have exceeded your monthly quota (HTTP 402).")
+  expect(failureText({ type: "provider.auth", message: "Invalid API key.", status: 401 })).toBe("Model provider error: Invalid API key (HTTP 401).")
+  expect(failureText({ type: "tool.crash", message: "boom" })).toBe("boom.")
+  expect(failureText("model overloaded")).toBe("model overloaded")
+  expect(failureText({ code: 7 })).toBe('{"code":7}')
+})
