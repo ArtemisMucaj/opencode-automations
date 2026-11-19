@@ -33,8 +33,8 @@ export function failureText(error: unknown): string {
   const { type, message, status } = error as { type?: unknown; message?: unknown; status?: unknown }
   if (typeof message !== "string" || !message.trim()) return JSON.stringify(error).slice(0, 500)
   const said = `${message.trim().replace(/\.$/, "")}${typeof status === "number" ? ` (HTTP ${status})` : ""}.`
-  if (type === "provider.quota") return `The model provider's quota is used up: ${said} Runs fail until it resets or the automation uses another model.`
-  if (typeof type === "string" && type.startsWith("provider.")) return `The model provider refused the request: ${said}`
+  if (type === "provider.quota") return `Model quota used up: ${said}`
+  if (typeof type === "string" && type.startsWith("provider.")) return `Model provider error: ${said}`
   return said
 }
 

@@ -311,7 +311,7 @@ test("a run that fails on the provider's quota is reported in words", async () =
     for (let i = 0; i < 50 && fetch.mock.calls.length < 1; i++) await flush()
     expect(bodies(fetch)[0]).toMatchObject({
       title: "Morning failed",
-      message: "The model provider's quota is used up: You have exceeded your monthly quota (HTTP 402). Runs fail until it resets or the automation uses another model.",
+      message: "Model quota used up: You have exceeded your monthly quota (HTTP 402).",
     })
     expect(app.store.history()[0].error).not.toContain("{")
   } finally { fetch.mockRestore() }
