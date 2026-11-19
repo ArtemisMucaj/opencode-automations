@@ -79,8 +79,11 @@ export const MEMORY_GUIDE =
   `conversation. Build on what the previous runs found: don't redo their work, and don't tell the user again what ` +
   `they were already told. End every run with ${UPDATE_CALL}, before your final reply, with the result of this run ` +
   `for the next one: the current state, what changed, open items and what to watch for, what you told the user, and ` +
-  `anything learned that saves work (IDs, links, commands). Facts, not a story of the run. It replaces the previous ` +
-  `memory, so carry over what still matters from it. At most ${MAX_NOTE} characters.`
+  `anything learned that saves work (IDs, links, commands). Facts, not a story of the run. ` +
+  `The user reads it too, so write it for a person, whatever style your other replies use: plain words and short ` +
+  `sentences, no shorthand or dropped words; one item per line, grouped under short labels (e.g. "Waiting for my review:"), ` +
+  `a blank line between groups. It replaces the previous memory, so carry over what still matters from it. ` +
+  `At most ${MAX_NOTE} characters: to fit, drop what no longer matters rather than compressing the wording.`
 export const MEMORY_GUIDE_SHORT =
   `You haven't called ${UPDATE_CALL}, so the next run won't know the result of this one: it may not see ` +
   `this conversation. Call ${UPDATE_CALL} now with this run's result and what the next run needs to pick up from here.`
