@@ -31,7 +31,8 @@ export const AUTOMATIONS_GUIDE =
   "\"sticky\" carries context across runs (with channels that set event.sessionKey: per key): it continues its session " +
   "while the model's prompt cache is warm, and otherwise compacts it to the run's memory, so old history isn't re-read " +
   "at full price. \"current\" is this chat. Every automation keeps a memory: each run hands the next a note through " +
-  "automation_memory_update.\n" +
+  "automation_memory_update. The prompt can say what the memory should hold; runs are already told how to write it, " +
+  "so don't ask for a compact or terse one.\n" +
   "Channels write their events to a shared inbox; an automation takes the ones from its channels. " +
   "With no schedule it runs as events arrive (up to maxEvents, default 10, per run); with a " +
   "schedule it is a digest of everything since the last run (default 50). When it is attached to a channel, it gets " +
@@ -80,7 +81,8 @@ export const MEMORY_GUIDE =
   `they were already told. End every run with ${UPDATE_CALL}, before your final reply, with the result of this run ` +
   `for the next one: the current state, what changed, open items and what to watch for, what you told the user, and ` +
   `anything learned that saves work (IDs, links, commands). Facts, not a story of the run. ` +
-  `The user reads it too, so write it for a person, whatever style your other replies use: plain words and short ` +
+  `The user reads it too, so write it for a person, whatever style your other replies use and however the prompt ` +
+  `says to write it (a prompt asking for a compact or short memory means leaving out what doesn't matter): plain words and short ` +
   `sentences, no shorthand or dropped words; one item per line, grouped under short labels (e.g. "Waiting for my review:"), ` +
   `a blank line between groups. It replaces the previous memory, so carry over what still matters from it. ` +
   `At most ${MAX_NOTE} characters: to fit, drop what no longer matters rather than compressing the wording.`
