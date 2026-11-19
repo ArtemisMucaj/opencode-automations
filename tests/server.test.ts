@@ -146,7 +146,7 @@ async function start(options: Record<string, unknown> = {}, jobs: Job[] = [], se
 const pushover = { destinations: [{ id: "phone", type: "Notification.PushOver", options: { token: "test-token", user: "test-user" } }] }
 /** Save the run's memory, as a run is told to before it ends (else it is asked once more). */
 const remember = (app: { call: (name: string, input: unknown, sessionID: string) => Promise<{ content: string }> }, sessionID: string, note = "noted") =>
-  app.call("automation_memory_update", { note }, sessionID)
+  app.call("automation_memory_update", { memory: note }, sessionID)
 
 /** Tests about something else than notifying pass `notify: false`, or a run that ends is asked whether to notify. */
 function job(overrides: Partial<Job> = {}): Job {
@@ -324,7 +324,7 @@ test("a run that ends silently without saying why is asked once whether to notif
   await flush()
   expect(app.prompts).toHaveLength(2)
   expect(app.prompts[1]).toMatchObject({ sessionID: "session-1", delivery: "queue" })
-  expect(app.prompts[1].text).toContain("automation_notify")
+  expect(app.prompts[1].text).toContain("tools.automation.notify({ title, message })")
   expect(app.prompts[1].metadata.automation).toMatchObject({ jobID: "morning", reason: "check" })
   expect(app.store.history()[0].status).toBe("running")
   // A legacy idle after the V2 event doesn't end the check turn early.
@@ -698,7 +698,7 @@ test("a run's tools and guidance work through another instance of the plugin in 
     other.hooks.get("context")!(c)
     expect(Object.keys(c.tools)).toEqual(["automation_notify", "automation_memory_update"])
     const system = c.system.map((p) => p.text)
-    expect(system.join("\n")).toContain("End every run with automation_memory_update")
+    expect(system.join("\n")).toContain("End every run with tools.automation.memory_update({ memory })")
     expect(new Set(system).size).toBe(system.length)
 
     expect((await other.call("automation_notify", { title: "Brief", message: "MR !12 blocked" }, "session-1")).content).toContain("Outbox message queued")
@@ -730,9 +730,9 @@ test("a sticky session is continued while warm, and compacted to its memory once
   // Runs are offered the memory tool and told to use it; it saves a note for the job.
   const ctx = app.context("session-1")
   expect(ctx.tools).toContain("automation_memory_update")
-  expect(ctx.system).toContain("End every run with automation_memory_update")
+  expect(ctx.system).toContain("End every run with tools.automation.memory_update({ memory })")
   expect(ctx.tools).not.toContain("automation_memory_recall")
-  expect((await app.call("automation_memory_update", { note: "MR !12 reported. Watching !13." }, "session-1")).content).toContain("Saved")
+  expect((await app.call("automation_memory_update", { memory: "MR !12 reported. Watching !13." }, "session-1")).content).toContain("Saved")
   await end(app, "session-1")
   expect(app.prompts).toHaveLength(1) // it saved a note: no follow-up
   expect(app.store.history()[0].status).toBe("succeeded")
@@ -740,7 +740,7 @@ test("a sticky session is continued while warm, and compacted to its memory once
   // Right after: the cache is warm, so the same session goes on, without the note.
   await app.call("automation_run", { id: "morning" })
   expect(app.prompts[1]).toMatchObject({ sessionID: "session-1", text: "Check things" })
-  await app.call("automation_memory_update", { note: "MR !12, !13 reported." }, "session-1")
+  await app.call("automation_memory_update", { memory: "MR !12, !13 reported." }, "session-1")
   await end(app, "session-1")
 
   // Cold: the same session, compacted first with the latest memory as its summary (no model call).
@@ -751,6 +751,18 @@ test("a sticky session is continued while warm, and compacted to its memory once
   expect(run).toMatchObject({ sessionID: "session-1", text: "Check things" })
   expect(app.sessions).toHaveLength(1)
   expect(app.store.session("morning")?.id).toBe("session-1")
+})
+
+test("automation_memory_update takes the memory as memory, or as note (its older name)", async () => {
+  const app = await start({}, [job({ notify: false })])
+  await app.call("automation_run", { id: "morning" })
+  expect((await app.call("automation_memory_update", { memory: "MR !12 reported." }, "session-1")).content).toContain("Saved")
+  expect(app.store.note("morning")).toBe("MR !12 reported.")
+  expect((await app.call("automation_memory_update", { note: "MR !13 reported." }, "session-1")).content).toContain("Saved")
+  expect(app.store.note("morning")).toBe("MR !13 reported.")
+  expect((await app.call("automation_memory_update", {}, "session-1")).content).toContain("memory_update({ memory")
+  expect((await app.call("automation_memory_update", { mem: "x" }, "session-1")).content).toContain("input.mem is not a field")
+  expect(app.store.note("morning")).toBe("MR !13 reported.")
 })
 
 test("the compaction's end, even delivered after it returns, doesn't end the run or check it before its turn", async () => {
@@ -813,8 +825,8 @@ test("a sticky run that saves no note is asked once, with the notify check in th
   app.events.emit("event", { type: "session.text.ended", data: { sessionID: "session-1", text: "MR !12 is blocked." } })
   await end(app, "session-1")
   expect(app.prompts).toHaveLength(2)
-  expect(app.prompts[1].text).toContain("automation_notify")
-  expect(app.prompts[1].text).toContain("automation_memory_update")
+  expect(app.prompts[1].text).toContain("tools.automation.notify({ title, message })")
+  expect(app.prompts[1].text).toContain("tools.automation.memory_update({ memory })")
   await end(app, "session-1")
   expect(app.prompts).toHaveLength(2)
   expect(app.store.history()[0]).toMatchObject({ status: "succeeded" })
@@ -905,7 +917,7 @@ test("every automation that runs again keeps a memory; empty or long notes are r
   await app.call("automation_run", { id: "morning" })
   await app.call("automation_run", { id: "once" })
   expect(app.context("session-1").tools).toContain("automation_memory_update")
-  expect(app.context("session-1").system).toContain("End every run with automation_memory_update")
+  expect(app.context("session-1").system).toContain("End every run with tools.automation.memory_update({ memory })")
   // A one-shot has no next run: no memory, and no reminder.
   expect(app.context("session-2").tools).not.toContain("automation_memory_update")
   expect(app.context("caller").tools).not.toContain("automation_memory_update")
