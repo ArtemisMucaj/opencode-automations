@@ -8,6 +8,10 @@ const NOTHING_TO_NOTIFY = "Nothing worth notifying the user about in this run."
 export const saidNothing = (reply?: string) => !!reply && /nothing worth notifying the user about/i.test(reply)
 export const UPDATE_TOOL = "automation_memory_update"
 export const MAX_NOTE = 4000
+// How runs call them: code mode exposes the tools as tools.<namespace>.<name>, not by their registered names.
+// The arguments are spelled out because models guess them otherwise (memory_update({ memory }) is accepted too).
+const NOTIFY_CALL = "tools.automation.notify({ title, message })"
+const UPDATE_CALL = "tools.automation.memory_update({ memory })"
 
 /**
  * Every tool goes through opencode's code mode: they're grouped in these namespaces and exposed as
@@ -20,13 +24,15 @@ export const NAMESPACES = [
 ] as const
 
 export const AUTOMATIONS_GUIDE =
+  "Tools named here automation_x and channel_x are called in code mode as tools.automation.x(...) and tools.channel.x(...). " +
   "Automations run a prompt on a schedule (cron, every, or a one-shot at), or on events from channels. " +
   "automation_create/list/update/delete/run/history manage them. Write the prompt self-contained: runs start with no " +
   "conversation context unless session is \"current\". Sessions: \"new\" (default) is a fresh session per run, " +
   "\"sticky\" carries context across runs (with channels that set event.sessionKey: per key): it continues its session " +
   "while the model's prompt cache is warm, and otherwise compacts it to the run's memory, so old history isn't re-read " +
   "at full price. \"current\" is this chat. Every automation keeps a memory: each run hands the next a note through " +
-  "automation_memory_update.\n" +
+  "automation_memory_update. The prompt can say what the memory should hold. Runs are already told how to write it, " +
+  "so don't ask for a compact or terse one.\n" +
   "Channels write their events to a shared inbox; an automation takes the ones from its channels. " +
   "With no schedule it runs as events arrive (up to maxEvents, default 10, per run); with a " +
   "schedule it is a digest of everything since the last run (default 50). When it is attached to a channel, it gets " +
@@ -55,7 +61,7 @@ export const CHANNEL_GUIDE =
 
 export const RUN_GUIDE =
   `You are running unattended as an automation. Nobody is watching this session: ` +
-  `your final reply stays here and is not sent anywhere. To reach the user, call ${NOTIFY_TOOL} ` +
+  `your final reply stays here and is not sent anywhere. To reach the user, call ${NOTIFY_CALL} ` +
   `with what they need to know or act on, once you know it. If nothing is worth their attention, don't notify, ` +
   `and end your final reply with the line "${NOTHING_TO_NOTIFY}" ` +
   `Write it as a notification, not a chat reply: plain text, no markdown (no **, #, backticks, tables or [text](url)). ` +
@@ -64,24 +70,29 @@ export const RUN_GUIDE =
   `Send few notifications; group related items into one. ` +
   `Where it is delivered is set up by the user; you don't choose. Failures and timeouts are reported to the user automatically.`
 export const RUN_GUIDE_SHORT =
-  `This run is ending and you haven't called ${NOTIFY_TOOL}, so the user has heard nothing: ` +
+  `This run is ending and you haven't called ${NOTIFY_CALL}, so the user has heard nothing: ` +
   `your reply above is not sent anywhere. If it holds anything the user should know or act on, ` +
-  `send it now with ${NOTIFY_TOOL}. If there is really nothing, reply "${NOTHING_TO_NOTIFY}"`
+  `send it now with ${NOTIFY_CALL}. If there is really nothing, reply "${NOTHING_TO_NOTIFY}"`
 
 export const MEMORY_GUIDE =
-  `This automation carries its results from run to run through a memory: the note each run writes with ${UPDATE_TOOL}. ` +
+  `This automation carries its results from run to run through a memory: the note each run writes with ${UPDATE_CALL}. ` +
   `The next run gets it (at the top of its prompt, or as the summary of a sticky session), but maybe not this ` +
   `conversation. Build on what the previous runs found: don't redo their work, and don't tell the user again what ` +
-  `they were already told. End every run with ${UPDATE_TOOL}, before your final reply, with the result of this run ` +
+  `they were already told. End every run with ${UPDATE_CALL}, before your final reply, with the result of this run ` +
   `for the next one: the current state, what changed, open items and what to watch for, what you told the user, and ` +
-  `anything learned that saves work (IDs, links, commands). Facts, not a story of the run. It replaces the previous ` +
-  `memory, so carry over what still matters from it. At most ${MAX_NOTE} characters.`
+  `anything learned that saves work (IDs, links, commands). Facts, not a story of the run. ` +
+  `The user reads it too, so write it for a person. Do this whatever style your other replies use, and even if the ` +
+  `prompt asks for a compact or short memory. That means leaving out what doesn't matter, not shorthand. ` +
+  `Use plain words and short sentences, with no dropped words. Put one item per line, not a list joined by semicolons. ` +
+  `Group the lines under short labels, such as "Waiting for my review:", with a blank line between groups. ` +
+  `It replaces the previous memory, so carry over what still matters from it. At most ${MAX_NOTE} characters. ` +
+  `To fit, drop what no longer matters rather than compressing the wording.`
 export const MEMORY_GUIDE_SHORT =
-  `You haven't called ${UPDATE_TOOL}, so the next run won't know the result of this one: it may not see ` +
-  `this conversation. Call ${UPDATE_TOOL} now with this run's result and what the next run needs to pick up from here.`
+  `You haven't called ${UPDATE_CALL}, so the next run won't know the result of this one: it may not see ` +
+  `this conversation. Call ${UPDATE_CALL} now with this run's result and what the next run needs to pick up from here.`
 
 export const withMemory = (text: string, note: string | undefined) =>
-  note ? `Memory from the previous run of this automation (written by it with ${UPDATE_TOOL}):\n\n${note}\n\n---\n\n${text}` : text
+  note ? `Memory from the previous run of this automation (written by it with ${UPDATE_CALL}):\n\n${note}\n\n---\n\n${text}` : text
 
 // After the constant guides, so they stay one cached prefix. Only values fixed for the whole run.
 const SESSION_MODES: Record<SessionMode, string> = {

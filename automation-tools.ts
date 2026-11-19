@@ -80,18 +80,22 @@ export function automationTools(tools: ToolEditor, rt: Runtime) {
       "Hand the result of this run to the next run of this automation; it replaces the previous memory. " +
       "The next run may see only this, not this conversation. Write the current " +
       "state, what changed, open items, what the user was already told, useful IDs and links. " +
+      "The user reads it too. Use plain words and no shorthand, one item per line, grouped under short labels. " +
       `At most ${MAX_NOTE} characters. Call it before your final reply.`,
     input: {
       type: "object",
-      properties: { note: { type: "string", description: `The whole memory, at most ${MAX_NOTE} characters.` } },
-      required: ["note"],
+      // `note` was the field's first name: memories written then still tell runs to use it.
+      properties: {
+        memory: { type: "string", description: `The whole memory, at most ${MAX_NOTE} characters.` },
+        note: { type: "string", description: "Same as memory (older name)." },
+      },
       additionalProperties: false,
     },
     execute: async (input, tc) => {
       const f = rt.runOf(tc.sessionID)
       if (!f || !remembers(f.job)) return text("error: memory is only kept inside a run of an automation that runs again.")
-      const note = input.note.trim()
-      if (!note) return text("error: the note is empty.")
+      const note = (input.memory ?? input.note ?? "").trim()
+      if (!note) return text('error: the memory is empty. Pass it as memory_update({ memory: "…" }). Nothing was saved.')
       if (note.length > MAX_NOTE) {
         return text(`error: the note is ${note.length} characters; the limit is ${MAX_NOTE}. Keep what the next run needs. Nothing was saved.`)
       }
