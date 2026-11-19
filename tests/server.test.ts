@@ -297,7 +297,23 @@ test("failed runs notify automatically even after the agent notified", async () 
     await app.call("automation_notify", { title: "Started", message: "Looking" }, "session-1")
     app.events.emit("event", { type: "session.execution.failed", data: { sessionID: "session-1", error: "model overloaded" } })
     for (let i = 0; i < 50 && fetch.mock.calls.length < 2; i++) await flush()
-    expect(bodies(fetch)[1]).toMatchObject({ title: "Morning failed", message: '"model overloaded"', priority: 1 })
+    expect(bodies(fetch)[1]).toMatchObject({ title: "Morning failed", message: "model overloaded", priority: 1 })
+  } finally { fetch.mockRestore() }
+})
+
+test("a run that fails on the provider's quota is reported in words", async () => {
+  const fetch = spyOn(globalThis, "fetch").mockResolvedValue(new Response("ok"))
+  try {
+    const app = await start({ outbox: pushover }, [job()])
+    await app.call("automation_run", { id: "morning" })
+    const error = { type: "provider.quota", message: "You have exceeded your monthly quota", status: 402, response: { body: "{\"error\":{\"code\":\"quota_exceeded\"}}" } }
+    app.events.emit("event", { type: "session.execution.failed", data: { sessionID: "session-1", error } })
+    for (let i = 0; i < 50 && fetch.mock.calls.length < 1; i++) await flush()
+    expect(bodies(fetch)[0]).toMatchObject({
+      title: "Morning failed",
+      message: "The model provider's quota is used up: You have exceeded your monthly quota (HTTP 402). Runs fail until it resets or the automation uses another model.",
+    })
+    expect(app.store.history()[0].error).not.toContain("{")
   } finally { fetch.mockRestore() }
 })
 

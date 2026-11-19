@@ -23,6 +23,21 @@ export async function within(p: Promise<unknown>, ms: number, signal?: AbortSign
 
 export const errorMessage = (e: unknown) => String((e as Error)?.message ?? e)
 
+/**
+ * Why a run failed, as a sentence for the user. opencode reports it as { type, message, status, … }:
+ * the message is what reads, the rest is for logs.
+ */
+export function failureText(error: unknown): string {
+  if (typeof error === "string") return error
+  if (typeof error !== "object" || error === null) return JSON.stringify(error) ?? "unknown error"
+  const { type, message, status } = error as { type?: unknown; message?: unknown; status?: unknown }
+  if (typeof message !== "string" || !message.trim()) return JSON.stringify(error).slice(0, 500)
+  const said = `${message.trim().replace(/\.$/, "")}${typeof status === "number" ? ` (HTTP ${status})` : ""}.`
+  if (type === "provider.quota") return `The model provider's quota is used up: ${said} Runs fail until it resets or the automation uses another model.`
+  if (typeof type === "string" && type.startsWith("provider.")) return `The model provider refused the request: ${said}`
+  return said
+}
+
 export const fmt = (t?: number) => (t ? new Date(t).toLocaleString() : "—")
 export const clock = (t?: number) =>
   t ? new Date(t).toLocaleString(undefined, { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }) : "—"
