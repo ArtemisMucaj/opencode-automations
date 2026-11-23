@@ -3,7 +3,7 @@
 import { describe, nextRun } from "./cron.ts"
 import { CODE_MODE, MAX_NOTE } from "./guides.ts"
 import { checkTimeout, find, isActive, newJob, parseModel, remembers, runnable, toSchedule } from "./jobs.ts"
-import { longLine, MAX_LINE, MAX_MESSAGE, type Priority } from "./notify.ts"
+import { MAX_LINE, MAX_MESSAGE, type Priority, wrapLines } from "./notify.ts"
 import { tool } from "./schema.ts"
 import type { Runtime, ToolEditor } from "./types.ts"
 import { elapsed, errorMessage, fmt, leaderLine, orError, text } from "./util.ts"
@@ -26,7 +26,7 @@ export function automationTools(tools: ToolEditor, rt: Runtime) {
       '(e.g. "3 MRs need your review", not "Report"), then the details that support it, most important first: ' +
       "often only the first lines are shown. " +
       "Format it as a notification, not markdown: plain text, short lines, one item per line, a blank line " +
-      `between groups, links pasted directly as full URLs. Lines over ${MAX_LINE} characters (links aside) are refused. ` +
+      `between groups, links pasted directly as full URLs. Lines over ${MAX_LINE} characters (links aside) are broken up. ` +
       "No **bold**, headings, backticks, tables or [text](url) links. " +
       `Keep it short: ideally under 1000 characters, at most ${MAX_MESSAGE}. One notification per topic: send several only for ` +
       "separate findings that each deserve attention, not one per item.",
@@ -49,15 +49,8 @@ export function automationTools(tools: ToolEditor, rt: Runtime) {
       const f = rt.runOf(tc.sessionID)
       if (!f || !outbox.canNotify(f.job)) return text("error: notifications are only available inside an automation run that has them enabled.")
       const title = input.title.trim()
-      const message = input.message.trim()
+      const message = wrapLines(input.message.trim())
       if (!title || !message) return text("error: title and message are required.")
-      const long = longLine(message)
-      if (long) {
-        return text(
-          `error: a line is ${long.length} characters ("${long.slice(0, 60)}…"), too long to read on a phone. ` +
-          `Break it up: one item per line, at most ${MAX_LINE} characters each, a blank line between groups. Nothing was sent.`,
-        )
-      }
       if (message.length > MAX_MESSAGE) {
         return text(
           `error: message is ${message.length} characters; the limit is ${MAX_MESSAGE}. ` +
