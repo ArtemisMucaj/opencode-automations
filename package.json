@@ -18,7 +18,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@opencode/plugin": "2.2.1",
+    "@opencode/plugin": "2.4.0",
     "cron-parser": "5.10.2",
     "pino": "10.4.0"
   },
@@ -30,7 +30,7 @@
   "devDependencies": {
     "@babel/core": "7.29.7",
     "@babel/preset-typescript": "7.27.1",
-    "@opencode/theme": "2.2.1",
+    "@opencode/theme": "2.4.0",
     "@opentui/core": "0.7.0",
     "@opentui/solid": "0.7.0",
     "@types/bun": "1.4.4",
