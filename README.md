@@ -30,6 +30,8 @@ opencode plugin remove github:ArtemisMucaj/opencode-automations
 
 Removing the plugin keeps your automations and their history, in case you install it again.
 
+The plugin replaces opencode's built-in automations: the `automation` tools and the `/automation` command are this plugin's.
+
 ## Create your first automation
 
 Ask for it in chat, in any opencode session:
