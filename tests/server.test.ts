@@ -366,7 +366,7 @@ test("runs that can't notify are never asked", async () => {
   expect(app.store.history()[0].status).toBe("succeeded")
 })
 
-test("automation_notify rejects text too long", async () => {
+test("automation_notify rejects text too long and breaks up long lines", async () => {
   const fetch = spyOn(globalThis, "fetch").mockResolvedValue(new Response("ok"))
   try {
     const app = await start({ outbox: pushover }, [job()])
@@ -374,13 +374,12 @@ test("automation_notify rejects text too long", async () => {
     const long = await app.call("automation_notify", { title: "Dump", message: ("word ".repeat(30) + "\n").repeat(40) }, "session-1")
     expect(long.content).toContain("error: message is")
     const wall = await app.call("automation_notify", { title: "Brief", message: "This sentence goes on. ".repeat(10) + "https://x.test/" + "a".repeat(300) }, "session-1")
-    expect(wall.content).toContain("too long to read on a phone")
-    expect(fetch.mock.calls).toHaveLength(0)
-    // Long links alone don't make a line too long.
+    // A long line is sent, broken up, not refused: the agent shouldn't have to retry over formatting.
+    expect(wall.content).toContain("Outbox message queued")
     expect((await app.call("automation_notify", { title: "Link", message: "MR ready:\nhttps://x.test/" + "a".repeat(300) }, "session-1")).content).toContain("Outbox message queued")
     expect((await app.call("automation_notify", { title: "B", message: "two" }, "session-1")).content).toContain("Outbox message queued")
-    await sent(fetch, 2)
-    expect(fetch.mock.calls).toHaveLength(2)
+    await sent(fetch, 3)
+    expect(fetch.mock.calls).toHaveLength(3)
   } finally { fetch.mockRestore() }
 })
 

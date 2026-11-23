@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { log } from "../log.ts"
-import { deliver, format, longLine, MAX_PARTS, pushoverParts, split, MAX_LINE, PUSHOVER, type Deps, type Message, type Destination } from "../notify.ts"
+import { deliver, format, MAX_PARTS, pushoverParts, split, MAX_LINE, PUSHOVER, wrapLines, type Deps, type Message, type Destination } from "../notify.ts"
 import { compose, Outbox, parseDestinations, RETRY_MS } from "../outbox.ts"
 import { Store, type Job, type Run } from "../store.ts"
 
@@ -232,8 +232,18 @@ test("quotes in link URLs can't break the href", async () => {
   expect(format('[dash](https://x.test/?q="a")', "html")).toBe('<a href="https://x.test/?q=&quot;a&quot;">dash</a>')
 })
 
-test("longLine finds a wall of text but ignores links and short lines", () => {
-  expect(longLine("3 MRs need review\n\n!12 blocked\nhttps://x.test/" + "a".repeat(400))).toBeUndefined()
-  const wall = "word ".repeat(MAX_LINE / 4)
-  expect(longLine(`Fine\n${wall}`)).toBe(wall.trim())
+test("wrapLines breaks a wall of text at words but leaves links and short lines alone", () => {
+  const short = "3 MRs need review\n\n!12 blocked\nhttps://x.test/" + "a".repeat(400)
+  expect(wrapLines(short)).toBe(short)
+  const wall = "word ".repeat(MAX_LINE / 2).trim()
+  const lines = wrapLines(`Fine\n${wall}`).split("\n")
+  expect(lines[0]).toBe("Fine")
+  expect(lines.length).toBeGreaterThan(2)
+  for (const l of lines) expect(l.length).toBeLessThanOrEqual(MAX_LINE)
+  expect(lines.slice(1).join(" ")).toBe(wall)
+  // A link on a long line doesn't count toward its length and isn't cut.
+  const url = "https://x.test/" + "a".repeat(300)
+  expect(wrapLines(`${"word ".repeat(30)}${url}`)).toBe(`${"word ".repeat(30)}${url}`)
+  // One word longer than the limit is hard-cut.
+  expect(wrapLines("x".repeat(MAX_LINE * 2 + 1)).split("\n").map((l) => l.length)).toEqual([MAX_LINE, MAX_LINE, 1])
 })

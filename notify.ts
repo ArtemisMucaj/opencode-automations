@@ -97,8 +97,24 @@ export function format(text: string, style: Style): string {
 /** Longest a line may run, links aside, before it reads as a wall of text on a phone. */
 export const MAX_LINE = 200
 
-export function longLine(text: string): string | undefined {
-  return format(text, "plain").split("\n").find((l) => l.replace(/\bhttps?:\/\/\S+/g, "").trim().length > MAX_LINE)
+/** A line's length as read, links aside: a long URL is one tap, not a wall of text. */
+const readLength = (s: string) => s.replace(/\bhttps?:\/\/\S+/g, "").trim().length
+
+/** Break lines longer than MAX_LINE (links aside) at word breaks, so a wall of text reads on a phone. */
+export function wrapLines(text: string): string {
+  return text.split("\n").map((l) => {
+    if (readLength(l) <= MAX_LINE) return l
+    const pieces: string[] = []
+    let cur = ""
+    for (const word of l.split(/(?<=\s)/)) {
+      if (!cur || readLength(cur + word) <= MAX_LINE) { cur += word; continue }
+      pieces.push(cur.trimEnd())
+      cur = word
+    }
+    pieces.push(cur.trimEnd())
+    // One word longer than MAX_LINE (not a link): hard-cut it.
+    return pieces.flatMap((p) => (readLength(p) <= MAX_LINE ? [p] : p.match(new RegExp(`.{1,${MAX_LINE}}`, "gu")) ?? [p])).join("\n")
+  }).join("\n")
 }
 
 /** Cut a source line into pieces that each render within `max`, preferring word breaks. */
